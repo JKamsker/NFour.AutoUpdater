@@ -14,8 +14,8 @@ public sealed record InstalledFile(
 
 public abstract record FileOperation(VirtualPath Path)
 {
-    public sealed record Write(VirtualPath Path, ContentHash Content, long Size, long StoredSize,
-                               ContentEncoding Encoding, PackageId Owner, FileInstallPolicy Policy)
+    public sealed record Write(VirtualPath Path, ContentHash Content, long Size,
+                               PackageId Owner, FileInstallPolicy Policy)
         : FileOperation(Path);
     public sealed record Delete(VirtualPath Path, PackageId PreviousOwner) : FileOperation(Path);
     public sealed record Keep  (VirtualPath Path)                          : FileOperation(Path);
@@ -38,15 +38,48 @@ public sealed record InstallPlan
     public required long NetInstallDelta { get; init; }
 }
 
+/// What the scanner observed on disk. Explicit input, so planning is reproducible.
+public sealed record ObservedEntry(
+    VirtualPath Path,
+    bool Exists,
+    ObservedKind Kind,             // File | Directory | Reparse | Other
+    long Size,
+    long MtimeUnixSeconds,
+    FileIdentity? Identity,        // volume+file id where the OS provides one
+    ContentHash? Hash);            // present only if the scanner was asked to hash
+
+public sealed record ObservedTreeSnapshot(
+    string InstallRoot,
+    ImmutableDictionary<VirtualPath, ObservedEntry> Entries);
+
+public interface ITreeScanner
+{
+    /// Observes exactly the union of ledger paths and target paths — never a full walk.
+    ValueTask<ObservedTreeSnapshot> ScanAsync(
+        string installRoot,
+        IEnumerable<VirtualPath> ledgerPaths,
+        IEnumerable<VirtualPath> targetPaths,
+        HashPolicy hashPolicy,
+        CancellationToken ct = default);
+}
+
 public interface IInstallPlanner
 {
     /// current == null (fresh install OR lost ledger) => NEVER emits Delete.
-    InstallPlan Plan(ComposedFileSet target, IReadOnlyDictionary<VirtualPath, InstalledFile>? current);
+    InstallPlan Plan(
+        ComposedFileSet target,
+        IReadOnlyDictionary<VirtualPath, InstalledFile>? current,
+        ObservedTreeSnapshot observed);
 }
 ```
 
-`Plan` is a **pure function**. It takes no repository, no filesystem and no clock, which means
-the entire delete-set logic — the part that can destroy player data — is testable with literals.
+`Plan` **is** a pure function — but only because the filesystem observations are now an explicit
+parameter. The first draft declared the same purity claim while the algorithm called
+`File.Exists`, `Size` and `mtime` directly, so identical inputs produced different plans depending
+on disk state and the claim was unimplementable (review finding **C7**).
+
+Splitting scan from plan also makes the delete-set logic — the part that can destroy player data —
+testable with literals, which was the point of the original claim.
 
 ## 2. The planning rules
 
@@ -54,19 +87,43 @@ Reproduced from [04](04-variant-model.md) §5 step 12 because this is the safety
 
 ```
 foreach (path, want) in target.Files:
+    obs = observed[path]
     if !current.TryGetValue(path, out have):
-        if want.Policy == Preserve && File.Exists(path) -> Keep      (adopt into ledger)
-        else                                            -> Write
+        if want.Policy == Preserve && obs.Exists -> Adopt   (unmanaged content, see below)
+        else                                     -> Write
     elif have.Content != want.Content:
-        if want.Policy == Preserve                      -> Keep
-        else                                            -> Write
-    else                                                -> Keep      (re-hash only if (size, mtime) drifted)
+        if want.Policy == Preserve               -> Keep
+        else                                     -> Write
+    else                                         -> Keep
+         // re-hash only when (obs.Size, obs.Mtime, obs.Identity) drift from the ledger;
+         // the hash is always the authority, the stat triple is only a cache key (18 §8.3)
 
 foreach (path, had) in current:
     if target.Files.ContainsKey(path): continue
-    if had.Policy == Preserve                           -> Orphan
-    else                                                -> Delete
+    if had.Policy == Preserve                    -> Orphan
+    else                                         -> Delete
 ```
+
+### 2.1 `Adopt` is not `Keep`
+
+A `Preserve` file that already exists when we first see it has **unknown content** — the updater
+did not write it and has not read it. The first draft recorded it in the ledger with the
+*desired* hash, which makes the ledger assert something false, and every later `verify` would
+compare against a hash that was never observed.
+
+`Adopt` therefore writes a distinct ledger state:
+
+```jsonl
+{"k":"f","p":"config/user.ini","st":"adopted","h":null,"oh":"sha256:1a2b…","o":"…","pol":"preserve","mt":…,"os":1391}
+```
+
+- `st: "adopted"` — content is unmanaged.
+- `h: null` — no desired-content claim is made.
+- `oh` — the *observed* hash, populated only if the scanner was asked to hash it.
+
+`verify` reports adopted files as `unmanaged`, not as `drifted`. `repair` leaves them alone. They
+are never deletion candidates. If a later release changes the file's policy from `Preserve` to
+`Replace`, the transition is an ordinary `Write` and the state clears.
 
 Three properties that follow, and that the reference did not have:
 
@@ -130,24 +187,43 @@ and this makes it an invariant.
   wins** — a mirror that serves a hash mismatch is demoted for the session. This is also the
   only way to detect a poisoned CDN edge.
 
-### 3.3 Resume — with a validator
+### 3.3 Resume
 
-The reference resumed by setting a `Range` header with no `If-Range` and reopening at
-`_position` with no validator, so a blob replaced mid-download **spliced two different objects
-together**.
+Blobs are stored **identity-encoded** ([18](18-normative-contract.md) §5), so a range offset is
+an offset into the content itself. Resume is therefore a byte-append into
+`.4sup/staging/{sha256}` with a streaming hash carried across the resume boundary — there is no
+decode stage, no second representation, and the staging filename is unambiguous. That is the
+whole reason at-rest compression was dropped.
 
-Here:
+The reference resumed by setting `Range` with no validator and reopening at `_position`, so a
+blob replaced mid-download **spliced two different objects together**.
+
+Here, and using the correct HTTP semantics (review finding **H10** — the first draft conflated
+`If-Range` with `If-Match` and expected `412` from a validator mismatch, which is not what
+`If-Range` does):
 
 1. Capture the `ObjectValidator` at first open.
-2. Pass it as `ifMatch` on every reopen.
-3. A `412` means *the object changed* → restart from zero, do not splice.
-4. `ReadResult.ActualStartOffset` reports what the backend actually gave us, so the caller can
-   refuse to drain 3.9 GB forward to resume at 3.9 GB.
-5. Drain-forward is an explicit policy value — `never | under N bytes | always` — not a silent
-   behaviour.
-6. On FTP the validator is `(MDTM, SIZE)` and is **weak**: the backend cannot detect
-   replacement. The caller is told this. Whole-content SHA-256 verification is what makes it
-   safe, and here it is load-bearing rather than belt-and-braces.
+2. Resume with `Range: bytes=n-` **plus `If-Range: <strong validator>`**.
+3. Interpret the response:
+
+| Status | Meaning | Action |
+|---|---|---|
+| `206` | Range honoured, validator matched | Append from `n` |
+| `200` | Validator mismatched **or** server ignored `Range` | Discard the partial, restart from 0 |
+| `416` | Offset past end — object shrank | Discard, restart from 0 |
+| `412` | Only from `If-Match`, which is used on **writes**, not this path | Treat as a protocol error |
+
+4. **A weak ETag (`W/"…"`) is not usable with `If-Range`.** If the only validator is weak, resume
+   is disabled for that object and it restarts from 0. Silently resuming on a weak validator is
+   how mirror nodes splice.
+5. `ReadResult.ActualStartOffset` reports what the backend actually delivered, so the caller can
+   refuse to drain forward. Drain-forward is an explicit policy — `never | under N bytes |
+   always` — never silent.
+6. On FTP the validator is `(MDTM, SIZE)` and is **weak by definition**, so resume over FTP is
+   restart-only. This costs nothing in the recommended topology, where FTP is a write transport
+   and reads go over the paired HTTP endpoint.
+7. Whatever the path, the streaming SHA-256 over the assembled content is the authority. A
+   mismatch discards the staged file and refetches from the next mirror.
 
 Retry uses the reference's `Func<long, Task<Stream>>` seam — which maps cleanly onto HTTP
 `Range`, S3 Range, FTP `REST`+`RETR` and `FileStream.Seek` — with a correct implementation:
@@ -213,6 +289,35 @@ Download bytes and write bytes are **separate**, because they differ by the comp
 and a launcher needs both. The reference emitted `if (progress % 10 == 0)` log lines that skip
 percentages whenever a step crosses more than one boundary.
 
+## 3.7 Secure traversal — lexical validation is not a boundary
+
+`VirtualPath` validation is **syntactic**. It proves the manifest did not *ask* to escape the
+install root. It does not prove the write *lands* inside it, because an existing directory
+symlink, junction, mount point or reparse point below the root redirects the write after
+validation succeeds — and a TOCTOU swap between validation and mutation produces the same result.
+For an updater running elevated, `Path.Combine(root, validatedRelativePath)` is an arbitrary-write
+primitive (review finding **C10**).
+
+Normative rules for every mutation — write, replace, delete, and directory creation:
+
+1. **Open parents by handle, component by component**, from a handle to the install root. Never
+   resolve a full path string in one call.
+2. **No-follow at every component.** `O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT`. Encountering
+   a reparse point or symlink on the path to a managed file is a hard error, not a traversal.
+3. **Verify parent identity immediately before mutation** — the parent handle's file id must match
+   the one observed during the scan. A mismatch aborts the operation.
+4. **Mutate relative to the parent handle**: `openat`/`unlinkat`/`renameat` on POSIX,
+   `NtCreateFile` with a root directory handle on Windows. Not by absolute path.
+5. **Root preconditions**: the install root must not itself be a reparse point, must be on the
+   same volume as `.4sup/staging`, and — when running elevated — must not be writable by
+   unprivileged users. A world-writable root under an elevated updater is refused with exit
+   code 4, because it lets an unprivileged user plant a junction between scan and apply.
+6. **Directories the updater creates are created no-follow**; a pre-existing directory that is a
+   reparse point is never entered.
+
+The adversarial cases — junction swap, symlink race, mount point, case collision, parent
+replacement mid-apply — are explicit tests ([12](12-testing.md) §7), not review items.
+
 ## 4. Locked files, processes and services
 
 On Windows, patching a game whose launcher holds a handle to `bin/game.exe` simply fails:
@@ -250,23 +355,44 @@ is a full re-download, which contradicts the design's own claim that a switch is
 | Property | Decision |
 |---|---|
 | Location | `%LOCALAPPDATA%\4Story\4sup\cas` (Windows), `$XDG_CACHE_HOME/4sup/cas` (POSIX); overridable |
-| Layout | identical to the repository CAS — `{alg}/{aa}/{bb}/{hash}{enc}` |
+| Layout | identical to the repository CAS — `{alg}/{aa}/{bb}/{hash}` |
 | Size cap | configurable, default 20 GB |
 | Eviction | LRU by last-access, never evicting a blob referenced by the current `state.jsonl` |
 | GC | on-demand and on-cap; separate from `.4sup/staging` |
 | Relationship to staging | `.4sup/staging` is per-operation and per-install; the CAS is per-machine and shared across installs |
 
-**Materialisation is hardlink-first:**
+**Materialisation is reflink-first, copy-default, and does not hardlink by default:**
 
-1. Same volume + `Replace`/`Executable` policy → `CreateHardLink` / `link(2)`. Zero copy, zero
-   extra space.
-2. Same volume + filesystem supports reflink → `FSCTL_DUPLICATE_EXTENTS_TO_FILE` / `FICLONE` /
-   `clonefile` behind a P/Invoke fast path.
-3. `Preserve` policy, or different volume, or hardlink unsupported → copy.
+1. Same volume + filesystem supports **copy-on-write clone** → `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+   (ReFS) / `FICLONE` (btrfs, XFS) / `clonefile` (APFS) behind a P/Invoke fast path. Zero copy,
+   zero extra space, **and a write to the install file diverges instead of propagating**.
+2. Otherwise → **copy**.
+3. Hardlink → only under an explicit `immutable-install` profile (below).
 
-Rule 3's `Preserve` exclusion is not an optimisation detail: the game **mutates** a preserved
-config in place, and a hardlink there would corrupt the shared CAS entry for every other install
-on the machine.
+The first draft made hardlinks the default for non-`Preserve` files, on the reasoning that only
+preserved config is mutated in place. Review finding **C9** is correct that this is wrong: a
+hardlink is the *same inode*, so **any** write to an installed file — by the game, a repair tool,
+anti-cheat, a mod manager, or an administrator — rewrites the shared CAS object and silently
+corrupts it for every other installation linked to it. A content-addressed cache is only safe if
+cached bytes cannot be reached through a writable path.
+
+The `immutable-install` profile permits hardlinks only when all of these hold, and it is off by
+default:
+
+- the destination is made read-only after linking;
+- the running product is known not to write into the install tree;
+- the CAS re-verifies an entry's hash before reuse if its link count or file identity has changed
+  since it was written;
+- the profile is opt-in per install root, never inferred.
+
+## 5.1 Local CAS integrity
+
+Because a CAS entry can be corrupted by anything on the machine, the cache is not trusted blindly:
+
+- Entries are stored read-only.
+- An entry is re-hashed before reuse if its `(size, mtime, identity)` triple drifts.
+- A hash mismatch **evicts** the entry and refetches; it never fails the install.
+- `4sup verify --rehash-cas` walks the whole cache.
 
 ## 6. Verify and repair
 

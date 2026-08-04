@@ -33,11 +33,6 @@ All three are in scope. The library is the product; the other two are its first 
 
 ### FR-1 — Storage backends
 
-Four backends, one abstraction. Read support is mandatory for all; write support only where
-the backend can express it safely.
-
-| Backend | Read | Write | Notes |
-|---|---|---|---|
 Backends are **dumb byte stores**. A repository has **two endpoints** — an anonymous read URL and
 an authenticated write transport, which need not be the same protocol.
 
@@ -65,7 +60,7 @@ plus `yank` and `prune`.
 ### FR-3 — Flat content-addressed repository
 
 All content lives in one blob store shared by every product, version and variant, keyed by the
-hash of the uncompressed bytes. Identical bytes stored once, regardless of which variant or
+SHA-256 of its bytes and stored **identity-encoded** ([18](18-normative-contract.md) §5). Identical bytes stored once, regardless of which variant or
 version references them. The hash algorithm must be explicit in the key so a future migration
 to blake3/sha256 does not require a new store. See [05-repository-format.md](05-repository-format.md) §2.
 
@@ -130,7 +125,7 @@ See [09-control-plane-server.md](09-control-plane-server.md) and
 | NFR-2 | **Integrity and authenticity.** Every byte verified against its content hash on arrival. Every mutable pointer signed, with the trust root outside the repository. |
 | NFR-3 | **Resumability.** A 40 GB download interrupted at 39 GB resumes, and knows the difference between "network hiccup" and "the object changed". |
 | NFR-4 | **Determinism.** `(releaseDigest, selectionId)` determines the composed file set bit-identically on every OS, forever. Support can reproduce a player's exact content from two hashes. |
-| NFR-5 | **Bounded memory.** A 200k-file manifest never materialises in memory on either side. |
+| NFR-5 | **Bounded working set.** File tables stream and are never fully materialised. Composition, the plan and the ledger are O(files-in-selection) by design — budgeted at ≤ 400 MB for 200k files, with a stated supported ceiling of 10⁶ files per selection. Beyond that, external sort. This is a *budget*, not an O(1) claim (review **H15**). |
 | NFR-6 | **Cross-platform.** Windows is the primary client target; Linux is a first-class publish/serve target. No Windows-only type on the shared path. |
 | NFR-7 | **Testability without infrastructure.** The full backend surface exercisable in-memory; containers only for conformance runs. |
 | NFR-8 | **Forward compatibility.** Every document carries `schemaVersion` and a defined unknown-field policy. An old client must fail loudly and legibly, never silently wrongly. |

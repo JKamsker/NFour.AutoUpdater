@@ -157,13 +157,13 @@ symmetric write targets and the design must say so rather than imply otherwise.
 | Operation | Local | S3 | FTP | HTTP |
 |---|---|---|---|---|
 | Per-object expiring grant | n/a (ACL) | ✔ presigned PUT | ✘ **none** | ✘ |
-| Server-side promotion | ✔ rename | ✔ `CopyObject` | ✔ `RNTO` | ✘ |
+| Server-side promotion (**same store only**) | ✔ rename | ✔ `CopyObject` | ✔ `RNTO` | ✘ |
 | Server-side verification before promote | ✔ | ✔ | ⚠ needs an API-held read credential | ✘ |
 | Race-free channel placement | ✔ lock file | ✔ `If-Match` CAS | ✘ **single-publisher only** | ✘ |
 | GC (needs List) | ✔ | ✔ | ⚠ 65,536 `MLSD` round trips | ✘ |
 
 **FTP is single-publisher, in writing.** No CAS means two concurrent placements lose an update
-and `previousReleaseId` silently becomes wrong — breaking rollback exactly when it is needed.
+and the channel silently regresses or forks — breaking rollback exactly when it is needed.
 B2's S3 endpoint falls in the same bucket despite being "S3-compatible".
 
 **GC over FTP is effectively unsupported** — 65,536 leaf directories, no resumability, a
@@ -177,8 +177,8 @@ server-side control can bound a malicious publisher. See [16](16-publish-protoco
 
 ## 5. The `Content-Encoding` hazard
 
-The codec is in the **key** (`{hash}.zst`) and decoded **client-side**. If the origin *also*
-applies transport compression — nginx `gzip on`/`gzip_static on`, CloudFront/Cloudflare
+Blobs are stored and served as raw content bytes with no encoding. If the origin applies
+transport compression — nginx `gzip on`/`gzip_static on`, CloudFront/Cloudflare
 auto-compression, Apache `mod_deflate` — then a .NET client with `AutomaticDecompression` enabled
 receives **decoded** bytes and the SHA-256 check fails **100% of the time**, and `Range` offsets
 refer to **encoded** octets so every resume is wrong.

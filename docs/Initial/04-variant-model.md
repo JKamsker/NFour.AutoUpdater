@@ -11,7 +11,7 @@ immutable lockfile that declares the variant **axes** and pins N independently v
 for multi-valued axes, a sub-cube) in axis space — evaluates every `when` predicate locally
 against the one artifact it downloaded, sorts the matched packages by
 `(derived layer, discriminator, package id)`, and merges their file tables lowest-first into a
-**composed file set**: a pure `path -> (contentHash, owningPackage, policy)` map. That map is
+**composed file set**: a pure `path -> (contentHash, owner, policy, kind, mode)` map. That map is
 the entire truth. Install is `compose(target) − state`; deletion is `state − compose(target)`;
 a variant switch is recompose-and-diff. Manifest cost is O(Σ files across packages), never
 O(Π axis cardinalities).
@@ -27,7 +27,7 @@ identity, lifecycle and validation, so it gets its own level: the **release**.
 |---|---|---|
 | "a patch version" | **package version** — `fourstory.client.lang.de@1.4.7` | yes, once published |
 | (implied) "what a client installs" | **release** — `fourstory.client@2026.02.15-a` | yes, once published |
-| (implied) "what live points at" | **channel** — `live` | **no** — the only mutable object |
+| (implied) "what live points at" | **channel** — `live` | **no** — a mutable *signed* control document ([17](17-signed-documents.md) §3) |
 
 The payoff: a German string-table hotfix republishes one 1,188-file package and one 6 KB
 release lock. It does not touch, re-hash or re-upload the 184,203-file core package.
@@ -119,11 +119,22 @@ int layer = requirement.LayerOverride
            : requirement.When.IsAlways      ? 0
            : requirement.When.Constraints.Keys.Max(k => axes[k].Rank) * 1000);
 
+// The discriminator is the minimum DECLARED VALUE INDEX in the intersection —
+// never the lexical minimum of the value strings. With values ["en","de"],
+// declaration order makes "en" index 0 and "de" index 1, while a lexical Min()
+// would pick "de". Those disagree, and declaration order is the one that matches
+// AxisDefinition's stated precedence rule.
 int discriminator =
       requirement.RankAs is not null ? -1
     : requirement.When.IsAlways      ? -1
-    : axes[dominantAxis].IndexOf(selection[dominantAxis].Intersect(When[dominantAxis]).Min());
+    : selection[dominantAxis]
+        .Intersect(requirement.When.Constraints[dominantAxis])
+        .Select(v => axes[dominantAxis].IndexOf(v))
+        .Min();
 ```
+
+`dominantAxis` is the constrained axis with the highest `Rank`; ties are impossible because
+`Rank` is unique across the release.
 
 This reproduces exactly the ladder a human would hand-pick — core 0, `bin.x64` 10000, `ui.*`
 20000, `lang.common` 30000/−1, `lang.*` 30000/valueIndex, `tex.hd` 40000, `brand.gamigo`
@@ -155,9 +166,7 @@ public sealed record PackageFileEntry
 {
     public required VirtualPath Path { get; init; }
     public required ContentHash Content { get; init; }     // sha256 of UNCOMPRESSED bytes
-    public required long Size { get; init; }               // uncompressed — install accounting
-    public required long StoredSize { get; init; }         // transfer bytes — download accounting
-    public required ContentEncoding Encoding { get; init; }
+    public required long Size { get; init; }               // bytes; stored ≡ content (18 §5)
     public ContentHash? Md5 { get; init; }                 // cheap change detection only
     public FileInstallPolicy Policy { get; init; } = FileInstallPolicy.Replace;
 }
@@ -211,13 +220,35 @@ public sealed record PackageRequirement
     /// Escape hatch only; emits PKG010.
     public int? LayerOverride { get; init; }
 
-    /// Overrides declared HERE rather than inside the (immutable, already-published)
-    /// package manifest, so introducing a new lower-layer package never forces
-    /// republication of packages whose bytes did not change.
+    /// THE authoritative override declaration. See §4.2.
     public ImmutableArray<PackageId> Overrides { get; init; } = [];
 
     public bool Optional { get; init; }
 }
+
+### 4.2 Override authority — exactly one source
+
+Override declarations appeared in three places in the first draft (package manifest, release
+requirement, locked pin) with a comment that authority had "moved" to requirements. Three
+candidate authorities is zero authorities.
+
+**Normative:** `PackageRequirement.Overrides` is the sole authority. Concretely:
+
+- `PackageManifest.Overrides` is **removed** from the schema. A package cannot declare what it
+  shadows, because shadowing is a property of the *composition it appears in*, not of the package.
+  This is also what stops a new lower-layer package from forcing republication of unchanged bytes.
+- `LockedPackage.Overrides` is a **denormalised copy** of the requirement's value, written at
+  release-build time so the client validates the closure from one file. If it disagrees with the
+  requirement, the release is rejected at publish (`PKG016 DenormalisationMismatch`); the client
+  treats the lock as authoritative because it is what the signature covers.
+- `PackageManifest.Conflicts` and `.Requires` **stay on the manifest** — those are genuine
+  intrinsic properties of a package and do not vary by composition.
+
+**Effective overrides** for a selected package = the union of `Overrides` across every
+requirement that matched it. `release check` rejects a release where one package is matched by
+two requirements whose `when` predicates are co-satisfiable but whose `optional`, `rankAs`,
+`layerOverride` or derived layer differ (`PKG008`), so the union is only ever taken over
+requirements that agree on everything else.
 
 /// Denormalised pin: Requires/Overrides/Conflicts are COPIED here at build time so the
 /// client validates the entire dependency closure from ONE downloaded file, before
@@ -332,7 +363,7 @@ identity (NFR-4).
 **9 — Package manifests.** From `bundle.Inline` (zero network) or `GET ManifestPath` plus a
 digest assertion. Immutable ⇒ cached by digest.
 
-**10 — File tables.** For each `FileTableShardRef`, `GET layout.Blob(shard.Digest, canonicalEncoding)`,
+**10 — File tables.** For each `FileTableShardRef`, `GET layout.Blob(shard.Digest)`,
 verify the digest, stream as JSONL. Never materialise a whole table. Because shards are
 content-addressed and hash-bucketed, `core@1.4.8` touching 12 files shares 15 of its 16 shards
 with `1.4.7` and the client re-downloads one.
@@ -341,12 +372,27 @@ with `1.4.7` and the client re-downloads one.
 
 - `VirtualPath.TryCreate` fails ⇒ `RES003 IllegalPath` (fatal; rejects the whole repository).
 - `map[path]` empty ⇒ take ownership.
-- Occupied by a **lower** layer ⇒ record the previous owner in `Shadowed`, take ownership.
-- Occupied at the **same** layer *and* discriminator ⇒ `RES004 UnexpectedCollision` (fatal).
-  Unreachable on a repository that passed `release check`; the client enforces it anyway rather
-  than silently picking a winner.
+- Otherwise compare the **full precedence tuple** `(layer, discriminator, packageId)` of the
+  incumbent against the arrival, per the table below.
 
-`FileSetId = sha256` over canonical `path\0hash\0owner\n` triples in ordinal path order.
+| Case | Rule |
+|---|---|
+| Arrival has a **higher layer** | May take ownership **only if** it declares the incumbent in its effective overrides; else `RES006 UndeclaredOverride` (fatal). Incumbent recorded in `Shadowed`. |
+| **Same layer, higher discriminator** | May take ownership **only if** it declares the incumbent in its effective overrides; else `RES007 IntraAxisCollision` (fatal). |
+| **Same layer, same discriminator**, different package | `RES004 UnexpectedCollision` (fatal). |
+| Arrival has a **lower** tuple | Unreachable — packages are walked in ascending tuple order (step 8). Defensive assert. |
+
+The `Same layer, higher discriminator` row is the case the first draft omitted entirely, and it
+is the **normal** case for a `Many` axis. With `language=de,en` selected, `lang.de` and `lang.en`
+both sit at layer 30000 with different discriminators. If they ship a common path — a shared
+font, a merged string index — the resolution must be defined rather than accidental. Requiring an
+explicit override makes the winner a publisher decision that `release check` can verify, instead
+of a consequence of value declaration order that nobody reviewed.
+
+`FileSetId` is computed per [18](18-normative-contract.md) §4 — over
+`(path, hash, owner, policy, kind, mode)`, **not** over `(path, hash, owner)`. The earlier
+three-field framing meant flipping a file from `Replace` to `Preserve` left the identifier
+unchanged despite materially different overwrite, deletion and verification behaviour.
 
 **12 — Plan.** Read `state.jsonl` into `current`, then:
 
@@ -388,6 +434,8 @@ dumps, mods and user configs are structurally safe. This is the fix for the refe
 | `RES003 IllegalPath` | Error | A manifest path violates `VirtualPath` rules |
 | `RES004 UnexpectedCollision` | Error | Same path at same layer and discriminator |
 | `RES005 DeclaredConflict` | Error | Two selected packages declare each other in `Conflicts` |
+| `RES006 UndeclaredOverride` | Error | Higher-layer package shadows a path without declaring the override |
+| `RES007 IntraAxisCollision` | Error | Same layer, different discriminator, overlapping path, no declared override |
 
 ## 7. Worked examples
 
@@ -511,9 +559,9 @@ And three of the winning model's own flaws were fixed rather than inherited:
 
 - **Retroactive `overrides` churn** — killed by allowing overrides on the release
   *requirement* instead of inside the immutable package manifest.
-- **The encoding fork** (`{hash}.gz` and `{hash}.zst` for the same content, where GC can
-  later half-collect and 404 an entire variant) — killed by one canonical encoding per
-  repository, declared in `repo.json` and gate-checked.
+- **The encoding fork** (one content addressable under two representations, where GC can later
+  half-collect and 404 an entire variant) — killed outright by identity-only storage
+  ([18](18-normative-contract.md) §5): one hash, one object.
 - **The CDN caching the channel pointer** — the highest-severity operational risk in either
   design, because it disables the rollback lever during an incident — becomes an asserted
   live-HTTP check in `verify-repo` (`PKG011`).

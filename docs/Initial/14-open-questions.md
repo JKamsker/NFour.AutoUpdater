@@ -4,6 +4,32 @@ Decisions that need a human answer. Each carries a recommendation so nothing is 
 discussion alone — but the ones marked **BLOCKING** change work already scheduled in
 [13-roadmap.md](13-roadmap.md) and should be settled before Phase 1 ends.
 
+## Status index
+
+An external review found this document mixed genuinely-open items with ones already decided
+elsewhere (review **M2**). Every item is now classified, and a **decided** item is a pointer to
+its authoritative record, not a discussion.
+
+| # | Topic | Status |
+|---|---|---|
+| Q1 | Engine globs `ui/**` at startup? | **OPEN — blocking** |
+| Q2 | Build-tree partitioning / `slice.yaml` ownership | **OPEN — blocking** |
+| Q3 | UI packages: full subtree or thin overlay | **OPEN — blocking** |
+| Q4 | Which axes are post-install switchable | **OPEN** |
+| Q5 | Ed25519 signing in v1 | **DECIDED — yes.** Architecturally mandatory; the envelope is normative in [17](17-signed-documents.md) and is a Phase 0 exit criterion |
+| Q6 | Deployment topology and GC ownership | **OPEN** |
+| Q7 | Small-file bundling in v1 | **OPEN — blocking, format decision** |
+| Q8 | Sub-file delta / CDC | **DEFERRED.** Reserve the `d` field; revisit in Phase 8 |
+| Q9 | Symlinks, exec bits, empty directories | **DECIDED.** Symlinks rejected at publish; `pol:"executable"` + `mode`; empty dirs via `k:"dir"` ([05](05-repository-format.md) §8) |
+| Q10 | Naming (`FourSaas.*` vs `NFour.*`) | **OPEN — cheap now, annoying later** |
+| Q11 | Re-run the third variant design | **CLOSED — no.** Nothing depends on it |
+| Q12 | Migration from an existing patcher | **OPEN** |
+| Q13 | Telemetry consent | **OPEN**, but lower stakes now — telemetry is diagnostic-only and gates nothing ([09](09-control-plane-server.md) §2.1) |
+| Q14 | Who operates special servers | **OPEN — blocking for that feature** |
+| — | At-rest compression | **DECIDED — removed.** Identity-only CAS ([18](18-normative-contract.md) §5) |
+| — | Device targeting | **DECIDED — none.** Channels only ([09](09-control-plane-server.md) §2.3) |
+| — | Rollback mechanics | **DECIDED.** New signed pointer at a higher `channelSequence` ([17](17-signed-documents.md) §4) |
+
 ---
 
 ## Q1 — Does the 4Story client tolerate stale variant files on disk? **BLOCKING**

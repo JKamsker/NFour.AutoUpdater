@@ -137,19 +137,18 @@ public readonly record struct ContentHash(HashAlgorithmId Algorithm, ReadOnlyMem
     public override string ToString();
     public bool Equals(ContentHash other);                      // structural over bytes
     public override int GetHashCode();                          // structural over bytes
+    // Backed by a fixed 32-byte inline buffer, NOT ReadOnlyMemory<byte>: a memory
+    // wrapper can alias a caller's mutable array, so a later write changes a value
+    // already used as a dictionary key (review H3). Construction is via Parse/TryParse
+    // only; the default value is invalid and rejected by every validated model.
 }
-
-/// Transport/at-rest encoding. Generalises the reference's bool IsCompressed + ".gz".
-public enum ContentEncoding { Identity = 0, Gzip = 1, Zstd = 2 }
 
 /// A blob is addressed by the hash of its UNCOMPRESSED bytes; the encoding is a
 /// property of the STORED OBJECT, not of a manifest entry. In the reference, two
 /// versions referencing one sha512 could disagree on FileMetaDataDto.IsCompressed
 /// and one of them would 404.
-public readonly record struct BlobLocator(ContentHash Content, ContentEncoding Encoding)
-{
-    public string Suffix { get; }                               // "" | ".gz" | ".zst"
-}
+// Blobs are identity-encoded (18 §5), so a locator is just the hash.
+public readonly record struct BlobLocator(ContentHash Content);
 
 public readonly record struct PackageId          // ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$
 {
@@ -181,7 +180,8 @@ public readonly record struct VirtualPath : IComparable<VirtualPath>
     public string FoldedKey { get; }        // invariant-lower; COLLISION DETECTION ONLY
     public static VirtualPath Create(string raw);
     public static bool TryCreate(string? raw, out VirtualPath p, out string? error);
-    public static VirtualPath FromHostPath(DirectoryInfo root, FileInfo file);
+    // NOTE: no DirectoryInfo/FileInfo overloads here — those live in the platform layer,
+    // because Core must not touch System.IO beyond Stream (review M6).
 }
 ```
 

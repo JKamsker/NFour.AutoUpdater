@@ -13,8 +13,8 @@ interop bug later.
   repo.json                                          # descriptor: layout, capabilities, trust roots
 
   blobs/                                             # ONE flat sharded CAS: content AND file-table shards
-    sha256/7c/19/7c19a4f1…e8.zst
-    sha256/aa/10/aa10bd07…31.zst                     # a file-table shard — shards are blobs too
+    sha256/7c/19/7c19a4f1…e8
+    sha256/aa/10/aa10bd07…31                         # a file-table shard — shards are blobs too
 
   packages/
     fourstory.client.core/
@@ -79,9 +79,9 @@ These are what make one tree work identically over four backends. Each is assert
 | I-3 | Exactly one type owns every key template (`RepositoryLayout`). Nothing bypasses it. |
 | I-4 | Staging never happens inside a served prefix — enforced by a live `GET` against a known staging key requiring 403/404. The reference wrote `{sha}.tmp` into `blobs/`, briefly exposing partial blobs over HTTP. |
 | I-8 | A blob exists in the CAS only after the API has **read its bytes from storage and verified the hash**. `blobs/query` reports a hash present only for placements with a non-null `verifiedAt`. See [16](16-publish-protocol.md) §5. |
-| I-5 | Blobs and releases are immutable once written. The **only** mutable object in a repository is `channels/*.json`. |
+| I-5 | Every artifact belongs to exactly one mutability class ([17](17-signed-documents.md) §3). Class A/B are immutable once written; class C is mutable but monotonic and signed; class D is mutable, unsigned, and **never trusted for an install decision**. |
 | I-6 | No blob is ever served with an HTTP `Content-Encoding` header. See §2.3 — this is a day-one total-failure risk. |
-| I-7 | `entry.Encoding ∈ { Identity, descriptor.canonicalEncoding }`. One canonical codec per repository. |
+| I-7 | Blobs are stored identity-encoded. Stored bytes ≡ content bytes; there is exactly one representation per hash ([18](18-normative-contract.md) §5). |
 
 ### 1.2 Required cache headers
 
@@ -102,35 +102,46 @@ Asserted by `verify-repo` with a **live HTTP request against the origin**, not a
 ### 2.1 Addressing
 
 ```
-blobs/{alg}/{hash[0:2]}/{hash[2:4]}/{hash}{enc}
+blobs/{alg}/{hash[0:2]}/{hash[2:4]}/{hash}
 ```
 
 - `{alg}` — `sha256` today. It is tagged so blake3 or sha512 can coexist without a new store;
   the reference hardcoded sha512 into the path shape and could not evolve. SHA-256 is chosen
   because it is the only strong digest S3 can enforce at PUT, which lets storage validate the
   CAS key itself ([16](16-publish-protocol.md) §5.1).
-- `{hash}` — **lowercase** hex of the hash of the **uncompressed** bytes.
-- `{enc}` — `""`, `.gz`, or `.zst`.
+- `{hash}` — **lowercase** hex of the hash of the blob's bytes.
+- **No encoding suffix.** Blobs are stored identity-encoded; stored bytes ≡ content bytes.
+  See [18](18-normative-contract.md) §5 for why at-rest compression was removed.
 - 2+2 hex sharding = 65,536 leaf directories. Free on S3; necessary on NTFS and ext4, which
   degrade badly past ~10^5 entries in one directory. Note the cost on FTP (§ [06](06-storage-backends.md) §2.2).
 
-A blob's identity is its **uncompressed** content. Encoding is a property of the stored object,
-not of a manifest entry. In the reference, two versions referencing one sha512 could disagree
-on `FileMetaDataDto.IsCompressed` and one of them would 404.
+A blob's identity is its content, and its stored representation is identical to its content.
+There is exactly one representation per hash, so a manifest entry cannot disagree with a stored
+object about encoding — the failure mode the reference had, where two versions referencing one
+digest disagreed on `FileMetaDataDto.IsCompressed` and one of them would 404.
 
-### 2.2 Compression policy
+### 2.2 No at-rest compression
 
-Carried over from the reference, made configurable and with the compressed size recorded:
+Blobs are stored exactly as their content. This is normative — see
+[18](18-normative-contract.md) §5. Briefly:
 
-- Attempt compression only above a size floor (default 10 MiB).
-- Discard the compressed form if `compressed / original > 0.75`.
-- Record both `Size` (uncompressed, for install accounting) and `StoredSize` (for download
-  accounting and progress). The reference recorded only the former, so every progress bar was
-  wrong on a compressed patch.
+- It is what makes S3's `x-amz-checksum-sha256` genuinely *be* the CAS key, so
+  `StorageEnforced` integrity is sound rather than merely asserted.
+- It makes range offsets content offsets, so resume is a byte-append with a streaming hash and
+  the staging path `{sha256}` is unambiguous.
+- The cost is small in practice: the previous policy only attempted compression above 10 MiB and
+  discarded any result above a 0.75 ratio, and a game client's large assets — DDS, packed
+  archives, audio — are already compressed.
+
+Consequently `PackageFileEntry` has **one** size field, and `RepositoryDescriptor.canonicalEncoding`
+and the `PKG013 EncodingFork` diagnostic no longer exist.
+
+**Transport compression remains forbidden** (§2.3). That rule concerns the HTTP `Content-Encoding`
+header and is unrelated to at-rest encoding.
 
 ### 2.3 The Content-Encoding hazard — TIER 1
 
-The codec is encoded in the **key** and decoded **client-side**. If the origin *also* applies
+Blobs are stored and served as raw content bytes with no encoding of any kind. If the origin applies
 transport compression — nginx `gzip on` / `gzip_static on`, CloudFront or Cloudflare
 auto-compression, or an uploader setting `Content-Encoding` on the S3 object — then:
 
@@ -159,7 +170,7 @@ or Cloudflare.
   "repositoryId": "4story-live",
   "generatedAt": "2026-02-15T10:00:04Z",
   "layout": {
-    "blobTemplate":         "blobs/{alg}/{h0:2}/{h2:2}/{hash}{enc}",
+    "blobTemplate":         "blobs/{alg}/{h0:2}/{h2:2}/{hash}",
     "packageTemplate":      "packages/{packageId}/{version}/package.json",
     "packageIndexTemplate": "packages/{packageId}/index{page}.json",
     "channelTemplate":      "products/{productId}/channels/{channel}.json",
@@ -169,7 +180,6 @@ or Cloudflare.
     "releaseIndexTemplate": "products/{productId}/releases/index{page}.json"
   },
   "contentHashAlgorithm": "sha256",
-  "canonicalEncoding": "zstd",
   "capabilities": ["read", "range"],
   "integrityGuarantee": "verified",
   "products": ["fourstory.client"],
@@ -212,14 +222,17 @@ The only mutable object in a repository.
   "releaseId": "2026.02.15-a",
   "releaseSequence": 418,
   "releaseDigest": "sha256:c4d0f1a9b73e2c5580ab41ff9d2e6c17b8a40c3e77d1965f2b0ce8143a7f9d22",
-  "previousReleaseId": "2026.02.14-a",
+  "channelSequence": 419,
+  "supersedesChannelSequence": 418,
   "minimumClientVersion": "1.0.0",
   "updatedAt": "2026-02-15T10:00:00Z",
   "signature": { "keyId": "4s-2026", "algorithm": "ed25519", "value": "n1Qk…" }
 }
 ```
 
-`previousReleaseId` makes rollback a single write with no republication and no rebuild.
+Rollback is a **new signed pointer** at `channelSequence + 1` naming an older `releaseId`, not a
+restored old document — see [17](17-signed-documents.md) §4. Restoring the old bytes would move
+the sequence backwards and every client that had seen the newer pointer would reject it.
 
 ## 5. `release.lock.json`
 
@@ -331,7 +344,6 @@ tampered inline manifests must fail.
   "version": "2.0.1",
   "sequence": 20001,
   "kind": "content",
-  "state": "published",
   "createdAt": "2026-02-11T14:03:02Z",
   "overrides": [],
   "conflicts": ["fourstory.client.ui.classic"],
@@ -345,12 +357,16 @@ tampered inline manifests must fail.
     "shardCount": 1,
     "digest": "sha256:41ab55c9…",
     "shards": [
-      { "index": 0, "digest": "sha256:aa10bd07…", "count": 4812, "storedSize": 402118 }
+      { "index": 0, "digest": "sha256:aa10bd07…", "count": 4812, "size": 402118 }
     ]
   },
   "metadata": { "buildId": "tc-88412", "vcsRef": "9a41c0e" }
 }
 ```
+
+There is **no `state` field**. Draft/published/yanked is a lifecycle property owned by the
+control plane and, for yank, by the signed revocation document ([17](17-signed-documents.md)
+§4.5) — an immutable content object cannot carry a mutable lifecycle flag (review **M9**).
 
 `pathPrefixes` is a conservative superset — every path in the table must start with one of
 them. It lets the publish gate skip O(n) table intersection for pairs with disjoint prefixes.
@@ -361,21 +377,29 @@ A shard **is a blob**, stored in the same CAS. One JSON object per line, sorted 
 the shard. Two-character keys keep a 200,000-row table small.
 
 ```jsonl
-{"p":"data/ui/main.dat","h":"sha256:7c19a4f1…","s":88213,"z":31004,"e":"zstd","m":"md5:9a3f10c2…"}
-{"p":"shaders/ui/blur.fx","h":"sha256:0e77b311…","s":4102,"z":1288,"e":"zstd"}
-{"p":"ui/modern/atlas/000.dds","h":"sha256:22be9017…","s":16777216,"z":9114402,"e":"zstd"}
-{"p":"ui/modern/config/default.ini","h":"sha256:0e7742aa…","s":1204,"z":1204,"e":"identity","pol":"preserve"}
+{"p":"data/ui/main.dat","h":"sha256:7c19a4f1…","s":88213,"m":"md5:9a3f10c2…"}
+{"p":"shaders/ui/blur.fx","h":"sha256:0e77b311…","s":4102}
+{"p":"ui/modern/atlas/000.dds","h":"sha256:22be9017…","s":16777216}
+{"p":"ui/modern/config/default.ini","h":"sha256:0e7742aa…","s":1204,"pol":"preserve"}
+{"p":"logs","k":"dir","s":0}
+{"p":"bin/run.sh","h":"sha256:31cc90a1…","s":412,"pol":"executable","mode":"0755"}
 ```
 
-| Key | Meaning |
-|---|---|
-| `p` | virtual path |
-| `h` | content hash (uncompressed) |
-| `s` | uncompressed size |
-| `z` | stored size (transfer bytes) |
-| `e` | encoding — `identity` / `gzip` / `zstd` |
-| `m` | md5, optional, cheap change detection only |
-| `pol` | install policy; omitted ⇒ `replace` |
+| Key | Required | Meaning |
+|---|---|---|
+| `p` | yes | Virtual path, NFC, ordinal-compared |
+| `h` | yes for `k:file` | Content hash. Also the CAS key and the transfer size basis |
+| `s` | yes | Size in bytes. One size field only — stored ≡ content |
+| `k` | no | Entry kind: `file` (default) or `dir` (a directory that must exist though it contains no files) |
+| `m` | no | md5, cheap change detection only, never integrity |
+| `pol` | no | Install policy; omitted ⇒ `replace` |
+| `mode` | no | POSIX mode, octal string. Meaningful with `pol:"executable"`; ignored on Windows |
+
+`k:"dir"` closes review finding **M9/Q9**'s empty-directory gap — `logs/` and `screenshots/` can
+be declared. Symlinks remain rejected at publish; there is no entry kind for them.
+
+Every field that can affect apply behaviour is covered by `FileSetId`
+([18](18-normative-contract.md) §4).
 
 **Reserved for v2, must be present in the spec now** (see [14](14-open-questions.md) Q7/Q8):
 

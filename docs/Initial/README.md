@@ -28,6 +28,9 @@ that need a human answer before implementation starts.
 | 13 | [Roadmap](13-roadmap.md) | Phases, sequencing, what ships when |
 | 14 | [Open questions](14-open-questions.md) | Decisions required from the product owner, with recommendations |
 | 15 | [Risk register](15-risks.md) | Ranked risks and their mitigations |
+| 17 | [Signed documents](17-signed-documents.md) | **Normative.** Envelope format, sequences, mutability classes, rollback, yank, key lifecycle |
+| 18 | [Normative contract](18-normative-contract.md) | **Normative.** Identifier grammar, digest domains, `FileSetId` framing, JSON rules, identity-only content |
+| 19 | [Review disposition](19-review-disposition.md) | External review findings and where each was resolved |
 
 ## Topology
 
@@ -64,8 +67,8 @@ install is `compose(target) - state`, deletion is `state - compose(target)`, and
 switch is recompose-and-diff. All content lives in one flat content-addressed blob store, so
 files shared between variants cost one copy. Every key a client fetches is computed
 client-side, so a plain S3 bucket, an nginx static root, an FTP mirror and a local directory
-are interchangeable. A separate control-plane server writes channel pointers and does
-targeting and telemetry, but is never on the read path.
+are interchangeable. A management API owns authoring and brokers write access to storage, but is
+never on the read path and never authors or signs a release lock or a channel pointer.
 
 ## How this maps to the original brief
 
@@ -73,7 +76,7 @@ targeting and telemetry, but is never on the read path.
 |---|---|
 | Multiple backends (S3, FTP, Local, HTTP read-only) | [06](06-storage-backends.md) — capability-split port, one conformance suite |
 | Patch versions containing a set of files | [04](04-variant-model.md) §2 — a **package version**; a **release** composes many |
-| Flat file repository identified by sha256/md5/… | [05](05-repository-format.md) §2 — sharded, algorithm-tagged CAS |
+| Flat file repository identified by sha256/md5/… | [05](05-repository-format.md) §2 — sharded, algorithm-tagged, identity-encoded CAS |
 | Multiple variants (languages, 2 UIs over the same paths) | [04](04-variant-model.md) — the whole document |
 | Patch management | [08](08-publishing-and-validation.md) and [09](09-control-plane-server.md) |
 

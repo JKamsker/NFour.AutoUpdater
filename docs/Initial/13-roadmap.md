@@ -11,9 +11,16 @@ Build the **correctness floor first**, then widen. Concretely: the pure resoluti
 before any I/O; the local backend before any remote one; a working install-and-switch against a
 static local repository before signing, before the server, before a GUI.
 
-Two things are pulled forward out of order because they are **format decisions that cannot be
-retrofitted**: the signing field layout and the small-file bundling schema. Both must be
-decided before Phase 3 publishes anything real ([14](14-open-questions.md) Q5, Q7).
+**The trust boundary comes first, not last.** An earlier ordering put signing in Phase 6, after
+real publishing and client work — which meant the first real repository would be built against a
+format whose signed-envelope bytes, digest domains and key lifecycle were still unfixed, and
+every artifact would need reissuing (review **H11**). Signed-envelope format, digest-domain
+registry, identifier grammar, content-identity rules and rollback semantics are now **Phase 0/1
+exit criteria**, and the first end-to-end repository is built from **signed golden fixtures**
+before any production publishing path exists.
+
+Small-file bundling remains a format decision that cannot be retrofitted and must be settled
+before Phase 3 ([14](14-open-questions.md) Q7).
 
 ---
 
@@ -22,14 +29,22 @@ decided before Phase 3 publishes anything real ([14](14-open-questions.md) Q5, Q
 **Goal:** nothing is built on an assumption that a human should have made.
 
 - Resolve the blocking open questions: Q1 (engine glob behaviour), Q2 (build-tree
-  partitioning), Q3 (UI package shape), Q7 (bundling), Q10 (naming).
+  partitioning), Q3 (UI package shape), Q7 (bundling), Q10 (naming), Q14 (special servers).
+- **Freeze the signed envelope** ([17](17-signed-documents.md)): payload framing, domain
+  separation, `channelSequence` vs `releaseSequence`, mutability classes.
+- **Freeze the normative contract** ([18](18-normative-contract.md)): identifier grammar, digest
+  domain registry, `FileSetId` framing, JSON rules, identity-only content rules.
+- **Publish the JSON Schemas and golden vectors** — generated from the C# models, with valid and
+  invalid fixtures for each document.
 - Solution scaffold, `Directory.Build.props`, `Directory.Packages.props`, `.editorconfig`
   inherited from the sibling repo conventions.
-- CI skeleton on Gitea: build, test, secret scan, architecture tests.
+- CI skeleton on Gitea: build, test, secret scan, architecture tests, **schema validation**.
 - Architecture tests **first**, so the layering in [03](03-architecture.md) §3 is enforced from
   commit one rather than retrofitted.
 
-**Exit:** `dotnet build` and `dotnet test` green on an empty but correctly layered solution.
+**Exit:** `dotnet build` and `dotnet test` green on an empty but correctly layered solution, and
+the signed-envelope golden vectors verify against a throwaway reference implementation. **No
+byte-level format decision remains open after this phase.**
 
 ---
 
@@ -87,7 +102,7 @@ without a validator.
 - Hashing pipeline with the `(path, size, mtime) → hash` cache.
 - `slice.yaml` + slicer with `unmatched: error`, `rewrite`, and `policy`.
 - File-table sharding — `xxh3_64` pinned and golden-vectored.
-- Compression policy with `StoredSize`.
+- Identity-only CAS; no encoding decision in the hash pipeline.
 - `release new`, `release check` (**both tiers**), `release publish`, `coverage.json`.
 - `channel promote` / `rollback` with conditional write.
 - Signature **fields and canonicalisation** wired in, even if the first key is a dev key.

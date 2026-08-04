@@ -43,12 +43,15 @@ have the API write `X` at the key asserting `sha512 = H` — using the API's own
 authority. A textbook confused deputy, in the design's *strongest* integrity mode, on the backend
 the plan calls the safest.
 
-**Resolved** — [16](16-publish-protocol.md) §5.1: **the CAS is re-keyed to SHA-256**, so the
-checksum S3 enforces *is* the key. The confused deputy is closed by construction on the primary
-backend rather than compensated for with a mandatory re-read. Side benefits: no verification
-egress on S3 single PUT, hex digests halve (~6.4 MB saved across a 200k-entry file table), and
-SHA-256 has hardware acceleration on every current x64 and ARMv8 CPU while SHA-512 has none on
-x86.
+Re-keying to SHA-256 was **necessary but not sufficient**, and an external review caught the gap:
+S3 checksums the *uploaded body*, so with compressed blobs it still validated `sha256(compressed)`
+against a key asserting `sha256(uncompressed)`. The same defect in a new costume.
+
+**Resolved** by two changes together — SHA-256 keying ([16](16-publish-protocol.md) §5.1) **and**
+**identity-only storage** ([18](18-normative-contract.md) §5). With stored bytes ≡ content bytes,
+the checksum S3 enforces genuinely *is* the CAS key. Side benefits: no verification egress on S3
+single PUT, hex digests halve, SHA-256 is hardware-accelerated on every current x64/ARMv8 CPU, and
+the compressed-resume problem disappears with it.
 
 **Residual risk**, and it is real: storage enforcement does **not** cover S3 multipart above
 5 GiB (SHA-256 there is `COMPOSITE` — a checksum of part checksums, not of the object), Azure
@@ -131,12 +134,12 @@ monotonic-sequence rule.
 **Severity: catastrophic. Likelihood: high. This is the most likely single cause of a day-one
 total failure on the HTTP and S3 backends.**
 
-The codec is encoded in the key (`{hash}.zst`) and decoded client-side. If the origin *also*
-applies transport compression — nginx `gzip on` / `gzip_static on`, CloudFront or Cloudflare
+Blobs are stored and served as raw content bytes. If the origin applies transport compression — nginx `gzip on` / `gzip_static on`, CloudFront or Cloudflare
 auto-compression, or an uploader setting `Content-Encoding` on the S3 object — then a .NET
 client with `AutomaticDecompression` enabled receives **decoded** bytes and the SHA-256 check
 fails **100% of the time**; and `Range` offsets refer to **encoded** octets, so every resume is
-wrong.
+wrong. (At-rest compression is gone, but this risk is about the **HTTP header**, which an origin
+can add to any response, and it remains live.)
 
 The reference never configured decompression on its patch clients at all (the only
 `AutomaticDecompression` in the tree is `Apro.AutoUpdater.PlayGround/Program.cs:19`) and
@@ -224,7 +227,7 @@ golden-vectored against the RFC's own test vectors.
 **Severity: high. Likelihood: moderate.**
 
 `channels/{c}.json` is read-decide-write. Two concurrent `4sup channel promote` runs lose an
-update and `previousReleaseId` silently becomes wrong — **breaking rollback exactly when it is
+update and the channel silently regresses — **breaking rollback exactly when it is
 needed.** S3/MinIO/R2 have compare-and-swap; local can use `FileMode.CreateNew`; B2's S3
 endpoint cannot reliably; **FTP has nothing at all** — `RNTO` overwrite semantics are
 server-dependent.
@@ -414,17 +417,16 @@ architecture rule that every value type used as a dictionary key has both.
 
 ---
 
-## R-19 — Encoding fork
+## R-19 — Encoding fork — CLOSED
 
-**Severity: moderate. Likelihood: low with one canonical codec.**
+**Severity: was moderate. Now structurally impossible.**
 
-The same content stored as both `.gz` and `.zst` by two build agents; GC then deletes a
-still-referenced encoding and 404s an entire variant.
+The same content stored under two representations by two build agents; GC then collects one and
+404s an entire variant for every client.
 
-**Mitigation** — [05](05-repository-format.md) I-7, `PKG013`: exactly one canonical encoding per
-repository, declared in `repo.json`, with the invariant
-`entry.Encoding ∈ { Identity, canonicalEncoding }` gate-checked. A build agent that cannot
-produce the canonical codec fails the publish rather than forking a blob.
+**Closed** by identity-only storage ([18](18-normative-contract.md) §5): one hash, one object,
+no representation axis. `RepositoryDescriptor.canonicalEncoding` and the `PKG013 EncodingFork`
+diagnostic were removed along with the hazard they guarded.
 
 ---
 

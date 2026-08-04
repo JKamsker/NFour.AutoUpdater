@@ -86,14 +86,20 @@ Writes go into the layer that already defines the key, else the outermost layer 
 
 ## 4. Promote and roll back
 
+Both mutate a signed control document, so **both require a signer** — the API cannot author one
+([17](17-signed-documents.md) §4.4). The first draft named a signer only on `release publish`,
+which made the channel workflow unexecutable as written (review **H12**).
+
 ```bash
-4sup channel promote  fourstory.client live --release 2026.02.15-a
-4sup channel rollback fourstory.client live                # uses previousReleaseId
+4sup channel promote  fourstory.client live --release 2026.02.15-a --sign 4s-2026
+4sup channel rollback fourstory.client live --sign 4s-2026     # new pointer, older release
 4sup channel show     fourstory.client live
+4sup channel yank     fourstory.client --release 2026.02.15-a --effect block-install --sign 4s-2026
 ```
 
-`promote` requires `IConditionalWriteStore`. On FTP or B2 it demands
-`--force-unsafe-promote` and warns ([08](08-publishing-and-validation.md) §4.1).
+Each constructs the payload locally at `channelSequence + 1`, signs it, and submits the envelope
+for verify-and-place. `promote` additionally requires `IConditionalWriteStore`; on FTP or B2 it
+demands `--force-unsafe-promote` and warns ([08](08-publishing-and-validation.md) §4.1).
 
 ## 5. Maintenance
 
@@ -110,13 +116,18 @@ undetectable precisely because nothing observed it.
 
 ## 6. Client
 
+Each `--select` carries **exactly one axis**. Multiple values for a `Many` axis are repeated
+flags, never comma-separated — a comma cannot separate both axes and values without ambiguity
+(review **H12**).
+
 ```bash
 4sup install "remote/fourstory.client@live" "C:\Games\4Story" \
-             --select arch=x64 --select ui=classic --select language=de,en
+             --select arch=x64 --select ui=classic \
+             --select language=de --select language=en
 
 4sup update  "C:\Games\4Story"
 4sup switch  "C:\Games\4Story" --select ui=modern
-4sup rollback "C:\Games\4Story"                    # to the previous release in the ledger
+4sup rollback "C:\Games\4Story" --to 2026.02.14-a  # local rollback; target is explicit
 
 # Dry run: writes, deletes, bytes, peak space per volume. Touches nothing.
 4sup plan    "C:\Games\4Story" --select ui=modern --json
@@ -150,18 +161,23 @@ answerable in one command, not by reading manifests. Its release-side twin,
 
 ## 7. Exit codes
 
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 1 | Validation failed — one or more `Error` diagnostics |
-| 2 | Usage error |
-| 3 | Network or backend failure (retryable) |
-| 4 | Precondition failed — free space, locked file, `minimumClientVersion` |
-| 5 | Signature or integrity verification failed |
-| 75 | Temporary failure; the caller should retry (`EX_TEMPFAIL`) |
+One stable code per condition category, no overlaps. The first draft had `3` and `75` both
+meaning "retryable", which is two codes for one condition (review **H12**).
 
-Distinguishing 3 from 5 matters: a CI pipeline retries a network failure and must **never**
-retry an integrity failure.
+| Code | Meaning | Retryable |
+|---|---|---|
+| 0 | Success | — |
+| 1 | Validation failed — one or more `Error` diagnostics | no |
+| 2 | Usage error | no |
+| 3 | Network or backend failure | **yes** |
+| 4 | Precondition failed — free space, locked file, `minimumClientVersion`, unsafe root | no |
+| 5 | Signature, digest or integrity verification failed | **never** |
+| 6 | Concurrency — lock held, or a conditional write lost its race | **yes** |
+| 7 | Cancelled by the user | no |
+
+Distinguishing 3 from 5 matters most: a CI pipeline retries a network failure and must **never**
+retry an integrity failure — a retry loop against a poisoned mirror is how a transient
+compromise becomes a sustained one.
 
 ## 8. Output
 

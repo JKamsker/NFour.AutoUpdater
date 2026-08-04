@@ -28,7 +28,17 @@ backend, asserting identical observable behaviour.
 | FTP | vsftpd container |
 | HTTP | nginx container serving a local tree read-only |
 
-Asserted, for each:
+**Every assertion is capability-conditioned.** A backend is tested against the interfaces it
+*implements*, and an operation it does not support must be **absent from its typed surface** —
+the test asserts the interface is not implemented, not that the call throws (review **H9**).
+Requiring write and create-if-absent from HTTP, which is read-only, would be testing a
+requirement that does not exist.
+
+Deployment *profiles* are tested as composites rather than as impossible standalone backends —
+notably **FTP publisher + HTTP client origin**, which is the recommended real topology and which
+no single-backend test exercises.
+
+Asserted, for each backend that declares the relevant capability:
 
 - Idempotent `PutAsync` — writing identical content twice is a no-op.
 - `PutIfAbsentAsync` under **concurrency** — N parallel writers, exactly one wins.
@@ -73,6 +83,33 @@ It asserts:
 
 This is the single most valuable test category the new system needs, and the reference has
 exactly one instance of the pattern (`MigrationTests` with a checked-in `litedb_V0.db`).
+
+## 3.1 Signed-envelope golden vectors
+
+The cross-implementation contract from [17](17-signed-documents.md) §6 and
+[18](18-normative-contract.md). These are the vectors a second implementation is verified
+against, so they ship as data, not as C#:
+
+- Payloads containing non-ASCII, escaped characters, large and negative integers, reordered
+  properties, unknown fields, and empty objects — all producing the same signature result,
+  proving the payload is never re-serialised.
+- A payload with a **duplicate key** — must be rejected, not last-wins.
+- A rollback chain 417 → 418 → 419-naming-417, with the expected accept/reject at each step.
+- Key rotation with overlapping validity; documents signed under the old key still verify.
+- A revocation that would empty the trusted set — must be refused.
+- An envelope whose `type` does not match its payload — must be rejected (domain separation).
+
+## 3.2 Adversarial path tests
+
+For [07](07-client-engine.md) §3.7. Each is a real filesystem manipulation, not a mock:
+
+- A directory junction planted under the install root between scan and apply.
+- A symlink swapped for a regular file mid-apply (TOCTOU).
+- A mount point where a managed directory is expected.
+- A case-colliding pair on a case-insensitive volume.
+- A parent directory replaced between validation and write.
+- An install root that is itself a reparse point, and one that is world-writable under
+  elevation — both must refuse with exit code 4.
 
 ## 4. Pinned-format tests
 

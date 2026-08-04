@@ -83,10 +83,10 @@ irreversible fleet-wide brick with no remote recovery.
 ## 4. Signing mechanics
 
 - **Ed25519.** Small keys and signatures, no parameter choices to get wrong.
-- **Canonicalisation: RFC 8785 (JCS)**, or — preferred — sign the exact bytes and never
-  reserialise. Without this, any change in property ordering, whitespace, number formatting or a
-  `System.Text.Json` version bump invalidates every published signature with no migration path.
-  Free to fix now; unfixable later.
+- **One envelope format, no implementation choice** — a detached envelope carrying the payload as
+  base64url bytes, defined normatively in [17](17-signed-documents.md) §2. The earlier text
+  permitted *either* RFC 8785 *or* exact-bytes signing, which is two incompatible protocols; it
+  also embedded the signature inside the bytes it signed, which is recursive. Both are fixed there.
 - **What is signed:** `ChannelPointer` and `ReleaseLock`. Everything else is covered transitively.
 - **Rotation:** overlapping validity windows; clients accept any pinned key valid at the
   document's `createdAt`.
@@ -163,6 +163,44 @@ attacker who uploads garbage under a hash that will legitimately appear later ma
 bytes permanently unpublishable. `POST /blobs/{hash}/quarantine`, `verify-repo --deep
 --rehash-cas`, and `blobs/query` reporting present only for `verifiedAt` placements
 ([16](16-publish-protocol.md) §7.1).
+
+## 6.1 `repo.json` is unsigned, so its templates are constrained
+
+`repo.json` is class D — mutable, unsigned, and **never trusted for an install decision**
+([17](17-signed-documents.md) §3). But it supplies layout templates and mirror URLs, so a
+compromised origin could use it to redirect fetches. Hash checking stops content substitution; it
+does not stop denial of service, tracking, credential leakage, or SSRF when the fetcher runs
+server-side (review **H14**).
+
+Therefore:
+
+- **Templates resolve to relative object keys only.** An allowlist of placeholders
+  (`{alg} {h0:2} {h2:4} {hash} {productId} {packageId} {version} {releaseId} {channel} {page}`);
+  anything else is rejected. A template that produces an absolute URL, a scheme, an authority,
+  `..`, a percent-encoded traversal, or a leading `/` is rejected.
+- **`blobBaseUrls` entries must be same-origin with the configured repository URL, or appear in a
+  client-side allowlist.** A repository cannot introduce a new origin to a client that did not
+  already trust it.
+- **Schemes are limited to `https` (and `http` only when the configured repository is already
+  `http`).** Never `file:`, never `ftp:` on the read path.
+- **Server-side fetchers additionally refuse** loopback, link-local, and RFC 1918 destinations,
+  because there the redirect is an SSRF primitive rather than a nuisance.
+
+## 6.2 Two distribution profiles
+
+The blanket claim that "players hold no credential" is true of the public profile and not of the
+protected one; conflating them hides a real difference (review **H18**).
+
+| | **Public** (default) | **Protected** |
+|---|---|---|
+| Read auth | none | short-lived scoped token via the content gateway |
+| Client holds | nothing | a token, cached in memory, refreshed |
+| Use | `live` for players | internal/`ptr` builds, embargoed content |
+| Signed-object identity | unaffected | **unaffected** — tokens never enter a digest or a signature |
+
+The last row is the invariant that matters: a protected repository serves *byte-identical*
+objects to a public one. Authorisation gates access; it never changes content, because content
+that varies by reader cannot be content-addressed.
 
 ## 7. Anonymous reads
 

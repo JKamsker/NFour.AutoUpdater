@@ -60,9 +60,11 @@ products/fourstory.client/channels/live.json   ← everyone
 products/fourstory.client/channels/ptr.json    ← opt-in testers
 ```
 
-A client follows one channel. Promotion is a single write; rollback is a single write using
-`previousReleaseId`. Each channel has its own monotonic sequence, so `ptr` running ahead of
-`live` never causes a client on either to refuse an update.
+A client follows one channel. Promotion and rollback are each a single write of a **newly signed**
+channel pointer whose `channelSequence` strictly increases — a rollback points at an older
+`releaseId` while still moving the channel forward ([17](17-signed-documents.md) §4). Each channel
+has its own sequence, so `ptr` running ahead of `live` never causes a client on either to refuse
+an update.
 
 Channel membership is client configuration, so a player can opt into `ptr` by editing a file.
 That is a content-disclosure nuisance, not a security failure — and non-public builds belong in a
@@ -87,7 +89,7 @@ What remains is **channels**, and they carry the whole load:
 | Everyone on the current build | `channels/live.json`; the launcher follows it |
 | Pre-release testing | `channels/ptr.json`; testers opt in by configuration |
 | Staged rollout | Promote `ptr` → `live` when satisfied. The gate is a human, not a percentage |
-| Emergency rollback | One write to `live.json` using `previousReleaseId` |
+| Emergency rollback | One newly signed `live.json` at `channelSequence + 1` naming the prior release |
 | Internal builds | A separate repository root ([10](10-security.md) §7) |
 
 Consequences worth stating plainly:
@@ -97,7 +99,7 @@ Consequences worth stating plainly:
   identity.
 - **Telemetry becomes purely diagnostic** — useful for spotting a bad release in aggregate,
   never a control input. That was already true once reads went anonymous
-  ([§2.1](#21-what-anonymity-costs-rollout-gating)); now nothing depends on it at all.
+  (§2.1); now nothing depends on it at all.
 - **The API's scope narrows to authoring.** Packages, releases, channels, grants, GC. It is a
   publishing service, not a fleet manager.
 
@@ -148,7 +150,7 @@ Product ──┬── Package ── PackageVersion ── PackageVersionFileT
           ├── Release (published index row: lockDigest, coverageDigest, signedBy, projectionState)
           └── Channel (current, previous, sequence, pointerDigest, projectionState)
 
-BlobRef (hash, algorithm, size, storedSize, encoding, firstSeenAt)
+BlobRef (hash, algorithm, size, firstSeenAt)
   └── BlobPlacement (blobRefId, backendId, key, verifiedAt)        ◀── verifiedAt is load-bearing
 
 PublishSession ── UploadGrant (grantId, stagingKey, expectedDigest, expiresAt, consumedAt)
@@ -191,9 +193,18 @@ cannot outrank an Ed25519 signature.
 | Trust roots | public key metadata only | `trustedKeys[]` (advisory) | **neither — the client's pinned key wins** |
 
 The channel row deserves its wording: the database says where the channel *should* point; the
-object says where clients *are actually being sent*. A reconciler drives storage toward the
-database and **alerts on divergence** rather than silently correcting, because divergence means
-either a failed projection or an unauthorised direct write.
+object says where clients *are actually being sent*.
+
+The reconciler's authority is split by mutability class, not left ambiguous (review **M17**):
+
+| Divergence | Action |
+|---|---|
+| Class D (indexes, `repo.json`, bundles) missing or stale | **Auto-heal.** Regenerable and untrusted; no approval needed |
+| Class C (a channel pointer whose bytes differ from the recorded digest) | **Alert, require approval.** It is a failed projection *or* an unauthorised direct write, and the API cannot tell which — nor can it re-sign |
+| Class A/B (a release lock or blob whose digest does not match) | **Mark the repository unavailable.** That is corruption, not drift |
+
+The API can never silently correct a class-C divergence, because correcting it means producing a
+signed document, which it is structurally forbidden from doing.
 
 ## 5. Degradation — what works with the API down
 
@@ -231,13 +242,13 @@ Versioned under `/api/v1`. Read endpoints are anonymous; every write endpoint is
 
 | Verb | Route | Purpose |
 |---|---|---|
-| `POST` | `/repositories/{repo}/blobs/query` | Batched existence probe — **repo-scoped** |
+| `POST` | `/repositories/{repo}/blobs/query` | Batched existence probe — **repo-scoped**; an unscoped variant would be a global hash-existence oracle and must not exist |
 | `POST` | `/repositories/{repo}/publish/sessions` | Open a staging session |
 | `POST` | `/publish/sessions/{id}/grants` | Mint per-object upload grants |
 | `POST` | `/publish/sessions/{id}/seal` | Close; triggers verify + promote |
-| `POST` | `/packages/{id}/versions` | Create a draft version |
-| `POST` | `/packages/{id}/versions/{v}/files` | Register verified blobs to paths |
-| `POST` | `/packages/{id}/versions/{v}/publish` | Freeze immutable |
+| `POST` | `/repositories/{repo}/packages/{id}/versions` | Create a draft version |
+| `POST` | `/repositories/{repo}/packages/{id}/versions/{v}/files` | Register the **file-table shard header** — not per-file rows; paths live in shard blobs (§3.1) |
+| `POST` | `/repositories/{repo}/packages/{id}/versions/{v}/publish` | Freeze immutable |
 | `POST` | `/products/{p}/releases/drafts` | Create/edit a release draft, axes, requirements, pins |
 | `POST` | `/products/{p}/releases/drafts/{d}/check` | Run the publish gate; returns diagnostics |
 
@@ -250,7 +261,7 @@ oracle over every product in the installation.
 |---|---|---|
 | `PUT` | `/products/{p}/releases/{r}/lock` | **Verify-and-place** a signed lock (opaque bytes) |
 | `PUT` | `/products/{p}/channels/{c}` | **Verify-and-place** a signed pointer (opaque bytes) |
-| `POST` | `/products/{p}/channels/{c}/rollback` | Place the previous signed pointer |
+| `PUT` | `/products/{p}/channels/{c}` | Verify-and-place a signed pointer. Rollback is the same route with a new pointer naming an older release |
 | `POST` | `/products/{p}/releases/{r}/yank` | Mark yanked |
 | `POST` | `/blobs/{hash}/quarantine` | **CAS repair path** — see [16](16-publish-protocol.md) §7.1 |
 | `POST` | `/repositories/{repo}/gc` | Mark-and-sweep with quarantine |
