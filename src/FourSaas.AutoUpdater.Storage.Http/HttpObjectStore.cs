@@ -33,10 +33,21 @@ public sealed class HttpObjectStore : IReadableObjectStore
         response.EnsureSuccessStatusCode();
         var encoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
         if (encoding is not null) { response.Dispose(); throw new InvalidDataException($"Blob '{key}' was served with forbidden Content-Encoding '{encoding}'."); }
+        var actualStartOffset = 0L;
+        if (response.StatusCode == System.Net.HttpStatusCode.PartialContent)
+        {
+            var range = response.Content.Headers.ContentRange;
+            if (range is null || range.From is null || range.From.Value != offset)
+            {
+                response.Dispose();
+                throw new InvalidDataException($"Blob '{key}' returned an invalid Content-Range for offset {offset}.");
+            }
+            actualStartOffset = range.From.Value;
+        }
         return new ReadResult
         {
             Content = new ResponseStream(response),
-            ActualStartOffset = response.StatusCode == System.Net.HttpStatusCode.PartialContent ? offset : 0,
+            ActualStartOffset = actualStartOffset,
             StatusCode = (int)response.StatusCode,
             Validator = ReadValidator(response),
             ContentEncoding = null
@@ -49,7 +60,7 @@ public sealed class HttpObjectStore : IReadableObjectStore
         response.EnsureSuccessStatusCode();
         var encoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
         if (encoding is not null) throw new InvalidDataException($"Blob '{key}' was served with forbidden Content-Encoding '{encoding}'.");
-        return new ObjectHead(response.Content.Headers.ContentLength ?? -1, ReadValidator(response), null, response.Content.Headers.ContentType?.MediaType, response.Headers.AcceptRanges.Contains("bytes"), response.Content.Headers.LastModified?.ToUniversalTime());
+        return new ObjectHead(response.Content.Headers.ContentLength ?? -1, ReadValidator(response), null, response.Content.Headers.ContentType?.MediaType, response.Headers.AcceptRanges.Contains("bytes"), response.Content.Headers.LastModified?.ToUniversalTime(), response.Headers.CacheControl?.ToString());
     }
     public async ValueTask DisposeAsync() { if (_ownsClient) _client.Dispose(); await ValueTask.CompletedTask; }
     private static ObjectValidator? ReadValidator(HttpResponseMessage response) => response.Headers.ETag is { } etag ? new(ObjectValidatorKind.ETag, etag.Tag, !etag.IsWeak) : response.Content.Headers.LastModified is { } modified ? new(ObjectValidatorKind.LastModified, modified.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture), false) : null;

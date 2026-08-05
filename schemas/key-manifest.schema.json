@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4story.example/schemas/key-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "keySequence", "keys", "revokedKeyIds"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "keySequence": { "type": "integer", "minimum": 1 },
+    "keys": { "type": "array", "items": { "$ref": "#/$defs/key" } },
+    "revokedKeyIds": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$" } }
+  },
+  "$defs": {
+    "key": {
+      "type": "object", "additionalProperties": false,
+      "required": ["keyId", "algorithm", "publicKey", "notBefore", "notAfter"],
+      "properties": {
+        "keyId": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", "maxLength": 64 },
+        "algorithm": { "const": "ed25519" },
+        "publicKey": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "notBefore": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" },
+        "notAfter": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" }
+      }
+    }
+  }
+}

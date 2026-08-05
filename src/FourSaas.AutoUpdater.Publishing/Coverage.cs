@@ -24,21 +24,37 @@ public sealed class CoverageGenerator
     public async ValueTask<(CoverageDocument Document, ContentHash Digest)> GenerateAsync(ReleaseLock release, IPackageRepository repository, CancellationToken cancellationToken = default)
     {
         var points = ImmutableArray.CreateBuilder<CoveragePoint>(); var resolver = new VariantResolver(); var composer = new FileSetComposer();
-        var selections = SelectionEnumerator.Enumerate(release.Axes, 4096); var mode = selections.Length < 4096 ? "exhaustive" : "sampled";
+        var exhaustive = SelectionEnumerator.EstimatedCount(release.Axes, 4097) <= 4096;
+        var selections = exhaustive ? SelectionEnumerator.Enumerate(release.Axes, 4096) : SelectionEnumerator.EnumeratePairwise(release.Axes, 4096);
+        var mode = exhaustive ? "exhaustive" : "sampled";
         foreach (var selection in selections)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var resolved = resolver.Resolve(release, selection);
-            if (!resolved.IsValid) continue;
+            if (!resolved.IsValid) throw new InvalidDataException($"Coverage selection '{selection.ToCanonicalString()}' is invalid: {string.Join("; ", resolved.Diagnostics.Where(x => x.IsError).Select(x => x.Code + " " + x.Message))}");
             var composed = await composer.ComposeAsync(repository, resolved, cancellationToken).ConfigureAwait(false);
-            points.Add(new CoveragePoint { Selection = selection.ToCanonicalString(), Packages = resolved.Packages.Select(x => x.Id.Value).ToImmutableArray(), FileCount = composed.Files.Count, InstallSize = composed.Files.Values.Sum(x => x.Size), DownloadSize = resolved.Packages.Sum(x => x.Pin.DownloadSize), FileSetId = composed.FileSetId });
+            if (!composed.IsValid) throw new InvalidDataException($"Coverage selection '{selection.ToCanonicalString()}' has composition errors: {string.Join("; ", composed.Diagnostics.Where(x => x.IsError).Select(x => x.Code + " " + x.Message))}");
+            var uniqueBlobs = new Dictionary<ContentHash, long>();
+            foreach (var package in resolved.Packages)
+            {
+                var manifest = await repository.GetManifestAsync(package.Pin.Id, package.Pin.Version, cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"Manifest '{package.Pin.Id}@{package.Pin.Version}' is missing.");
+                await foreach (var entry in repository.ReadFileTableAsync(manifest, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
+                    if (entry.Kind == FileEntryKind.File) uniqueBlobs.TryAdd(entry.Content, entry.Size);
+            }
+            points.Add(new CoveragePoint { Selection = selection.ToCanonicalString(), Packages = resolved.Packages.Select(x => x.Id.Value).ToImmutableArray(), FileCount = composed.Files.Count, InstallSize = composed.Files.Values.Sum(x => x.Size), DownloadSize = uniqueBlobs.Values.Sum(), FileSetId = composed.FileSetId });
         }
         var withoutDigest = new CoverageDocument { ReleaseId = release.ReleaseId, Mode = mode, PointCount = points.Count, Points = points.ToImmutable() };
-        var digest = ContentHash.Compute(Serialize(withoutDigest));
+        var digest = ContentHash.Compute(SerializeForDigest(withoutDigest));
         return (withoutDigest with { Digest = digest }, digest);
     }
 
     public static byte[] Serialize(CoverageDocument document)
+    {
+        if (document.Digest is not { IsValid: true }) throw new InvalidDataException("Coverage documents written to a repository must carry their digest.");
+        return JsonSerializer.SerializeToUtf8Bytes(document, RepositoryJson.Options);
+    }
+
+    public static byte[] SerializeForDigest(CoverageDocument document)
     {
         var copy = document with { Digest = null };
         return JsonSerializer.SerializeToUtf8Bytes(copy, RepositoryJson.Options);

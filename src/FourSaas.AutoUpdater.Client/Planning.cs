@@ -25,6 +25,8 @@ public sealed record InstallPlan
     public required long BytesToWrite { get; init; }
     public required ImmutableDictionary<string, long> PeakFreeSpaceRequiredByVolume { get; init; }
     public required long NetInstallDelta { get; init; }
+    public ImmutableDictionary<VirtualPath, FileIdentity> ParentIdentities { get; init; } = ImmutableDictionary<VirtualPath, FileIdentity>.Empty;
+    public FileIdentity? RootIdentity { get; init; }
 }
 
 public interface ITreeScanner
@@ -70,10 +72,25 @@ public sealed class InstallPlanner : IInstallPlanner
                 if (had.Policy == FileInstallPolicy.Preserve || had.State == "adopted") operations.Add(new FileOperation.Orphan(path, had.Owner, "Preserve policy protects unmanaged content."));
                 else operations.Add(new FileOperation.Delete(path, had.Owner));
             }
-        var peak = operations.OfType<FileOperation.Write>().GroupBy(_ => observed.InstallRoot, StringComparer.Ordinal).ToImmutableDictionary(x => x.Key, x => x.Sum(y => y.Size));
+        var stagingBytes = blobs.Sum(x => target.Files.Values.First(y => y.Content == x.Key).Size);
+        // Staging remains present until the ledger commit completes.  Account for every
+        // materialised write at the same time; using only the largest write understated the
+        // required free space for a multi-file update and could fail halfway through apply.
+        var peakBytes = stagingBytes + operations.OfType<FileOperation.Write>().Sum(x => x.Size);
+        var volume = Path.GetPathRoot(Path.GetFullPath(observed.InstallRoot)) ?? observed.InstallRoot;
+        var peak = ImmutableDictionary<string, long>.Empty.SetItem(volume, peakBytes);
         var removedBytes = current is null ? 0 : current.Where(x => operations.Any(op => op is FileOperation.Delete delete && delete.Path == x.Key)).Sum(x => x.Value.Size);
         var net = operations.OfType<FileOperation.Write>().Sum(x => x.Size) - removedBytes;
-        return new InstallPlan { Operations = operations.ToImmutable(), BlobsToFetch = blobs.Values.ToImmutableArray(), BytesToDownload = blobs.Values.Sum(x => target.Files.Values.First(y => y.Content == x.Content).Size), BytesToWrite = writeBytes == 0 ? operations.OfType<FileOperation.Write>().Sum(x => x.Size) : writeBytes, PeakFreeSpaceRequiredByVolume = peak, NetInstallDelta = net };
+        var parents = ImmutableDictionary.CreateBuilder<VirtualPath, FileIdentity>();
+        foreach (var operation in operations)
+        {
+            var separator = operation.Path.Value.LastIndexOf('/');
+            if (separator <= 0) continue;
+            var parent = new VirtualPath(operation.Path.Value[..separator]);
+            if (observed.Entries.TryGetValue(parent, out var parentObservation) && parentObservation.Identity is { } identity) parents[parent] = identity;
+        }
+        FileIdentity? rootIdentity = FileIdentityProvider.TryGet(observed.InstallRoot, out var observedRoot) ? observedRoot : null;
+        return new InstallPlan { Operations = operations.ToImmutable(), BlobsToFetch = blobs.Values.ToImmutableArray(), BytesToDownload = stagingBytes, BytesToWrite = writeBytes == 0 ? operations.OfType<FileOperation.Write>().Sum(x => x.Size) : writeBytes, PeakFreeSpaceRequiredByVolume = peak, NetInstallDelta = net, ParentIdentities = parents.ToImmutable(), RootIdentity = rootIdentity };
 
         void AddBlob(ContentHash content, long size) { if (!blobs.ContainsKey(content)) blobs[content] = new BlobLocator(content); }
     }
@@ -85,17 +102,28 @@ public sealed class LocalTreeScanner : ITreeScanner
     public async ValueTask<ObservedTreeSnapshot> ScanAsync(string installRoot, IEnumerable<VirtualPath> ledgerPaths, IEnumerable<VirtualPath> targetPaths, HashPolicy hashPolicy, CancellationToken cancellationToken = default)
     {
         var entries = ImmutableDictionary.CreateBuilder<VirtualPath, ObservedEntry>();
-        foreach (var path in ledgerPaths.Concat(targetPaths).Distinct())
+        var requested = new HashSet<VirtualPath>(ledgerPaths.Concat(targetPaths));
+        foreach (var path in requested.ToArray())
+        {
+            var components = path.Value.Split('/');
+            for (var count = 1; count < components.Length; count++) requested.Add(new VirtualPath(string.Join('/', components.Take(count))));
+        }
+        foreach (var path in requested)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var full = Resolve(installRoot, path);
             var info = new FileInfo(full);
-            if (Directory.Exists(full)) entries[path] = new(path, true, ObservedKind.Directory, 0, new DateTimeOffset(Directory.GetLastWriteTimeUtc(full)).ToUnixTimeSeconds(), null, null);
+            if (Directory.Exists(full))
+            {
+                var directory = new DirectoryInfo(full);
+                var isReparse = directory.Attributes.HasFlag(FileAttributes.ReparsePoint);
+                entries[path] = new(path, true, isReparse ? ObservedKind.Reparse : ObservedKind.Directory, 0, new DateTimeOffset(directory.LastWriteTimeUtc).ToUnixTimeSeconds(), FileIdentityProvider.TryGet(full, out var directoryIdentity) ? directoryIdentity : null, null);
+            }
             else if (info.Exists)
             {
                 ContentHash? hash = null;
                 if (hashPolicy != HashPolicy.Never) await using (var stream = info.OpenRead()) hash = await ContentHash.ComputeAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-                entries[path] = new(path, true, info.Attributes.HasFlag(FileAttributes.ReparsePoint) ? ObservedKind.Reparse : ObservedKind.File, info.Length, new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeSeconds(), new FileIdentity($"{info.Length}:{info.LastWriteTimeUtc.Ticks}"), hash);
+                entries[path] = new(path, true, info.Attributes.HasFlag(FileAttributes.ReparsePoint) ? ObservedKind.Reparse : ObservedKind.File, info.Length, new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeSeconds(), FileIdentityProvider.TryGet(full, out var fileIdentity) ? fileIdentity : new FileIdentity($"{info.Length}:{info.LastWriteTimeUtc.Ticks}"), hash);
             }
             else entries[path] = new(path, false, ObservedKind.Other, 0, 0, null, null);
         }

@@ -3,6 +3,12 @@ namespace FourSaas.AutoUpdater.Publishing;
 public sealed class PublishGate
 {
     public async ValueTask<ImmutableArray<Diagnostic>> CheckAsync(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, IFileSetComposer? composer = null, CancellationToken cancellationToken = default)
+        => await CheckCoreAsync(release, manifests, composer, null, cancellationToken).ConfigureAwait(false);
+
+    public async ValueTask<ImmutableArray<Diagnostic>> CheckAsync(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, IFileSetComposer composer, IPackageRepository repository, CancellationToken cancellationToken = default)
+        => await CheckCoreAsync(release, manifests, composer, repository, cancellationToken).ConfigureAwait(false);
+
+    private async ValueTask<ImmutableArray<Diagnostic>> CheckCoreAsync(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, IFileSetComposer? composer, IPackageRepository? repository, CancellationToken cancellationToken)
     {
         var diagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
         ValidateRelease(release, manifests, diagnostics);
@@ -13,6 +19,19 @@ public sealed class PublishGate
             {
                 if (!axes.TryGetValue(axis.Key, out var definition)) { diagnostics.Add(new("PKG003", DiagnosticSeverity.Error, $"Requirement references undeclared axis '{axis.Key}'.", requirement.Package.Value)); continue; }
                 foreach (var value in axis.Value) if (definition.IndexOf(value) < 0 && !definition.Retired.ContainsKey(value)) diagnostics.Add(new("PKG003", DiagnosticSeverity.Error, $"Requirement references unknown value '{value}'.", requirement.Package.Value));
+            }
+        }
+        foreach (var requirement in release.Requirements)
+        {
+            if (!manifests.TryGetValue(requirement.Package, out var dependent)) continue;
+            foreach (var dependency in dependent.Requires)
+            {
+                var dependencyRequirements = release.Requirements.Where(x => x.Package == dependency.Id).ToArray();
+                if (dependencyRequirements.Length == 0 || !dependencyRequirements.Any(candidate => Implies(requirement.When, candidate.When, axes)))
+                    diagnostics.Add(new("PKG007", DiagnosticSeverity.Error, $"Package '{requirement.Package}' requires '{dependency.Id}', but the dependency is not selectable wherever the dependent is.", requirement.Package.Value));
+                var pin = release.Packages.FirstOrDefault(x => x.Id == dependency.Id);
+                if (pin is null || dependency.MinSequence is { } minimum && pin.Sequence < minimum || dependency.MaxSequence is { } maximum && pin.Sequence > maximum)
+                    diagnostics.Add(new("PKG007", DiagnosticSeverity.Error, $"Package '{requirement.Package}' requires an unavailable sequence of '{dependency.Id}'.", requirement.Package.Value));
             }
         }
         for (var i = 0; i < release.Requirements.Length; i++)
@@ -28,12 +47,19 @@ public sealed class PublishGate
             }
         if (composer is not null && !diagnostics.Any(static x => x.IsError))
         {
-            var selections = SelectionEnumerator.Enumerate(release.Axes, 4096);
+            var selections = SelectionEnumerator.EstimatedCount(release.Axes, 4097) > 4096
+                ? SelectionEnumerator.EnumeratePairwise(release.Axes, 8192)
+                : SelectionEnumerator.Enumerate(release.Axes, int.MaxValue);
             foreach (var selection in selections)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var resolved = new VariantResolver().Resolve(release, selection);
                 if (resolved.Diagnostics.Any(static x => x.IsError)) { diagnostics.AddRange(resolved.Diagnostics); continue; }
+                if (repository is not null)
+                {
+                    var composed = await composer!.ComposeAsync(repository, resolved, cancellationToken).ConfigureAwait(false);
+                    diagnostics.AddRange(composed.Diagnostics);
+                }
             }
         }
         await Task.CompletedTask;
@@ -83,10 +109,94 @@ public sealed class PublishGate
             if (manifest.FileCount < 0 || manifest.InstallSize < 0 || manifest.DownloadSize < 0) diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, "Manifest counts and sizes cannot be negative.", manifest.Id.Value));
         }
     }
+
+    private static bool Implies(AxisPredicate dependent, AxisPredicate dependency, IReadOnlyDictionary<string, AxisDefinition> axes)
+    {
+        foreach (var (axis, dependencyValues) in dependency.Constraints)
+        {
+            if (!dependent.Constraints.TryGetValue(axis, out var dependentValues)) return false;
+            if (!axes.ContainsKey(axis) || !dependentValues.IsSubsetOf(dependencyValues)) return false;
+        }
+        return true;
+    }
 }
 
 public static class SelectionEnumerator
 {
+    public static long EstimatedCount(ImmutableArray<AxisDefinition> axes, long cap = long.MaxValue)
+    {
+        var total = 1L;
+        foreach (var axis in axes)
+        {
+            var choices = axis.Cardinality == AxisCardinality.One
+                ? axis.Values.Length
+                : axis.Values.Length < 20
+                    ? (1L << axis.Values.Length) - 1
+                    : checked((long)axis.Values.Length + ((long)axis.Values.Length * (axis.Values.Length - 1) / 2) + 1);
+            if (choices == 0) return 0;
+            if (total > cap / choices) return cap + 1;
+            total *= choices;
+        }
+        return total;
+    }
+
+    /// Deterministic covering array used once exhaustive enumeration exceeds the
+    /// report budget. Every value is paired with every value of every other axis;
+    /// Many axes additionally include pair and full-set choices so discriminator
+    /// changes are represented in the sample.
+    public static ImmutableArray<VariantSelection> EnumeratePairwise(ImmutableArray<AxisDefinition> axes, int maximum = 4096)
+    {
+        var choices = axes.ToDictionary(x => x.Name, PairwiseChoices, StringComparer.Ordinal);
+        var results = new List<VariantSelection>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var baseline = axes.ToDictionary(x => x.Name, x => choices[x.Name][0], StringComparer.Ordinal);
+        Add(baseline);
+        for (var i = 0; i < axes.Length && results.Count < maximum; i++)
+        {
+            for (var j = i + 1; j < axes.Length && results.Count < maximum; j++)
+                foreach (var left in choices[axes[i].Name])
+                    foreach (var right in choices[axes[j].Name])
+                    {
+                        if (results.Count >= maximum) break;
+                        var selection = new Dictionary<string, ImmutableSortedSet<string>>(baseline, StringComparer.Ordinal)
+                        {
+                            [axes[i].Name] = left,
+                            [axes[j].Name] = right
+                        };
+                        Add(selection);
+                    }
+        }
+        foreach (var axis in axes)
+            foreach (var choice in choices[axis.Name])
+            {
+                if (results.Count >= maximum) break;
+                var selection = new Dictionary<string, ImmutableSortedSet<string>>(baseline, StringComparer.Ordinal) { [axis.Name] = choice };
+                Add(selection);
+            }
+        return results.ToImmutableArray();
+
+        void Add(IReadOnlyDictionary<string, ImmutableSortedSet<string>> values)
+        {
+            if (results.Count >= maximum) return;
+            var selection = new VariantSelection { Axes = values.ToImmutableSortedDictionary(StringComparer.Ordinal) };
+            if (seen.Add(selection.ToCanonicalString())) results.Add(selection);
+        }
+
+        static ImmutableArray<ImmutableSortedSet<string>> PairwiseChoices(AxisDefinition axis)
+        {
+            var values = axis.Values.Select(x => x.Id).ToArray();
+            var result = new List<ImmutableSortedSet<string>>();
+            foreach (var value in values) result.Add(ImmutableSortedSet.Create(StringComparer.Ordinal, value));
+            if (axis.Cardinality == AxisCardinality.Many)
+            {
+                for (var i = 0; i < values.Length; i++)
+                    for (var j = i + 1; j < values.Length; j++) result.Add(ImmutableSortedSet.Create(StringComparer.Ordinal, values[i], values[j]));
+                if (values.Length > 1) result.Add(values.ToImmutableSortedSet(StringComparer.Ordinal));
+            }
+            return result.ToImmutableArray();
+        }
+    }
+
     public static ImmutableArray<VariantSelection> Enumerate(ImmutableArray<AxisDefinition> axes, int maximum = int.MaxValue)
     {
         var results = new List<VariantSelection>();

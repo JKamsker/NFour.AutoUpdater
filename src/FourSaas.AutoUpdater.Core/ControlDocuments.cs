@@ -74,6 +74,33 @@ public static class ControlDocumentPolicy
             if (!candidate.Keys.Any(x => x.KeyId != revoked && !candidate.RevokedKeyIds.Contains(x.KeyId, StringComparer.Ordinal) && x.NotBefore <= currentTime && x.NotAfter >= currentTime)) { error = $"Revoked key '{revoked}' has no valid replacement."; return false; }
         return true;
     }
+
+    public static bool ValidateKeyManifest(KeyManifest candidate, IReadOnlySet<string> alreadyTrustedKeyIds, string? pinnedRootKeyId, DateTimeOffset now, TimeSpan clockSkew, out string? error)
+    {
+        error = null;
+        if (candidate.SchemaVersion != 1) { error = $"Unsupported key manifest schemaVersion {candidate.SchemaVersion}."; return false; }
+        if (candidate.KeySequence < 1) { error = "Key sequence must be positive."; return false; }
+        if (candidate.Keys.IsDefaultOrEmpty) { error = "A key manifest must contain at least one key."; return false; }
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var key in candidate.Keys)
+        {
+            if (!Identifier.IsValid(key.KeyId, "keyId", out error) || !ids.Add(key.KeyId)) { error ??= $"Duplicate key id '{key.KeyId}'."; return false; }
+            if (!string.Equals(key.Algorithm, "ed25519", StringComparison.OrdinalIgnoreCase)) { error = $"Unsupported key algorithm '{key.Algorithm}'."; return false; }
+            byte[] publicKey;
+            try { publicKey = Base64Url.Decode(key.PublicKey); }
+            catch (FormatException ex) { error = $"Key '{key.KeyId}' public key is invalid: {ex.Message}"; return false; }
+            if (publicKey.Length != 32) { error = $"Key '{key.KeyId}' is not a 32-byte Ed25519 public key."; return false; }
+            if (key.NotAfter <= key.NotBefore) { error = $"Key '{key.KeyId}' has an invalid validity window."; return false; }
+            if (key.NotAfter < now - clockSkew || key.NotBefore > now + clockSkew) continue;
+        }
+        if (pinnedRootKeyId is not null && candidate.RevokedKeyIds.Contains(pinnedRootKeyId, StringComparer.Ordinal)) { error = "The compiled pinned root may not be remotely revoked."; return false; }
+        if (candidate.RevokedKeyIds.Any(x => !ids.Contains(x))) { error = "The key manifest revokes an unknown key."; return false; }
+        var active = candidate.Keys.Any(x => !candidate.RevokedKeyIds.Contains(x.KeyId, StringComparer.Ordinal) && x.NotBefore <= now + clockSkew && x.NotAfter >= now - clockSkew);
+        if (!active) { error = "The key manifest would leave no currently valid trusted key."; return false; }
+        if (alreadyTrustedKeyIds.Count > 0 && !candidate.Keys.Any(x => alreadyTrustedKeyIds.Contains(x.KeyId) && !candidate.RevokedKeyIds.Contains(x.KeyId)))
+        { error = "The key manifest is not chained from an already trusted key."; return false; }
+        return true;
+    }
 }
 
 public sealed record Ed25519KeyPair(byte[] PrivateKey, byte[] PublicKey)

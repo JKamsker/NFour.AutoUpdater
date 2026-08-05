@@ -3,10 +3,10 @@
   "$id": "https://4sup.invalid/schemas/state-record.schema.json",
   "oneOf": [
     { "type": "object", "additionalProperties": false, "required": ["k", "schemaVersion", "repositoryUri", "productId", "releaseId", "releaseDigest", "selection", "selectionId", "fileSetId", "appliedAt"], "properties": {
-      "k": { "const": "lock" }, "schemaVersion": { "const": 1 }, "repositoryUri": { "type": "string" }, "productId": { "type": "string" }, "channel": { "type": "string" }, "releaseId": { "type": "string" }, "releaseDigest": { "type": "string" }, "selection": { "type": "object" }, "selectionId": { "type": "string" }, "fileSetId": { "type": "string" }, "lastChannelSequence": { "type": "integer" }, "appliedAt": { "type": "string" }
+      "k": { "const": "lock" }, "schemaVersion": { "const": 1 }, "repositoryUri": { "type": "string" }, "productId": { "type": "string" }, "channel": { "type": "string" }, "releaseId": { "type": "string" }, "releaseSequence": { "type": "integer" }, "releaseDigest": { "type": "string" }, "selection": { "type": "object" }, "selectionId": { "type": "string" }, "fileSetId": { "type": "string" }, "lastChannelSequence": { "type": "integer" }, "keySequence": { "type": "integer" }, "revocationSequence": { "type": "integer" }, "trustedKeyIds": { "type": "array", "items": { "type": "string" } }, "appliedAt": { "type": "string" }
     } },
-    { "type": "object", "additionalProperties": false, "required": ["k", "p", "s", "o", "pol", "os", "mt"], "properties": {
-      "k": { "const": "f" }, "p": { "type": "string" }, "h": { "type": ["string", "null"] }, "s": { "type": "integer" }, "o": { "type": "string" }, "pol": { "type": "string" }, "os": { "type": "integer" }, "mt": { "type": "integer" }, "st": { "type": "string" }, "oh": { "type": "string" }
+    { "type": "object", "additionalProperties": false, "required": ["k", "p", "s", "o", "os", "mt"], "properties": {
+      "k": { "const": "f" }, "p": { "type": "string" }, "h": { "type": "string" }, "s": { "type": "integer" }, "o": { "type": "string" }, "pol": { "type": "string", "enum": ["preserve", "executable"] }, "os": { "type": "integer" }, "mt": { "type": "integer" }, "st": { "type": "string", "enum": ["adopted"] }, "oh": { "type": "string" }
     } }
   ]
 }

@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><IsTestProject>true</IsTestProject><NoWarn>$(NoWarn);xUnit1051</NoWarn><RootNamespace>FourSaas.AutoUpdater.Architecture.Tests</RootNamespace></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/FourSaas.AutoUpdater.Core/FourSaas.AutoUpdater.Core.csproj" /><ProjectReference Include="../../src/FourSaas.AutoUpdater.Gateway/FourSaas.AutoUpdater.Gateway.csproj" /><ProjectReference Include="../../src/FourSaas.AutoUpdater.Server/FourSaas.AutoUpdater.Server.csproj" /><PackageReference Include="Microsoft.NET.Test.Sdk" /><PackageReference Include="xunit.v3" /><PackageReference Include="xunit.runner.visualstudio" /></ItemGroup>
+</Project>

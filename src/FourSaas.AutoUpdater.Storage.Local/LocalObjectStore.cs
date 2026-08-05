@@ -3,11 +3,11 @@ using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Local;
 
-public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteStore, IServerSideCopyStore, IServerSideVerifier
+public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideVerifier
 {
     private readonly string _root;
-    private readonly ConcurrentDictionary<string, object> _locks = new(StringComparer.Ordinal);
     public LocalObjectStore(string root) => _root = Path.GetFullPath(root);
+    public string Root => _root;
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ConditionalWrite | StorageCapabilities.ServerSideCopy | StorageCapabilities.Delete;
     public int RecommendedParallelism => 16;
 
@@ -38,6 +38,7 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
         foreach (var file in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories).OrderBy(static x => x, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (IsInternalPath(file)) continue;
             var key = Path.GetRelativePath(_root, file).Replace(Path.DirectorySeparatorChar, '/');
             if (prefix is null || key.StartsWith(prefix, StringComparison.Ordinal)) yield return new ObjectKey(key);
             await Task.Yield();
@@ -47,49 +48,68 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
     {
         var destination = Resolve(key);
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-        var temporary = destination + ".tmp-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
+        var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
         try
         {
-            await using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true))
-            {
-                await content.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
-                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-            }
             File.Move(temporary, destination, overwrite: true);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
-    public ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default) { var path = Resolve(key); if (File.Exists(path)) File.Delete(path); return ValueTask.CompletedTask; }
-    public ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    public async ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
-        var gate = _locks.GetOrAdd(key.Value, static _ => new object());
-        lock (gate)
-        {
-            var destination = Resolve(key); Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            if (File.Exists(destination)) return ValueTask.FromResult(false);
-            try
-            {
-                using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: false);
-                content.CopyTo(output); output.Flush(flushToDisk: true); return ValueTask.FromResult(true);
-            }
-            catch (IOException) when (File.Exists(destination)) { return ValueTask.FromResult(false); }
-        }
+        await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
+        var path = Resolve(key);
+        if (File.Exists(path)) File.Delete(path);
     }
-    public ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
-        var gate = _locks.GetOrAdd(key.Value, static _ => new object());
-        lock (gate)
+        var destination = Resolve(key);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
+        if (File.Exists(destination)) return false;
+        var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
+        try
         {
-            var info = new FileInfo(Resolve(key));
-            if (!info.Exists || Validator(info).Value != expected.Value) return ValueTask.FromResult(false);
-            using var output = new FileStream(Resolve(key) + ".cas-tmp", FileMode.Create, FileAccess.Write, FileShare.None);
-            content.CopyTo(output); output.Flush(flushToDisk: true); output.Dispose(); File.Move(Resolve(key) + ".cas-tmp", Resolve(key), overwrite: true); return ValueTask.FromResult(true);
+            try { File.Move(temporary, destination, overwrite: false); return true; }
+            catch (IOException) when (File.Exists(destination)) { return false; }
         }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
-    public ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
+    public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
+        ValidateCasKey(key, expectedDigest);
+        var destination = Resolve(key);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
+        if (File.Exists(destination)) return false;
+        var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using var verification = File.OpenRead(temporary);
+            if (await ContentHash.ComputeAsync(verification, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false) != expectedDigest)
+                throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
+            File.Move(temporary, destination, overwrite: false);
+            return true;
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+    public async ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    {
+        var destination = Resolve(key);
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
+        var info = new FileInfo(destination);
+        if (!info.Exists || expected.Kind != ObjectValidatorKind.SizeAndMtime || Validator(info).Value != expected.Value) return false;
+        var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
+        try { File.Move(temporary, destination, overwrite: true); return true; }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+    public async ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
+    {
+        await using var keyLock = await AcquireKeyLockAsync(destination, cancellationToken).ConfigureAwait(false);
         var sourcePath = Resolve(source); var destinationPath = Resolve(destination); Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-        File.Copy(sourcePath, destinationPath, overwrite); return ValueTask.CompletedTask;
+        File.Copy(sourcePath, destinationPath, overwrite);
     }
     public async ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expected, CancellationToken cancellationToken = default)
     {
@@ -106,4 +126,40 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
         return combined;
     }
     private static ObjectValidator Validator(FileInfo info) => new(ObjectValidatorKind.SizeAndMtime, $"{info.Length}:{info.LastWriteTimeUtc.Ticks}", false);
+
+    private static void ValidateCasKey(ObjectKey key, ContentHash expectedDigest)
+    {
+        if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Value.Span).ToLowerInvariant(), StringComparison.Ordinal))
+            throw new FormatException("Content-addressed writes require a sha256 digest encoded in the final object-key segment.");
+    }
+
+    private async ValueTask<string> WriteTemporaryAsync(string destination, Stream content, CancellationToken cancellationToken)
+    {
+        var temporary = destination + ".tmp-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        await using var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await content.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+        output.Flush(flushToDisk: true);
+        return temporary;
+    }
+
+    private async ValueTask<FileStream> AcquireKeyLockAsync(ObjectKey key, CancellationToken cancellationToken)
+    {
+        var lockRoot = Path.Combine(_root, ".4sup-locks");
+        Directory.CreateDirectory(lockRoot);
+        var name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key.Value))).ToLowerInvariant() + ".lock";
+        var path = Path.Combine(lockRoot, name);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.Asynchronous); }
+            catch (IOException) { await Task.Delay(25, cancellationToken).ConfigureAwait(false); }
+        }
+    }
+
+    private bool IsInternalPath(string path)
+    {
+        var lockRoot = Path.Combine(_root, ".4sup-locks") + Path.DirectorySeparatorChar;
+        return path.StartsWith(lockRoot, StringComparison.Ordinal) || Path.GetFileName(path).Contains(".tmp-", StringComparison.Ordinal);
+    }
 }

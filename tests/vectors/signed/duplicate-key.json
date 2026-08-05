@@ -1,0 +1,1 @@
+{"type":"channel-pointer","expected":"reject","reason":"duplicate-json-property","payload":"{\"productId\":\"demo\",\"productId\":\"attacker\"}"}

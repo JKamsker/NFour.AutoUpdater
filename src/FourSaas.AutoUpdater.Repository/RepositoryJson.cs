@@ -16,8 +16,15 @@ public static class RepositoryJson
     public static PackageManifest DeserializeManifest(ReadOnlySpan<byte> bytes)
     {
         var dto = Deserialize<PackageManifestDocument>(bytes, rejectUnknownFields: true);
+        if (dto.SchemaVersion != 1) throw new FormatException($"Unsupported package schemaVersion {dto.SchemaVersion}.");
         if (!PackageId.TryCreate(dto.Id, out var id)) throw new FormatException("Manifest contains an invalid package id.");
         if (!Identifier.IsValid(dto.Version, 64)) throw new FormatException("Manifest contains an invalid package version.");
+        if (dto.Sequence < 0) throw new FormatException("Manifest sequence cannot be negative.");
+        if (dto.FileTable.Format != "jsonl/v1") throw new FormatException($"Unsupported file table format '{dto.FileTable.Format}'.");
+        if (dto.FileTable.ShardCount < 1 || dto.FileTable.ShardCount > 1_048_576 ||
+            (dto.FileTable.ShardCount & (dto.FileTable.ShardCount - 1)) != 0 ||
+            dto.FileTable.Shards.Length != dto.FileTable.ShardCount)
+            throw new FormatException("File-table shardCount must be a positive power of two matching the shard list.");
         var version = new PackageVersion(dto.Version, dto.Sequence);
         var fileTable = new FileTableRef
         {
@@ -26,6 +33,12 @@ public static class RepositoryJson
             Digest = ContentHash.Parse(dto.FileTable.Digest),
             Shards = dto.FileTable.Shards.Select(x => new FileTableShardRef { Index = x.Index, Digest = ContentHash.Parse(x.Digest), Count = x.Count, Size = x.Size }).ToImmutableArray()
         };
+        if (fileTable.Shards.Select(x => x.Index).OrderBy(x => x).SequenceEqual(Enumerable.Range(0, fileTable.ShardCount)) is false)
+            throw new FormatException("File-table shard indexes must be contiguous from zero.");
+        if (fileTable.Digest.Algorithm != HashAlgorithmId.Sha256 || fileTable.Shards.Any(x => x.Digest.Algorithm != HashAlgorithmId.Sha256))
+            throw new FormatException("Package file-table digests must use sha256.");
+        if (dto.FileCount < 0 || dto.InstallSize < 0 || dto.DownloadSize < 0)
+            throw new FormatException("Package sizes and fileCount cannot be negative.");
         return new PackageManifest
         {
             SchemaVersion = dto.SchemaVersion,
@@ -34,8 +47,8 @@ public static class RepositoryJson
             Sequence = dto.Sequence,
             Kind = dto.Kind,
             CreatedAt = dto.CreatedAt,
-            Conflicts = dto.Conflicts.Select(x => new PackageId(x)).ToImmutableArray(),
-            Requires = dto.Requires.Select(x => new PackageDependency { Id = new PackageId(x.Id), MinSequence = x.MinSequence, MaxSequence = x.MaxSequence }).ToImmutableArray(),
+            Conflicts = dto.Conflicts.Select(x => PackageId.TryCreate(x, out var conflict) ? conflict : throw new FormatException($"Invalid conflicting package id '{x}'.")).ToImmutableArray(),
+            Requires = dto.Requires.Select(x => PackageId.TryCreate(x.Id, out var dependency) ? new PackageDependency { Id = dependency, MinSequence = x.MinSequence, MaxSequence = x.MaxSequence } : throw new FormatException($"Invalid dependency package id '{x.Id}'.")).ToImmutableArray(),
             PathPrefixes = dto.PathPrefixes,
             FileTable = fileTable,
             FileCount = dto.FileCount,

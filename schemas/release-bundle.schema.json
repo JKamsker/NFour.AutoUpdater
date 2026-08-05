@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4story.example/schemas/release-bundle.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "lockEnvelope", "inline"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "lockEnvelope": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "inline": { "type": "object", "additionalProperties": { "$ref": "package.schema.json" } }
+  }
+}

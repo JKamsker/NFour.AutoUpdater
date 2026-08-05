@@ -31,10 +31,11 @@ public sealed class ConfigurationLoader
     public IReadOnlyList<string> Layers { get; }
     public ConfigurationLoader(string? contentRoot = null)
     {
-        var root = contentRoot ?? Directory.GetCurrentDirectory();
+        var root = contentRoot ?? Environment.GetEnvironmentVariable("FOURSUP_CONTENT_ROOT") ?? Directory.GetCurrentDirectory();
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         var common = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-        Layers = [Path.Combine(root, "4sup.json"), Path.Combine(appData, "4Story", "4sup", "config.json"), Path.Combine(common, "4Story", "4sup", "config.json")];
+        var configuredPath = Environment.GetEnvironmentVariable("FOURSUP_CONFIG_PATH");
+        Layers = configuredPath is null ? [Path.Combine(root, "4sup.json"), Path.Combine(appData, "4Story", "4sup", "config.json"), Path.Combine(common, "4Story", "4sup", "config.json")] : [Path.GetFullPath(configuredPath), Path.Combine(root, "4sup.json"), Path.Combine(appData, "4Story", "4sup", "config.json"), Path.Combine(common, "4Story", "4sup", "config.json")];
     }
     public FourSupConfiguration Load()
     {
@@ -54,7 +55,17 @@ public sealed class ConfigurationLoader
     }
     public async ValueTask SaveAsync(string key, JsonElement value, CancellationToken cancellationToken = default)
     {
-        var target = Layers.FirstOrDefault(File.Exists) ?? Layers[0]; Directory.CreateDirectory(Path.GetDirectoryName(target)!); Dictionary<string, JsonElement> values = [];
+        // Update the highest-precedence layer that already owns this key. New keys
+        // belong in the outermost layer, even when a lower layer happens to exist.
+        var target = Layers[0];
+        foreach (var layer in Layers)
+        {
+            if (!File.Exists(layer)) continue;
+            using var document = JsonDocument.Parse(await File.ReadAllBytesAsync(layer, cancellationToken).ConfigureAwait(false));
+            if (document.RootElement.TryGetProperty(key, out _)) { target = layer; break; }
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        Dictionary<string, JsonElement> values = [];
         if (File.Exists(target)) using (var existing = JsonDocument.Parse(await File.ReadAllBytesAsync(target, cancellationToken).ConfigureAwait(false))) foreach (var property in existing.RootElement.EnumerateObject()) values[property.Name] = property.Value.Clone();
         values[key] = value; await File.WriteAllTextAsync(target, JsonSerializer.Serialize(values, _options), cancellationToken).ConfigureAwait(false);
     }

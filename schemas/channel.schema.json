@@ -1,7 +1,9 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://4sup.invalid/schemas/channel.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://4sup.invalid/schemas/channel.schema.json",
   "type": "object", "additionalProperties": false,
   "required": ["schemaVersion", "productId", "channel", "channelSequence", "supersedesChannelSequence", "releaseId", "releaseSequence", "releaseDigest", "updatedAt"],
-  "properties": { "schemaVersion": { "const": 1 }, "productId": { "type": "string" }, "channel": { "type": "string" }, "channelSequence": { "type": "integer" }, "supersedesChannelSequence": { "type": "integer" }, "releaseId": { "type": "string" }, "releaseSequence": { "type": "integer" }, "releaseDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "reason": { "type": "string" }, "minimumClientVersion": { "type": "string" }, "updatedAt": { "type": "string" } }
+  "properties": {
+    "schemaVersion": { "const": 1 }, "productId": { "$ref": "#/$defs/id128" }, "channel": { "$ref": "#/$defs/id64" }, "channelSequence": { "type": "integer", "minimum": 1 }, "supersedesChannelSequence": { "type": "integer", "minimum": 0 }, "releaseId": { "$ref": "#/$defs/id64" }, "releaseSequence": { "type": "integer", "minimum": 1 }, "releaseDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "reason": { "type": "string" }, "minimumClientVersion": { "type": "string" }, "updatedAt": { "$ref": "#/$defs/time" }
+  },
+  "$defs": { "id128": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", "maxLength": 128 }, "id64": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", "maxLength": 64 }, "time": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" } }
 }

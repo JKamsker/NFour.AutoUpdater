@@ -4,6 +4,7 @@ namespace FourSaas.AutoUpdater.Repository;
 
 public sealed class StaticRepository : IPackageRepository, IManifestDigestRepository, IAsyncDisposable
 {
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private readonly IReadableObjectStore _store;
     public StaticRepository(IReadableObjectStore store, RepositoryDescriptor descriptor)
     {
@@ -45,6 +46,7 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
         if (manifest.FileTable.Shards.Any(static x => x.Digest.Algorithm != HashAlgorithmId.Sha256)) throw new FormatException("File-table shard digests must use sha256.");
         if (FileTableSharding.ComputeTableDigest(manifest.FileTable.Shards) != manifest.FileTable.Digest) throw new CryptographicException("File-table digest does not match its shard references.");
         var seenPaths = new HashSet<VirtualPath>();
+        var seenFoldedPaths = new Dictionary<string, VirtualPath>(StringComparer.Ordinal);
         var totalCount = 0;
         foreach (var shard in manifest.FileTable.Shards.OrderBy(static x => x.Index))
         {
@@ -56,11 +58,25 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
                 if (ContentHash.Compute(bytes) != shard.Digest) throw new InvalidDataException($"File-table shard {shard.Digest} failed its digest check.");
                 if (bytes.LongLength != shard.Size) throw new InvalidDataException($"File-table shard {shard.Index} size does not match its declaration.");
                 var shardCount = 0;
-                foreach (var line in Encoding.UTF8.GetString(bytes).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                string text;
+                try { text = StrictUtf8.GetString(bytes); }
+                catch (DecoderFallbackException ex) { throw new FormatException($"File-table shard {shard.Index} is not valid UTF-8.", ex); }
+                var lines = text.Split('\n');
+                string? previousPath = null;
+                for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
                 {
-                    var dto = RepositoryJson.Deserialize<FileEntryDocument>(Encoding.UTF8.GetBytes(line.TrimEnd('\r')));
+                    var line = lines[lineIndex];
+                    if (lineIndex == lines.Length - 1 && line.Length == 0 && text.EndsWith('\n')) continue;
+                    if (string.IsNullOrWhiteSpace(line)) throw new FormatException($"File-table shard {shard.Index} contains a blank JSONL line.");
+                    var jsonLine = line.EndsWith('\r') ? line[..^1] : line;
+                    var dto = RepositoryJson.Deserialize<FileEntryDocument>(StrictUtf8.GetBytes(jsonLine));
                     if (!VirtualPath.TryCreate(dto.Path, out var path, out var error)) throw new FormatException(error);
                     if (!seenPaths.Add(path)) throw new InvalidDataException($"File table contains duplicate path '{path}'.");
+                    if (seenFoldedPaths.TryGetValue(path.FoldedKey, out var folded) && folded != path) throw new InvalidDataException($"File table contains a case-only path collision between '{folded}' and '{path}'.");
+                    seenFoldedPaths[path.FoldedKey] = path;
+                    if (FileTableSharding.GetShardIndex(path, manifest.FileTable.ShardCount) != shard.Index) throw new InvalidDataException($"File-table entry '{path}' is in the wrong shard.");
+                    if (previousPath is not null && StringComparer.Ordinal.Compare(previousPath, path.Value) >= 0) throw new InvalidDataException($"File-table shard {shard.Index} is not sorted by path.");
+                    previousPath = path.Value;
                     if (dto.Size < 0) throw new FormatException("File-table entry size cannot be negative.");
                     ValidateMode(dto.Mode, dto.Policy);
                     if (dto.Kind == FileEntryKind.Directory)

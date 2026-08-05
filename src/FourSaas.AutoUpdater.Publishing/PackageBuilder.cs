@@ -57,6 +57,18 @@ public sealed class PackageBuilder
     private static string Prefix(string path) { var slash = path.IndexOf('/'); return slash < 0 ? path : path[..(slash + 1)]; }
     private static async ValueTask PutOnceAsync(IWritableObjectStore destination, ObjectKey key, Stream content, ContentHash expected, long length, CancellationToken cancellationToken)
     {
+        if (key.Value.StartsWith("blobs/", StringComparison.Ordinal) && destination is IContentAddressedWriteStore addressed)
+        {
+            if (await addressed.PutIfAbsentAsync(key, expected, content, length, cancellationToken).ConfigureAwait(false)) return;
+            var existingAddressed = await destination.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"CAS object '{expected}' disappeared after an existence race.");
+            await using (existingAddressed.ConfigureAwait(false))
+            {
+                await using var bytes = new MemoryStream();
+                await existingAddressed.Content.CopyToAsync(bytes, cancellationToken).ConfigureAwait(false);
+                if (ContentHash.Compute(bytes.ToArray(), expected.Algorithm) != expected) throw new CryptographicException($"Existing CAS object '{key}' failed verification.");
+            }
+            return;
+        }
         if (destination is IConditionalWriteStore conditional)
         {
             if (await conditional.PutIfAbsentAsync(key, content, length, cancellationToken).ConfigureAwait(false)) return;

@@ -3,7 +3,7 @@ using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Memory;
 
-public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteStore, IServerSideCopyStore, IServerSideVerifier
+public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideVerifier
 {
     private sealed record Entry(byte[] Bytes, DateTimeOffset LastModified, string ETag);
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
@@ -39,6 +39,7 @@ public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteS
     }
     public async ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
+        if (expected.Kind != ObjectValidatorKind.ETag || !expected.IsStrong) return false;
         var entry = await CreateEntryAsync(content, cancellationToken).ConfigureAwait(false);
         while (_entries.TryGetValue(key.Value, out var existing))
         {
@@ -47,18 +48,27 @@ public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteS
         }
         return false;
     }
+    public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    {
+        if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Value.Span).ToLowerInvariant(), StringComparison.Ordinal))
+            throw new FormatException("Content-addressed writes require a sha256 digest encoded in the final object-key segment.");
+        var entry = await CreateEntryAsync(content, cancellationToken).ConfigureAwait(false);
+        if (ContentHash.Compute(entry.Bytes, HashAlgorithmId.Sha256) != expectedDigest) throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
+        return _entries.TryAdd(key.Value, entry);
+    }
     public ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
         if (!_entries.TryGetValue(source.Value, out var entry)) throw new FileNotFoundException(source.Value);
-        if (!overwrite && _entries.ContainsKey(destination.Value)) throw new IOException("Destination already exists.");
-        _entries[destination.Value] = entry with { Bytes = entry.Bytes.ToArray() };
+        var copy = entry with { Bytes = entry.Bytes.ToArray(), LastModified = DateTimeOffset.UtcNow };
+        if (!overwrite && !_entries.TryAdd(destination.Value, copy)) throw new IOException("Destination already exists.");
+        if (overwrite) _entries[destination.Value] = copy;
         return ValueTask.CompletedTask;
     }
     public async ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expected, CancellationToken cancellationToken = default)
     {
         await using var result = await OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
         if (result is null) return false;
-        return ContentHash.Compute(await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false)) == expected;
+        return ContentHash.Compute(await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false), expected.Algorithm) == expected;
     }
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 

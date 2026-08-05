@@ -1,0 +1,10 @@
+{
+  "envelope": 1,
+  "type": "channel-pointer",
+  "payload": "eyJwcm9kdWN0SWQiOiJkZW1vIiwicHJvZHVjdElkIjoiYXR0YWNrZXIifQ",
+  "signatures": [{
+    "keyId": "vector-key",
+    "algorithm": "ed25519",
+    "signature": "5ubtbfvy5GGrOoEal3DMqmQoz-Vr0NnGNqfaRAjpbhiRrOBsv5bqcD2a8d96KUcyaqilcqiED2pTYb2F_PnRBA"
+  }]
+}

@@ -49,8 +49,31 @@ public sealed class PromotionService(IReadableObjectStore source, IWritableObjec
     public async ValueTask PromoteAsync(ObjectKey staged, ObjectKey destinationKey, ContentHash digest, long length, CancellationToken cancellationToken = default)
     {
         if (!await verifier.VerifyAsync(staged, digest, length, cancellationToken).ConfigureAwait(false)) throw new InvalidDataException($"Staged object '{staged}' failed server-side verification.");
+        var existing = await destination.HeadAsync(destinationKey, cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+        {
+            if (destination is IServerSideVerifier existingVerifier && await existingVerifier.VerifyAsync(destinationKey, digest, cancellationToken).ConfigureAwait(false)) return;
+            var existingRead = await destination.OpenAsync(destinationKey, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"Destination '{destinationKey}' disappeared during promotion.");
+            await using (existingRead.ConfigureAwait(false))
+            {
+                var existingHash = await ContentHash.ComputeAsync(existingRead.Content, digest.Algorithm, cancellationToken).ConfigureAwait(false);
+                if (existingHash == digest && existing.Length == length) return;
+            }
+            throw new IOException($"Immutable destination '{destinationKey}' already contains different bytes.");
+        }
         if (source is IServerSideCopyStore sameStore && ReferenceEquals(source, destination)) { await sameStore.CopyAsync(staged, destinationKey, overwrite: false, cancellationToken).ConfigureAwait(false); return; }
         var read = await source.OpenAsync(staged, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(staged.Value);
-        await using (read.ConfigureAwait(false)) await destination.PutAsync(destinationKey, read.Content, length, cancellationToken).ConfigureAwait(false);
+        await using (read.ConfigureAwait(false))
+        {
+            if (destination is IContentAddressedWriteStore addressed)
+            {
+                if (!await addressed.PutIfAbsentAsync(destinationKey, digest, read.Content, length, cancellationToken).ConfigureAwait(false)) throw new IOException($"Promotion lost the immutable destination race for '{destinationKey}'.");
+            }
+            else if (destination is IConditionalWriteStore conditional)
+            {
+                if (!await conditional.PutIfAbsentAsync(destinationKey, read.Content, length, cancellationToken).ConfigureAwait(false)) throw new IOException($"Promotion lost the immutable destination race for '{destinationKey}'.");
+            }
+            else throw new IOException("Promotion requires an immutable conditional-write destination.");
+        }
     }
 }

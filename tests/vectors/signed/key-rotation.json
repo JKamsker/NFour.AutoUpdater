@@ -1,0 +1,1 @@
+{"type":"key-manifest","expected":"overlapping-validity","keySequence":3,"keys":[{"keyId":"4s-2026","notBefore":"2026-01-01T00:00:00Z","notAfter":"2027-06-30T00:00:00Z"},{"keyId":"4s-2027","notBefore":"2027-01-01T00:00:00Z","notAfter":"2028-06-30T00:00:00Z"}],"oldDocumentRemainsVerifiable":true}

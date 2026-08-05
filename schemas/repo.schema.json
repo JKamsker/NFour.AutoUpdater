@@ -1,15 +1,22 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://4sup.invalid/schemas/repo.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://4sup.invalid/schemas/repo.schema.json",
   "type": "object", "additionalProperties": false,
   "required": ["schemaVersion", "repositoryId", "generatedAt", "layout", "contentHashAlgorithm", "capabilities"],
   "properties": {
-    "schemaVersion": { "const": 1 }, "repositoryId": { "$ref": "#/$defs/id" },
-    "generatedAt": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
-    "contentHashAlgorithm": { "const": "sha256" }, "integrityGuarantee": { "enum": ["verified", "reduced"] },
-    "minimumClientVersion": { "type": "string" }, "products": { "type": "array", "items": { "$ref": "#/$defs/id" } },
-    "blobBaseUrls": { "type": "array", "items": { "format": "uri" } }, "trustedKeys": { "type": "array" },
-    "capabilities": { "type": "array", "items": { "type": "string" } }, "layout": { "type": "object", "additionalProperties": { "type": "string" } }
+    "schemaVersion": { "const": 1 }, "repositoryId": { "$ref": "#/$defs/id64" }, "generatedAt": { "$ref": "#/$defs/time" }, "contentHashAlgorithm": { "const": "sha256" },
+    "integrityGuarantee": { "enum": ["verified", "reduced"] }, "minimumClientVersion": { "type": "string" },
+    "products": { "type": "array", "items": { "$ref": "#/$defs/id128" } },
+    "blobBaseUrls": { "type": "array", "items": { "type": "string", "format": "uri", "pattern": "^https?://" } },
+    "trustedKeys": { "type": "array", "items": { "$ref": "#/$defs/key" } },
+    "capabilities": { "type": "array", "items": { "enum": ["read", "range", "list", "write", "conditional-write", "server-side-copy", "presigning", "multipart", "delete"] } },
+    "layout": { "$ref": "#/$defs/layout" }
   },
-  "$defs": { "id": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$" } }
+  "$defs": {
+    "id64": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", "maxLength": 64 },
+    "id128": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", "maxLength": 128 },
+    "time": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "template": { "type": "string", "minLength": 1, "pattern": "^[^/\\%?#\\x00-\\x1f]+(?:/[^/\\%?#\\x00-\\x1f]+)*$" },
+    "layout": { "type": "object", "additionalProperties": false, "required": ["blobTemplate", "packageTemplate", "packageIndexTemplate", "channelTemplate", "releaseTemplate", "releaseBundleTemplate", "coverageTemplate", "releaseIndexTemplate", "keyManifestTemplate", "revocationTemplate"], "properties": { "blobTemplate": { "$ref": "#/$defs/template" }, "packageTemplate": { "$ref": "#/$defs/template" }, "packageIndexTemplate": { "$ref": "#/$defs/template" }, "channelTemplate": { "$ref": "#/$defs/template" }, "releaseTemplate": { "$ref": "#/$defs/template" }, "releaseBundleTemplate": { "$ref": "#/$defs/template" }, "coverageTemplate": { "$ref": "#/$defs/template" }, "releaseIndexTemplate": { "$ref": "#/$defs/template" }, "keyManifestTemplate": { "$ref": "#/$defs/template" }, "revocationTemplate": { "$ref": "#/$defs/template" } } },
+    "key": { "type": "object", "additionalProperties": false, "required": ["keyId", "algorithm", "publicKey"], "properties": { "keyId": { "$ref": "#/$defs/id64" }, "algorithm": { "const": "ed25519" }, "publicKey": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" }, "notBefore": { "$ref": "#/$defs/time" }, "notAfter": { "$ref": "#/$defs/time" } } }
+  }
 }
