@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/repo.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "repositoryId", "generatedAt", "layout", "contentHashAlgorithm", "capabilities"],
+  "properties": {
+    "schemaVersion": { "const": 1 }, "repositoryId": { "$ref": "#/$defs/id" },
+    "generatedAt": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "contentHashAlgorithm": { "const": "sha256" }, "integrityGuarantee": { "enum": ["verified", "reduced"] },
+    "minimumClientVersion": { "type": "string" }, "products": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+    "blobBaseUrls": { "type": "array", "items": { "format": "uri" } }, "trustedKeys": { "type": "array" },
+    "capabilities": { "type": "array", "items": { "type": "string" } }, "layout": { "type": "object", "additionalProperties": { "type": "string" } }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$" } }
+}

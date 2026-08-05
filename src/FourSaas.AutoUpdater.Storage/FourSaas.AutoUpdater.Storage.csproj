@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Storage</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Storage</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../FourSaas.AutoUpdater.Core/FourSaas.AutoUpdater.Core.csproj" /></ItemGroup>
+</Project>

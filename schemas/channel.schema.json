@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/channel.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "productId", "channel", "channelSequence", "supersedesChannelSequence", "releaseId", "releaseSequence", "releaseDigest", "updatedAt"],
+  "properties": { "schemaVersion": { "const": 1 }, "productId": { "type": "string" }, "channel": { "type": "string" }, "channelSequence": { "type": "integer" }, "supersedesChannelSequence": { "type": "integer" }, "releaseId": { "type": "string" }, "releaseSequence": { "type": "integer" }, "releaseDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "reason": { "type": "string" }, "minimumClientVersion": { "type": "string" }, "updatedAt": { "type": "string" } }
+}

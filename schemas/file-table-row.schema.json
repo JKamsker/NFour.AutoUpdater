@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/file-table-row.schema.json",
+  "type": "object", "additionalProperties": false, "required": ["p", "s"],
+  "properties": {
+    "p": { "type": "string" }, "h": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "s": { "type": "integer", "minimum": 0 }, "m": { "type": "string", "pattern": "^md5:[0-9a-f]{32}$" },
+    "pol": { "enum": ["replace", "preserve", "executable"] }, "k": { "enum": ["file", "dir"] }, "mode": { "type": "string", "pattern": "^[0-7]{4}$" }
+  }
+}

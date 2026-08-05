@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/release-lock.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "productId", "releaseId", "sequence", "state", "createdAt", "axes", "requirements", "packages", "coverageDigest"],
+  "properties": { "schemaVersion": { "const": 1 }, "productId": { "type": "string" }, "releaseId": { "type": "string" }, "sequence": { "type": "integer" }, "state": { "enum": ["draft", "published", "yanked"] }, "createdAt": { "type": "string" }, "minimumInstalledRelease": { "type": "integer" }, "coverageDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "axes": { "type": "array" }, "requirements": { "type": "array" }, "packages": { "type": "array" } }
+}

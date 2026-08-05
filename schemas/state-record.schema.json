@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/state-record.schema.json",
+  "oneOf": [
+    { "type": "object", "additionalProperties": false, "required": ["k", "schemaVersion", "repositoryUri", "productId", "releaseId", "releaseDigest", "selection", "selectionId", "fileSetId", "appliedAt"], "properties": {
+      "k": { "const": "lock" }, "schemaVersion": { "const": 1 }, "repositoryUri": { "type": "string" }, "productId": { "type": "string" }, "channel": { "type": "string" }, "releaseId": { "type": "string" }, "releaseDigest": { "type": "string" }, "selection": { "type": "object" }, "selectionId": { "type": "string" }, "fileSetId": { "type": "string" }, "lastChannelSequence": { "type": "integer" }, "appliedAt": { "type": "string" }
+    } },
+    { "type": "object", "additionalProperties": false, "required": ["k", "p", "s", "o", "pol", "os", "mt"], "properties": {
+      "k": { "const": "f" }, "p": { "type": "string" }, "h": { "type": ["string", "null"] }, "s": { "type": "integer" }, "o": { "type": "string" }, "pol": { "type": "string" }, "os": { "type": "integer" }, "mt": { "type": "integer" }, "st": { "type": "string" }, "oh": { "type": "string" }
+    } }
+  ]
+}

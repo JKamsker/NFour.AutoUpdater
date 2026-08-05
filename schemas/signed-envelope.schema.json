@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/signed-envelope.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["envelope", "type", "payload", "signatures"],
+  "properties": {
+    "envelope": { "const": 1 },
+    "type": { "enum": ["channel-pointer", "release-lock", "key-manifest", "revocation"] },
+    "payload": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+    "signatures": { "type": "array", "minItems": 1, "items": { "type": "object", "additionalProperties": false, "required": ["keyId", "algorithm", "signature"], "properties": { "keyId": { "$ref": "#/$defs/id" }, "algorithm": { "const": "ed25519" }, "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" } } } }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$" } }
+}

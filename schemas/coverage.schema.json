@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/coverage.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "releaseId", "mode", "pointCount", "points"],
+  "properties": {
+    "schemaVersion": { "const": 1 }, "releaseId": { "type": "string" },
+    "mode": { "enum": ["exhaustive", "sampled"] }, "pointCount": { "type": "integer", "minimum": 0 },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "points": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["selection", "fileSetId"], "properties": {
+      "selection": { "type": "string" }, "packages": { "type": "array", "items": { "type": "string" } },
+      "fileCount": { "type": "integer", "minimum": 0 }, "installSize": { "type": "integer", "minimum": 0 },
+      "downloadSize": { "type": "integer", "minimum": 0 }, "fileSetId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+    } } }
+  }
+}

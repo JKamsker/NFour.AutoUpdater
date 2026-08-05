@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Server</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Server</AssemblyName><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../FourSaas.AutoUpdater.Core/FourSaas.AutoUpdater.Core.csproj" /><ProjectReference Include="../FourSaas.AutoUpdater.Storage/FourSaas.AutoUpdater.Storage.csproj" /><ProjectReference Include="../FourSaas.AutoUpdater.Storage.Brokering/FourSaas.AutoUpdater.Storage.Brokering.csproj" /></ItemGroup>
+</Project>

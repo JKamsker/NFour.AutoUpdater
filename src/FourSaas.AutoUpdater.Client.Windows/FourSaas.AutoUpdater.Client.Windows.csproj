@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Client.Windows</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Client.Windows</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../FourSaas.AutoUpdater.Client/FourSaas.AutoUpdater.Client.csproj" /></ItemGroup>
+</Project>

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/package.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "id", "version", "sequence", "kind", "createdAt", "pathPrefixes", "fileTable", "fileCount", "installSize", "downloadSize"],
+  "properties": {
+    "schemaVersion": { "const": 1 }, "id": { "$ref": "#/$defs/id" }, "version": { "$ref": "#/$defs/id" }, "sequence": { "type": "integer" }, "kind": { "enum": ["content", "meta"] }, "createdAt": { "type": "string" }, "conflicts": { "type": "array", "items": { "$ref": "#/$defs/id" } }, "requires": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["id"], "properties": { "id": { "$ref": "#/$defs/id" }, "minSequence": { "type": "integer" }, "maxSequence": { "type": "integer" } } } }, "pathPrefixes": { "type": "array", "items": { "type": "string" } }, "fileCount": { "type": "integer", "minimum": 0 }, "installSize": { "type": "integer", "minimum": 0 }, "downloadSize": { "type": "integer", "minimum": 0 }, "fileTable": { "type": "object", "additionalProperties": false, "required": ["format", "shardCount", "shards", "digest"], "properties": { "format": { "const": "jsonl/v1" }, "shardCount": { "type": "integer", "minimum": 1 }, "digest": { "$ref": "#/$defs/hash" }, "shards": { "type": "array", "items": { "type": "object", "additionalProperties": false, "required": ["index", "digest", "count", "size"], "properties": { "index": { "type": "integer" }, "digest": { "$ref": "#/$defs/hash" }, "count": { "type": "integer" }, "size": { "type": "integer" } } } } } }
+  },
+  "$defs": { "id": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$" }, "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } }
+}
