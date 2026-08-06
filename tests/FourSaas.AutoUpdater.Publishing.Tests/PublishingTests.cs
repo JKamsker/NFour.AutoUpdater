@@ -42,6 +42,28 @@ public sealed class PublishingTests
         Assert.Equal("base", rules.Packages.Single().Requires.Single().Id.Value);
     }
     [Fact]
+    public void SliceRulesRejectUnknownAndDuplicateKeys()
+    {
+        // Rejected rather than skipped: the format looks like YAML, so silently ignoring what
+        // it cannot represent would let an editor and the publisher disagree about the file.
+        Assert.Throws<FormatException>(() => SliceRulesYaml.Parse("source: build\nnonsense: 1\n"));
+        Assert.Throws<FormatException>(() => SliceRulesYaml.Parse("source: build\nsource: other\n"));
+        Assert.Throws<FormatException>(() => SliceRulesYaml.Parse(
+            "source: build\npackages:\n  - id: core\n    include: [a]\n    include: [b]\n"));
+        Assert.Throws<FormatException>(() => SliceRulesYaml.Parse(
+            "source: build\npackages:\n  - id: core\n    include: [a]\n    bogus: [b]\n"));
+    }
+
+    [Fact]
+    public void SliceRulesKeepHashCharactersInsideQuotedValues()
+    {
+        // Splitting the line on '#' truncated any value containing one, so a glob like
+        // "assets/#tmp/**" quietly became "assets/" and changed which files the package claims.
+        var rules = SliceRulesYaml.Parse("source: build\npackages:\n  - id: core\n    include: [\"assets/#tmp/**\"]\n");
+        Assert.Equal("assets/#tmp/**", rules.Packages.Single().Include.Single());
+    }
+
+    [Fact]
     public void ReleaseAuthoringStoresTerminalRetirementMappings()
     {
         var axis = Axis("ui", AxisCardinality.One, "modern") with

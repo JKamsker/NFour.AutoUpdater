@@ -1,6 +1,19 @@
 namespace FourSaas.AutoUpdater.Publishing;
 
-/// <summary>Loads the intentionally small slice.yaml authoring format without coupling the runtime to a YAML engine.</summary>
+/// <summary>
+/// Loads the <c>slice.yaml</c> authoring format.
+///
+/// This is deliberately NOT a YAML parser. It accepts a small, fixed subset that looks like
+/// YAML — scalars, flow sequences, flow mappings and one level of block nesting — so the
+/// runtime does not have to carry a YAML engine. Anything outside that subset (anchors,
+/// aliases, multi-line scalars, tags, nested block sequences) is not understood.
+///
+/// Because it looks like YAML, silently ignoring what it does not understand is the dangerous
+/// failure mode: a file that a YAML editor renders one way would be interpreted another, with
+/// no indication. Unrecognised and duplicated keys are therefore rejected rather than skipped,
+/// so a construct this parser cannot represent fails loudly instead of quietly changing what
+/// gets published. JSON input is accepted too, and is parsed properly.
+/// </summary>
 public static class SliceRulesYaml
 {
     public static string JsonSchema => """
@@ -50,21 +63,39 @@ public static class SliceRulesYaml
     {
         if (yaml.TrimStart().StartsWith('{')) return JsonSerializer.Deserialize<SliceRules>(yaml, RepositoryJson.Options) ?? throw new FormatException("Slice rules JSON is empty.");
         var source = string.Empty; var unmatched = true; var packages = new List<MutablePackage>(); MutablePackage? current = null; string? section = null;
+        var seenRootKeys = new HashSet<string>(StringComparer.Ordinal);
+        var seenPackageKeys = new Dictionary<MutablePackage, HashSet<string>>();
         foreach (var raw in yaml.Split('\n'))
         {
-            var line = raw.Split('#')[0].TrimEnd(); if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("#", StringComparison.Ordinal)) continue;
+            var line = StripComment(raw).TrimEnd(); if (string.IsNullOrWhiteSpace(line)) continue;
             var text = line.Trim();
             if (text.StartsWith("- id:", StringComparison.Ordinal) && (current is null || section is null)) { current = new MutablePackage { Id = new PackageId(Unquote(text[5..].Trim())) }; packages.Add(current); section = null; continue; }
+            // A top-level key may legitimately appear after the packages block. Root keys are
+            // written at column zero, so indentation distinguishes them from package keys;
+            // without that they were interpreted as keys of whichever package came last.
+            var isRootLevel = line.Length > 0 && !char.IsWhiteSpace(line[0]);
+            if (isRootLevel && (text.StartsWith("source:", StringComparison.Ordinal) || text.StartsWith("unmatched:", StringComparison.Ordinal) || text.StartsWith("schemaVersion:", StringComparison.Ordinal) || text.StartsWith("packages:", StringComparison.Ordinal)))
+            {
+                current = null;
+                section = null;
+            }
+
             if (current is null)
             {
-                if (text.StartsWith("source:", StringComparison.Ordinal)) source = Unquote(text[7..].Trim());
-                else if (text.StartsWith("unmatched:", StringComparison.Ordinal)) unmatched = !text.EndsWith("ignore", StringComparison.OrdinalIgnoreCase);
+                if (text.StartsWith("source:", StringComparison.Ordinal)) { EnsureFirst(seenRootKeys, "source"); source = Unquote(text[7..].Trim()); }
+                else if (text.StartsWith("unmatched:", StringComparison.Ordinal)) { EnsureFirst(seenRootKeys, "unmatched"); unmatched = !text.EndsWith("ignore", StringComparison.OrdinalIgnoreCase); }
+                else if (text.StartsWith("schemaVersion:", StringComparison.Ordinal)) EnsureFirst(seenRootKeys, "schemaVersion");
+                else if (!text.StartsWith("packages:", StringComparison.Ordinal))
+                    throw new FormatException($"Unrecognised slice.yaml entry '{text}'. This format accepts a fixed subset; unknown keys are rejected rather than ignored.");
                 continue;
             }
             if (section == "requires" && text.StartsWith("- ", StringComparison.Ordinal)) { current.Requires.Add(ParseDependency(text[2..])); continue; }
-            var colon = text.IndexOf(':'); if (colon < 0) continue;
+            var colon = text.IndexOf(':');
+            if (colon < 0) throw new FormatException($"Unrecognised slice.yaml entry '{text}'.");
             var key = text[..colon].Trim().Trim('"'); var value = text[(colon + 1)..].Trim();
             if (value.Length == 0) { section = key; continue; }
+            if (section is null && key is "include" or "exclude" or "rewrite" or "policy" or "requires")
+                EnsureFirst(seenPackageKeys.TryGetValue(current, out var existing) ? existing : seenPackageKeys[current] = new HashSet<string>(StringComparer.Ordinal), key);
             switch (key)
             {
                 case "include": current.Include.AddRange(ParseList(value)); section = null; break;
@@ -75,11 +106,38 @@ public static class SliceRulesYaml
                 default:
                     if (section == "rewrite") current.Rewrite[key] = Unquote(value);
                     else if (section == "policy") current.Policies.Add(new SlicePolicy(key, ParsePolicy(value)));
+                    else throw new FormatException($"Unrecognised slice.yaml key '{key}'. This format accepts a fixed subset; unknown keys are rejected rather than ignored.");
                     break;
             }
         }
         if (string.IsNullOrWhiteSpace(source)) throw new FormatException("slice.yaml requires source.");
         return new SliceRules { SchemaVersion = 1, Source = source, UnmatchedIsError = unmatched, Packages = packages.Select(x => x.ToImmutable()).ToImmutableArray() };
+    }
+
+    /// <summary>
+    /// Removes a trailing comment, ignoring '#' inside quotes.
+    ///
+    /// Splitting the line on '#' truncated any value legitimately containing one — a glob such
+    /// as "assets/#tmp/**" silently became "assets/", quietly changing which files a package
+    /// claims.
+    /// </summary>
+    private static string StripComment(string line)
+    {
+        var inSingle = false;
+        var inDouble = false;
+        for (var index = 0; index < line.Length; index++)
+        {
+            var character = line[index];
+            if (character == '\'' && !inDouble) inSingle = !inSingle;
+            else if (character == '"' && !inSingle) inDouble = !inDouble;
+            else if (character == '#' && !inSingle && !inDouble) return line[..index];
+        }
+        return line;
+    }
+
+    private static void EnsureFirst(HashSet<string> seen, string key)
+    {
+        if (!seen.Add(key)) throw new FormatException($"slice.yaml declares '{key}' more than once.");
     }
 
     private static IEnumerable<string> ParseList(string value) => value.Trim().TrimStart('[').TrimEnd(']').Split(',', StringSplitOptions.RemoveEmptyEntries).Select(x => Unquote(x.Trim()));
