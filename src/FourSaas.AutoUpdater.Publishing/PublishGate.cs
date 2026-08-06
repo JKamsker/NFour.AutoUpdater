@@ -11,8 +11,27 @@ public sealed class PublishGate
     private async ValueTask<ImmutableArray<Diagnostic>> CheckCoreAsync(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, IFileSetComposer? composer, IPackageRepository? repository, CancellationToken cancellationToken)
     {
         var diagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
-        ValidateRelease(release, manifests, diagnostics);
+        Dictionary<PackageId, ContentHash>? exactManifestDigests = null;
+        if (repository is IExactManifestRepository exactRepository)
+        {
+            exactManifestDigests = [];
+            foreach (var pin in release.Packages)
+            {
+                var exactBytes = await exactRepository.GetManifestBytesAsync(pin.Id, new PackageVersion(pin.Version.Label, pin.Sequence), cancellationToken).ConfigureAwait(false);
+                if (exactBytes is null) diagnostics.Add(new("PKG015", DiagnosticSeverity.Error, $"Pinned manifest '{pin.Id}' is unavailable for digest validation.", pin.Id.Value));
+                else exactManifestDigests[pin.Id] = ContentHash.Compute(exactBytes);
+            }
+        }
+        ValidateRelease(release, manifests, diagnostics, exactManifestDigests);
         var axes = release.Axes.ToDictionary(x => x.Name, StringComparer.Ordinal);
+        var mentionedValues = release.Requirements
+            .SelectMany(x => x.When.Constraints)
+            .GroupBy(x => x.Key, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.SelectMany(y => y.Value).ToHashSet(StringComparer.Ordinal), StringComparer.Ordinal);
+        foreach (var axis in release.Axes)
+            foreach (var value in axis.Values)
+                if (!mentionedValues.TryGetValue(axis.Name, out var values) || !values.Contains(value.Id))
+                    diagnostics.Add(new("PKG004", DiagnosticSeverity.Warning, $"Axis value '{value.Id}' is not mentioned by any requirement.", axis.Name));
         foreach (var requirement in release.Requirements)
         {
             foreach (var axis in requirement.When.Constraints)
@@ -39,17 +58,38 @@ public sealed class PublishGate
             {
                 var left = release.Requirements[i]; var right = release.Requirements[j];
                 if (!left.When.CanCoexistWith(right.When, axes)) continue;
+                var leftLayer = DerivedLayer(left, axes);
+                var rightLayer = DerivedLayer(right, axes);
+                if (left.Package == right.Package && leftLayer != rightLayer)
+                    diagnostics.Add(new("PKG008", DiagnosticSeverity.Error, $"Package '{left.Package}' has inconsistent derived layers.", left.Package.Value));
                 if (!manifests.TryGetValue(left.Package, out var leftManifest) || !manifests.TryGetValue(right.Package, out var rightManifest)) continue;
-                if (leftManifest.PathPrefixes.Length > 0 && rightManifest.PathPrefixes.Length > 0 && !leftManifest.PathPrefixes.Any(a => rightManifest.PathPrefixes.Any(b => a.StartsWith(b, StringComparison.Ordinal) || b.StartsWith(a, StringComparison.Ordinal)))) continue;
                 if (leftManifest.Conflicts.Contains(right.Package) || rightManifest.Conflicts.Contains(left.Package)) diagnostics.Add(new("PKG006", DiagnosticSeverity.Error, $"Conflicting packages '{left.Package}' and '{right.Package}' can be selected together."));
+                if (!MayOverlap(leftManifest.PathPrefixes, rightManifest.PathPrefixes)) continue;
+                foreach (var (leftDiscriminator, rightDiscriminator) in DistinctDiscriminatorOutcomes(left, right, axes))
+                {
+                    if (leftLayer == rightLayer && leftDiscriminator == rightDiscriminator)
+                        diagnostics.Add(new("PKG001", DiagnosticSeverity.Error, $"Packages '{left.Package}' and '{right.Package}' can own an overlapping path at the same layer and discriminator."));
+                    else if (leftLayer > rightLayer && !left.Overrides.Contains(right.Package))
+                        diagnostics.Add(new("PKG002", DiagnosticSeverity.Error, $"Package '{left.Package}' may shadow '{right.Package}' without declaring an override.", left.Package.Value));
+                    else if (rightLayer > leftLayer && !right.Overrides.Contains(left.Package))
+                        diagnostics.Add(new("PKG002", DiagnosticSeverity.Error, $"Package '{right.Package}' may shadow '{left.Package}' without declaring an override.", right.Package.Value));
+                }
                 if (left.LayerOverride is not null) diagnostics.Add(new("PKG010", DiagnosticSeverity.Warning, "An explicit layer override was used.", left.Package.Value));
                 if (right.LayerOverride is not null) diagnostics.Add(new("PKG010", DiagnosticSeverity.Warning, "An explicit layer override was used.", right.Package.Value));
             }
         if (composer is not null && !diagnostics.Any(static x => x.IsError))
         {
-            var selections = SelectionEnumerator.EstimatedCount(release.Axes, 4097) > 4096
-                ? SelectionEnumerator.EnumeratePairwise(release.Axes, 8192)
-                : SelectionEnumerator.Enumerate(release.Axes, int.MaxValue);
+            ImmutableArray<VariantSelection> selections;
+            if (SelectionEnumerator.EstimatedCount(release.Axes, 4097) > 4096)
+            {
+                selections = SelectionEnumerator.EnumeratePairwise(release.Axes, 8192, out var truncated);
+                if (truncated)
+                {
+                    diagnostics.Add(new("PKG019", DiagnosticSeverity.Error, "The deterministic pairwise coverage sample exceeded its bound and would be incomplete."));
+                    return diagnostics.ToImmutable();
+                }
+            }
+            else selections = SelectionEnumerator.Enumerate(release.Axes, int.MaxValue);
             foreach (var selection in selections)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -66,7 +106,7 @@ public sealed class PublishGate
         return diagnostics.ToImmutable();
     }
 
-    private static void ValidateRelease(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, ImmutableArray<Diagnostic>.Builder diagnostics)
+    private static void ValidateRelease(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, ImmutableArray<Diagnostic>.Builder diagnostics, IReadOnlyDictionary<PackageId, ContentHash>? exactManifestDigests = null)
     {
         if (release.SchemaVersion != 1) diagnostics.Add(new("DOC001", DiagnosticSeverity.Error, $"Unsupported release schemaVersion {release.SchemaVersion}."));
         if (release.Axes.Select(x => x.Rank).Distinct().Count() != release.Axes.Length) diagnostics.Add(new("PKG001", DiagnosticSeverity.Error, "Axis ranks must be unique."));
@@ -79,7 +119,8 @@ public sealed class PublishGate
                 if (!Identifier.IsValid(value.Id, "value", out var valueError)) diagnostics.Add(new("PKG003", DiagnosticSeverity.Error, valueError!, axis.Name));
             foreach (var old in axis.Retired.Keys)
             {
-                if (!axis.TryResolveRetired(old, out _, out _, out var retirementError)) diagnostics.Add(new("PKG017", DiagnosticSeverity.Error, retirementError!, axis.Name));
+                if (!axis.TryResolveRetired(old, out _, out _, out var retirementError))
+                    diagnostics.Add(new(retirementError?.Contains("not a live axis value", StringComparison.Ordinal) == true ? "PKG018" : "PKG017", DiagnosticSeverity.Error, retirementError!, axis.Name));
             }
         }
         foreach (var requirement in release.Requirements)
@@ -94,9 +135,16 @@ public sealed class PublishGate
                 diagnostics.Add(new("PKG015", DiagnosticSeverity.Error, $"Pinned manifest '{pin.Id}' is unavailable for digest validation.", pin.Id.Value));
                 continue;
             }
-            if (ContentHash.Compute(RepositoryJson.SerializeManifest(manifest)) != pin.ManifestDigest)
+            var actualManifestDigest = exactManifestDigests is not null && exactManifestDigests.TryGetValue(pin.Id, out var exactDigest)
+                ? exactDigest
+                : ContentHash.Compute(RepositoryJson.SerializeManifest(manifest));
+            if (actualManifestDigest != pin.ManifestDigest)
                 diagnostics.Add(new("PKG015", DiagnosticSeverity.Error, $"Pinned manifest '{pin.Id}' does not match manifestDigest.", pin.Id.Value));
-            if (pin.Version.Label != manifest.Version.Label || pin.Sequence != (manifest.Sequence == 0 ? manifest.Version.Sequence : manifest.Sequence) || pin.FileCount != manifest.FileCount || pin.InstallSize != manifest.InstallSize || pin.DownloadSize != manifest.DownloadSize)
+            var expectedRequires = NormalizeDependencies(manifest.Requires);
+            var actualRequires = NormalizeDependencies(pin.Requires);
+            var expectedConflicts = manifest.Conflicts.Select(x => x.Value).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+            var actualConflicts = pin.Conflicts.Select(x => x.Value).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+            if (pin.Version.Label != manifest.Version.Label || pin.Sequence != (manifest.Sequence == 0 ? manifest.Version.Sequence : manifest.Sequence) || pin.FileCount != manifest.FileCount || pin.InstallSize != manifest.InstallSize || pin.DownloadSize != manifest.DownloadSize || !expectedRequires.SequenceEqual(actualRequires) || !expectedConflicts.SequenceEqual(actualConflicts))
                 diagnostics.Add(new("PKG016", DiagnosticSeverity.Error, $"Pinned metadata for '{pin.Id}' is not denormalised from its manifest.", pin.Id.Value));
             var expectedOverrides = release.Requirements.Where(x => x.Package == pin.Id).SelectMany(x => x.Overrides).Distinct().OrderBy(x => x.Value, StringComparer.Ordinal).ToArray();
             var actualOverrides = pin.Overrides.Distinct().OrderBy(x => x.Value, StringComparer.Ordinal).ToArray();
@@ -105,7 +153,12 @@ public sealed class PublishGate
         foreach (var manifest in manifests.Values)
         {
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var prefix in manifest.PathPrefixes) if (prefix != prefix.Normalize(NormalizationForm.FormC)) diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, "Path prefix is not NFC.", manifest.Id.Value));
+            foreach (var prefix in manifest.PathPrefixes)
+            {
+                if (prefix != prefix.Normalize(NormalizationForm.FormC)) diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, "Path prefix is not NFC.", manifest.Id.Value));
+                var folded = prefix.ToUpperInvariant();
+                if (!seen.Add(folded)) diagnostics.Add(new("PKG009", DiagnosticSeverity.Error, "Package contains case-only path prefixes.", manifest.Id.Value));
+            }
             if (manifest.FileCount < 0 || manifest.InstallSize < 0 || manifest.DownloadSize < 0) diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, "Manifest counts and sizes cannot be negative.", manifest.Id.Value));
         }
     }
@@ -114,10 +167,60 @@ public sealed class PublishGate
     {
         foreach (var (axis, dependencyValues) in dependency.Constraints)
         {
-            if (!dependent.Constraints.TryGetValue(axis, out var dependentValues)) return false;
-            if (!axes.ContainsKey(axis) || !dependentValues.IsSubsetOf(dependencyValues)) return false;
+            if (!axes.TryGetValue(axis, out var definition)) return false;
+            if (!dependent.Constraints.TryGetValue(axis, out var dependentValues))
+            {
+                if (!definition.Values.Select(x => x.Id).ToImmutableHashSet(StringComparer.Ordinal).SetEquals(dependencyValues)) return false;
+                continue;
+            }
+            if (!dependentValues.IsSubsetOf(dependencyValues)) return false;
         }
         return true;
+    }
+
+    private static IEnumerable<(string Id, long? MinSequence, long? MaxSequence)> NormalizeDependencies(IEnumerable<PackageDependency> dependencies) =>
+        dependencies
+            .OrderBy(x => x.Id.Value, StringComparer.Ordinal)
+            .ThenBy(x => x.MinSequence)
+            .ThenBy(x => x.MaxSequence)
+            .Select(x => (x.Id.Value, x.MinSequence, x.MaxSequence));
+
+    private static bool MayOverlap(ImmutableArray<string> left, ImmutableArray<string> right) =>
+        left.IsDefaultOrEmpty || right.IsDefaultOrEmpty || left.Any(a => right.Any(b => a.StartsWith(b, StringComparison.OrdinalIgnoreCase) || b.StartsWith(a, StringComparison.OrdinalIgnoreCase)));
+
+    private static int DerivedLayer(PackageRequirement requirement, IReadOnlyDictionary<string, AxisDefinition> axes) =>
+        requirement.LayerOverride ?? (requirement.RankAs is { } rankAs && axes.TryGetValue(rankAs, out var ranked) ? ranked.Rank * 1000 : requirement.When.IsAlways ? 0 : requirement.When.Constraints.Keys.Where(axes.ContainsKey).Select(x => axes[x].Rank).DefaultIfEmpty(0).Max() * 1000);
+
+    private static IEnumerable<(int Left, int Right)> DistinctDiscriminatorOutcomes(PackageRequirement left, PackageRequirement right, IReadOnlyDictionary<string, AxisDefinition> axes)
+    {
+        var leftAxis = left.RankAs is null && !left.When.IsAlways ? left.When.Constraints.Keys.Where(axes.ContainsKey).Select(x => axes[x]).MaxBy(x => x.Rank) : null;
+        var rightAxis = right.RankAs is null && !right.When.IsAlways ? right.When.Constraints.Keys.Where(axes.ContainsKey).Select(x => axes[x]).MaxBy(x => x.Rank) : null;
+        if (leftAxis is not null && rightAxis is not null && leftAxis.Name == rightAxis.Name && leftAxis.Cardinality == AxisCardinality.Many)
+        {
+            var leftValues = left.When.Constraints[leftAxis.Name];
+            var rightValues = right.When.Constraints[rightAxis.Name];
+            var declared = leftAxis.Values.Select((value, index) => (value.Id, index)).ToArray();
+
+            // A Many selection may contain values that satisfy either predicate.
+            // For a candidate (left, right), selecting those two values is enough
+            // to realize the outcome unless one is an earlier match for the other
+            // predicate, which would lower that predicate's discriminator.
+            var outcomes = new HashSet<(int Left, int Right)>();
+            foreach (var (leftValue, _) in declared)
+            {
+                if (!leftValues.Contains(leftValue)) continue;
+                foreach (var (rightValue, _) in declared)
+                {
+                    if (!rightValues.Contains(rightValue)) continue;
+                    var selected = new[] { leftValue, rightValue };
+                    var leftDiscriminator = selected.Select(leftAxis.IndexOf).Where(index => index >= 0 && leftValues.Contains(leftAxis.Values[index].Id)).DefaultIfEmpty(-1).Min();
+                    var rightDiscriminator = selected.Select(rightAxis.IndexOf).Where(index => index >= 0 && rightValues.Contains(rightAxis.Values[index].Id)).DefaultIfEmpty(-1).Min();
+                    if (outcomes.Add((leftDiscriminator, rightDiscriminator))) yield return (leftDiscriminator, rightDiscriminator);
+                }
+            }
+            yield break;
+        }
+        yield return (-1, -1);
     }
 }
 
@@ -125,16 +228,17 @@ public static class SelectionEnumerator
 {
     public static long EstimatedCount(ImmutableArray<AxisDefinition> axes, long cap = long.MaxValue)
     {
+        if (cap < 0) throw new ArgumentOutOfRangeException(nameof(cap));
         var total = 1L;
         foreach (var axis in axes)
         {
             var choices = axis.Cardinality == AxisCardinality.One
                 ? axis.Values.Length
-                : axis.Values.Length < 20
-                    ? (1L << axis.Values.Length) - 1
-                    : checked((long)axis.Values.Length + ((long)axis.Values.Length * (axis.Values.Length - 1) / 2) + 1);
+                : axis.Values.Length >= 63
+                    ? (cap == long.MaxValue ? long.MaxValue : cap + 1)
+                    : (1L << axis.Values.Length) - 1;
             if (choices == 0) return 0;
-            if (total > cap / choices) return cap + 1;
+            if (total > cap / choices) return cap == long.MaxValue ? long.MaxValue : cap + 1;
             total *= choices;
         }
         return total;
@@ -144,42 +248,64 @@ public static class SelectionEnumerator
     /// report budget. Every value is paired with every value of every other axis;
     /// Many axes additionally include pair and full-set choices so discriminator
     /// changes are represented in the sample.
-    public static ImmutableArray<VariantSelection> EnumeratePairwise(ImmutableArray<AxisDefinition> axes, int maximum = 4096)
+    public static ImmutableArray<VariantSelection> EnumeratePairwise(ImmutableArray<AxisDefinition> axes, int maximum = 4096) =>
+        EnumeratePairwise(axes, maximum, out _);
+
+    /// <summary>
+    /// Enumerates a deterministic bounded pairwise sample. If the complete
+    /// covering array does not fit, the returned prefix remains deterministic
+    /// and <paramref name="truncated"/> is set instead of throwing.
+    /// </summary>
+    public static ImmutableArray<VariantSelection> EnumeratePairwise(ImmutableArray<AxisDefinition> axes, int maximum, out bool truncated)
     {
+        if (maximum < 1) throw new ArgumentOutOfRangeException(nameof(maximum));
+        var wasTruncated = false;
         var choices = axes.ToDictionary(x => x.Name, PairwiseChoices, StringComparer.Ordinal);
         var results = new List<VariantSelection>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var baseline = axes.ToDictionary(x => x.Name, x => choices[x.Name][0], StringComparer.Ordinal);
         Add(baseline);
-        for (var i = 0; i < axes.Length && results.Count < maximum; i++)
+        for (var i = 0; i < axes.Length && !wasTruncated; i++)
         {
-            for (var j = i + 1; j < axes.Length && results.Count < maximum; j++)
+            for (var j = i + 1; j < axes.Length && !wasTruncated; j++)
                 foreach (var left in choices[axes[i].Name])
+                {
+                    if (wasTruncated) break;
                     foreach (var right in choices[axes[j].Name])
                     {
-                        if (results.Count >= maximum) break;
                         var selection = new Dictionary<string, ImmutableSortedSet<string>>(baseline, StringComparer.Ordinal)
                         {
                             [axes[i].Name] = left,
                             [axes[j].Name] = right
                         };
                         Add(selection);
+                        if (wasTruncated) break;
                     }
+                }
         }
         foreach (var axis in axes)
+        {
+            if (wasTruncated) break;
             foreach (var choice in choices[axis.Name])
             {
-                if (results.Count >= maximum) break;
                 var selection = new Dictionary<string, ImmutableSortedSet<string>>(baseline, StringComparer.Ordinal) { [axis.Name] = choice };
                 Add(selection);
+                if (wasTruncated) break;
             }
+        }
+        truncated = wasTruncated;
         return results.ToImmutableArray();
 
         void Add(IReadOnlyDictionary<string, ImmutableSortedSet<string>> values)
         {
-            if (results.Count >= maximum) return;
             var selection = new VariantSelection { Axes = values.ToImmutableSortedDictionary(StringComparer.Ordinal) };
-            if (seen.Add(selection.ToCanonicalString())) results.Add(selection);
+            if (!seen.Add(selection.ToCanonicalString())) return;
+            if (results.Count >= maximum)
+            {
+                wasTruncated = true;
+                return;
+            }
+            results.Add(selection);
         }
 
         static ImmutableArray<ImmutableSortedSet<string>> PairwiseChoices(AxisDefinition axis)
@@ -216,17 +342,16 @@ public static class SelectionEnumerator
     private static IEnumerable<ImmutableSortedSet<string>> NonEmptySubsets(IEnumerable<string> values)
     {
         var list = values.ToArray();
-        if (list.Length < 20)
+        if (list.Length < 63)
         {
-            var limit = 1L << list.Length;
-            for (var mask = 1L; mask < limit; mask++) yield return list.Where((_, i) => (mask & (1L << i)) != 0).ToImmutableSortedSet(StringComparer.Ordinal);
+            var limit = 1UL << list.Length;
+            for (var mask = 1UL; mask < limit; mask++) yield return list.Where((_, i) => (mask & (1UL << i)) != 0).ToImmutableSortedSet(StringComparer.Ordinal);
             yield break;
         }
 
         // Exhaustive subset enumeration is not bounded for large Many axes.
-        // The deterministic sample retains every singleton, every pair, and
-        // the full set, which gives the gate useful pairwise coverage without
-        // integer-shift overflow or unbounded memory.
+        // Retain every singleton, every pair, and the full set as a deterministic
+        // bounded sample instead of recursing through an exponential space.
         foreach (var value in list) yield return ImmutableSortedSet.Create(StringComparer.Ordinal, value);
         for (var i = 0; i < list.Length; i++)
             for (var j = i + 1; j < list.Length; j++)

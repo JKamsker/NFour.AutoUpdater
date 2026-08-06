@@ -51,6 +51,6 @@ public readonly record struct VirtualPath : IComparable<VirtualPath>
     public static string Fold(string value)
     {
         var components = value.Normalize(NormalizationForm.FormC).Split('/');
-        return string.Join('/', components.Select(static component => component.TrimEnd(' ', '.').ToLowerInvariant()));
+        return string.Join('/', components.Select(static component => component.TrimEnd(' ', '.').ToUpperInvariant()));
     }
 }

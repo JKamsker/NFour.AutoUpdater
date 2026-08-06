@@ -1,3 +1,5 @@
+using System.Buffers;
+
 namespace FourSaas.AutoUpdater.Core;
 
 public sealed class VariantResolver : IVariantResolver
@@ -124,14 +126,16 @@ public sealed class FileSetComposer : IFileSetComposer
     {
         var diagnostics = resolution.Diagnostics.ToBuilder();
         var files = new Dictionary<VirtualPath, ComposedFile>();
+        var foldedPaths = new Dictionary<string, VirtualPath>(StringComparer.Ordinal);
         var shadowed = ImmutableArray.CreateBuilder<ComposedFile>();
         var overrides = resolution.Packages.ToDictionary(x => x.Id, x => x.Requirement.Overrides.ToImmutableHashSet());
 
         foreach (var resolved in resolution.Packages)
         {
+            var requestedVersion = new PackageVersion(resolved.Pin.Version.Label, resolved.Pin.Sequence);
             var manifest = repository is IManifestDigestRepository verifiedRepository && resolved.Pin.ManifestDigest.IsValid
-                ? await verifiedRepository.GetManifestAsync(resolved.Pin.Id, resolved.Pin.Version, resolved.Pin.ManifestDigest, cancellationToken).ConfigureAwait(false)
-                : await repository.GetManifestAsync(resolved.Pin.Id, resolved.Pin.Version, cancellationToken).ConfigureAwait(false);
+                ? await verifiedRepository.GetManifestAsync(resolved.Pin.Id, requestedVersion, resolved.Pin.ManifestDigest, cancellationToken).ConfigureAwait(false)
+                : await repository.GetManifestAsync(resolved.Pin.Id, requestedVersion, cancellationToken).ConfigureAwait(false);
             if (manifest is null)
             {
                 diagnostics.Add(new("RES001", DiagnosticSeverity.Error, $"Manifest for '{resolved.Id}' was not found.", resolved.Id.Value));
@@ -145,6 +149,12 @@ public sealed class FileSetComposer : IFileSetComposer
                     continue;
                 }
                 var candidate = new ComposedFile(path, entry.Content, entry.Size, resolved.Id, entry.Policy, entry.Kind, entry.Mode, resolved.Layer, resolved.Discriminator);
+                if (foldedPaths.TryGetValue(path.FoldedKey, out var foldedPath) && foldedPath != path)
+                {
+                    diagnostics.Add(new("PKG009", DiagnosticSeverity.Error, $"Case-folded path collision between '{foldedPath}' and '{path}'.", resolved.Id.Value));
+                    continue;
+                }
+                foldedPaths[path.FoldedKey] = path;
                 if (!files.TryGetValue(path, out var incumbent))
                 {
                     files[path] = candidate;
@@ -181,14 +191,14 @@ public static class FileSetIdentity
 {
     public static ContentHash Compute(IReadOnlyDictionary<VirtualPath, ComposedFile> files)
     {
-        using var stream = new MemoryStream();
+        var buffer = new ArrayBufferWriter<byte>();
         foreach (var file in files.OrderBy(x => x.Key.Value, StringComparer.Ordinal).Select(x => x.Value))
         {
             var line = $"{file.Path.Value}\0{file.Content}\0{file.Owner.Value}\0{Policy(file.Policy)}\0{Kind(file.Kind)}\0{file.Mode ?? string.Empty}\n";
             var bytes = Encoding.UTF8.GetBytes(line.Normalize(NormalizationForm.FormC));
-            stream.Write(bytes);
+            buffer.Write(bytes);
         }
-        return ContentHash.Compute(stream.ToArray());
+        return ContentHash.Compute(buffer.WrittenSpan);
     }
 
     private static string Policy(FileInstallPolicy value) => value switch

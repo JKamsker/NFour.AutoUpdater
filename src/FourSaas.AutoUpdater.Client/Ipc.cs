@@ -88,7 +88,14 @@ public sealed class NamedPipeIpcServer(string pipeName, IpcRouter router)
 
     private async Task HandleAsync(Stream stream, CancellationToken cancellationToken)
     {
-        var request = await IpcFraming.ReadRequestAsync(stream, cancellationToken).ConfigureAwait(false);
+        IpcRequest request;
+        try { request = await IpcFraming.ReadRequestAsync(stream, cancellationToken).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
+        catch (Exception ex)
+        {
+            try { await IpcFraming.WriteResponseAsync(stream, error: new IpcError("invalid_request", ex.Message), done: true, cancellationToken: CancellationToken.None).ConfigureAwait(false); } catch (Exception) { }
+            return;
+        }
         if (!router.TryGet(request.Route, out var handler))
         {
             await IpcFraming.WriteResponseAsync(stream, error: new IpcError("route_not_found", $"IPC route '{request.Route}' is not registered."), done: true, cancellationToken: cancellationToken).ConfigureAwait(false);

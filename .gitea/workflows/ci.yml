@@ -20,5 +20,7 @@ jobs:
         run: dotnet build AutoUpdater.sln --no-restore --configuration Release
       - name: Test (all backends enabled)
         run: FOURSUP_MINIO=1 dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
+      - name: Secret scan
+        run: bash scripts/secret-scan.sh
       - name: Diff hygiene
         run: git diff --check

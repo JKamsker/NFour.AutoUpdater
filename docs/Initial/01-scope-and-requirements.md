@@ -25,8 +25,8 @@ All three are in scope. The library is the product; the other two are its first 
 
 | Consumer | Needs |
 |---|---|
-| **Game client patcher** | Variant selection and post-install switching, progress/pause/resume, locked-file handling while the launcher runs, self-update of the updater, resumable multi-GB downloads |
-| **Server / deployment artifacts** | Headless publish from CI, service stop/start with restore-as-found, rollback, staged rollout, exit codes suitable for pipeline gating |
+| **Game client patcher** | Variant selection and post-install switching, progress/pause/resume, explicit locked-file policies while the launcher runs, self-update of the updater, resumable multi-GB downloads |
+| **Server / deployment artifacts** | Headless publish from CI, rollback, staged rollout, exit codes suitable for pipeline gating; Windows service/process control is out of scope |
 | **Reusable library + CLI** | A narrow public surface, no Windows-only types on the cross-platform path, an in-memory backend so consumers can test without infrastructure |
 
 ## 3. Functional requirements

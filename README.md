@@ -1,7 +1,7 @@
 # 4sup AutoUpdater
 
 This repository implements the Initial 4sup specification in .NET 10. It is split into pure
-domain, repository-format, storage, publishing, client, server, gateway, Windows integration,
+domain, repository-format, storage, publishing, client, server, gateway, cross-platform client safeguards,
 and CLI projects.
 
 ## Build and test

@@ -51,7 +51,7 @@ public sealed class InstallPlanner : IInstallPlanner
             if (current is null || !current.TryGetValue(path, out var have))
             {
                 if (want.Kind == FileEntryKind.Directory) { operations.Add(new FileOperation.EnsureDirectory(path)); continue; }
-                if (want.Policy == FileInstallPolicy.Preserve && observation is { Exists: true }) operations.Add(new FileOperation.Adopt(path, want.Owner, want.Policy, observation.Hash));
+                if (want.Policy == FileInstallPolicy.Preserve && observation is { Exists: true, Kind: ObservedKind.File }) operations.Add(new FileOperation.Adopt(path, want.Owner, want.Policy, observation.Hash));
                 else { operations.Add(new FileOperation.Write(path, want.Content, want.Size, want.Owner, want.Policy)); AddBlob(want.Content, want.Size); }
                 continue;
             }

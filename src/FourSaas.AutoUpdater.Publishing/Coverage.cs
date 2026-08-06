@@ -21,11 +21,19 @@ public sealed record CoverageDocument
 
 public sealed class CoverageGenerator
 {
+    private const int CoveragePointBudget = 4096;
+
     public async ValueTask<(CoverageDocument Document, ContentHash Digest)> GenerateAsync(ReleaseLock release, IPackageRepository repository, CancellationToken cancellationToken = default)
     {
         var points = ImmutableArray.CreateBuilder<CoveragePoint>(); var resolver = new VariantResolver(); var composer = new FileSetComposer();
-        var exhaustive = SelectionEnumerator.EstimatedCount(release.Axes, 4097) <= 4096;
-        var selections = exhaustive ? SelectionEnumerator.Enumerate(release.Axes, 4096) : SelectionEnumerator.EnumeratePairwise(release.Axes, 4096);
+        var exhaustive = SelectionEnumerator.EstimatedCount(release.Axes, CoveragePointBudget + 1) <= CoveragePointBudget;
+        // Pairwise enumeration has an explicit bound: it throws instead of producing an
+        // incomplete report when the deterministic covering array cannot fit the budget.
+        var truncated = false;
+        var selections = exhaustive
+            ? SelectionEnumerator.Enumerate(release.Axes, CoveragePointBudget)
+            : SelectionEnumerator.EnumeratePairwise(release.Axes, CoveragePointBudget, out truncated);
+        if (!exhaustive && truncated) throw new InvalidDataException($"Coverage pairwise sample exceeds the {CoveragePointBudget} point budget; refusing to publish an incomplete report.");
         var mode = exhaustive ? "exhaustive" : "sampled";
         foreach (var selection in selections)
         {
@@ -37,7 +45,7 @@ public sealed class CoverageGenerator
             var uniqueBlobs = new Dictionary<ContentHash, long>();
             foreach (var package in resolved.Packages)
             {
-                var manifest = await repository.GetManifestAsync(package.Pin.Id, package.Pin.Version, cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"Manifest '{package.Pin.Id}@{package.Pin.Version}' is missing.");
+                var manifest = await repository.GetManifestAsync(package.Pin.Id, new PackageVersion(package.Pin.Version.Label, package.Pin.Sequence), cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"Manifest '{package.Pin.Id}@{package.Pin.Version}' is missing.");
                 await foreach (var entry in repository.ReadFileTableAsync(manifest, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
                     if (entry.Kind == FileEntryKind.File) uniqueBlobs.TryAdd(entry.Content, entry.Size);
             }

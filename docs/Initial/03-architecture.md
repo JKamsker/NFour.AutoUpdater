@@ -60,7 +60,6 @@ src/
   FourSaas.AutoUpdater.Repository/      # IPackageRepository over IObjectStore; GC, prune, mirror
   FourSaas.AutoUpdater.Publishing/      # slicing, hashing, packing, validation, release building
   FourSaas.AutoUpdater.Client/          # planner, applier, install ledger, verify/repair
-  FourSaas.AutoUpdater.Client.Windows/  # service tickets, Restart Manager, SCM integration
   FourSaas.AutoUpdater.Cli/             # `4sup`
   FourSaas.AutoUpdater.Server/          # management API (ASP.NET Core + EF Core/Npgsql)
   FourSaas.AutoUpdater.Gateway/         # OPTIONAL read-path content gateway; separate deployable
@@ -103,7 +102,6 @@ Asserted rules:
 | `Core` uses no `System.IO` type except `Stream` | I/O in the domain is how god libraries start |
 | No project outside `Storage.*` references an SDK client (`AWSSDK.*`, `FluentFTP`) | Backend leakage is the reference's `AzureBlobManager` failure |
 | Only `Storage` and `Repository` construct object keys | The `Products`/`products` split brain ([02](02-reference-review.md) §2.3) |
-| `Client.Windows` is referenced only by `Cli` and consumers, never by `Client` | NFR-6, cross-platform |
 | No type in `Storage.Brokering` accepts or returns a payload `Stream` on a client-facing path | Rule 3; the byte rule enforced by the type system, not by review |
 | `Gateway` references no project that references `Server` | The gateway must never become a route on the API |
 | `Server` contains no signing primitive and no reference to a signing library | Rule 4; an API that cannot sign cannot be a signing oracle |

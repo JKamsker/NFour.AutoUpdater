@@ -1,12 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://4story.example/schemas/revocation.schema.json",
+  "$id": "https://4sup.invalid/schemas/revocation.schema.json",
   "type": "object", "additionalProperties": false,
-  "required": ["schemaVersion", "productId", "revocationSequence", "entries"],
+  "required": ["schemaVersion", "productId", "revocationSequence", "updatedAt", "entries"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "productId": { "type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", "maxLength": 128 },
     "revocationSequence": { "type": "integer", "minimum": 1 },
+    "updatedAt": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" },
     "entries": { "type": "array", "items": { "$ref": "#/$defs/entry" } }
   },
   "$defs": {

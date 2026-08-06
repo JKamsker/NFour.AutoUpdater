@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Storage.Ftp</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Storage.Ftp</AssemblyName></PropertyGroup>
-  <ItemGroup><ProjectReference Include="../FourSaas.AutoUpdater.Storage/FourSaas.AutoUpdater.Storage.csproj" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../FourSaas.AutoUpdater.Storage/FourSaas.AutoUpdater.Storage.csproj" /><PackageReference Include="FluentFTP" /></ItemGroup>
 </Project>

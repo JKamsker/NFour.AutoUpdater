@@ -4,6 +4,8 @@ using FourSaas.AutoUpdater.Storage.Local;
 using FourSaas.AutoUpdater.Storage.Memory;
 using System.Text;
 using System.Security.Cryptography;
+using System.Net;
+using System.Net.Http.Headers;
 
 namespace FourSaas.AutoUpdater.Storage.Tests;
 
@@ -53,12 +55,93 @@ public sealed class StorageTests
         if (Directory.Exists(root)) Directory.Delete(root, true);
     }
 
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ConditionalCreateIsRaceFree(Func<string, IReadableObjectStore> factory)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "4sup-race-" + Guid.NewGuid().ToString("N"));
+        await using var store = factory(root);
+        var conditional = Assert.IsAssignableFrom<IConditionalWriteStore>(store);
+        var key = new ObjectKey("race/object");
+        var attempts = await Task.WhenAll(Enumerable.Range(0, 16).Select(async index =>
+        {
+            await using var body = new MemoryStream(Encoding.UTF8.GetBytes($"winner-{index}"), writable: false);
+            return await conditional.PutIfAbsentAsync(key, body, body.Length);
+        }));
+
+        Assert.Single(attempts, won => won);
+        var stored = await store.OpenAsync(key);
+        Assert.NotNull(stored);
+        await using (stored!)
+        {
+            using var bytes = new MemoryStream();
+            await stored.Content.CopyToAsync(bytes);
+            Assert.StartsWith("winner-", Encoding.UTF8.GetString(bytes.ToArray()), StringComparison.Ordinal);
+        }
+        await conditional.DeleteAsync(new ObjectKey("race/missing"));
+        if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
     [Fact]
     public async Task DeclaredCapabilitiesMatchInterfaces()
     {
         await using var memory = new MemoryObjectStore();
         Assert.True(StorageCapabilityNegotiation.IsConsistent(memory));
+        await using var http = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("https://example.invalid/"));
+        Assert.True(StorageCapabilityNegotiation.IsConsistent(http));
+        await using var ftp = new FourSaas.AutoUpdater.Storage.Ftp.FtpObjectStore(new Uri("ftps://example.invalid/"), new System.Net.NetworkCredential("test", "test"));
+        Assert.True(StorageCapabilityNegotiation.IsConsistent(ftp));
+    }
+
+    [Fact]
+    public async Task HttpRejectsContentEncodingAndHeadWithoutLength()
+    {
+        using var encodedHandler = new StubHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent("bytes"u8.ToArray()) };
+            response.Content.Headers.ContentEncoding.Add("gzip");
+            response.Content.Headers.ContentLength = 5;
+            return response;
+        });
+        await using (var encoded = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("https://example.invalid/"), encodedHandler))
+            await Assert.ThrowsAsync<InvalidDataException>(async () => await encoded.HeadAsync(new ObjectKey("blob")));
+
+        using var missingLengthHandler = new StubHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent("bytes"u8.ToArray()) };
+            response.Content.Headers.ContentLength = null;
+            return response;
+        });
+        await using var missingLength = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("https://example.invalid/"), missingLengthHandler);
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await missingLength.HeadAsync(new ObjectKey("blob")));
+    }
+
+    [Fact]
+    public async Task HttpReportsWhenAnOriginIgnoresRange()
+    {
+        using var handler = new StubHandler(request =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent("0123456789"u8.ToArray()) };
+            response.Content.Headers.ContentLength = 10;
+            return response;
+        });
+        await using var store = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("https://example.invalid/"), handler);
+        var read = await store.OpenAsync(new ObjectKey("blob"), 4);
+        Assert.NotNull(read);
+        await using (read!)
+        {
+            Assert.Equal(0, read.ActualStartOffset);
+            using var bytes = new MemoryStream();
+            await read.Content.CopyToAsync(bytes);
+            Assert.Equal("0123456789", Encoding.UTF8.GetString(bytes.ToArray()));
+        }
     }
 
     private static async Task<string[]> ToArrayAsync(IAsyncEnumerable<ObjectKey> keys) { var result = new List<string>(); await foreach (var key in keys) result.Add(key.Value); return result.ToArray(); }
+
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(responder(request));
+    }
 }

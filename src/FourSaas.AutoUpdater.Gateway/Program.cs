@@ -13,6 +13,11 @@ app.MapMethods("/{**path}", ["GET", "HEAD"], async (HttpContext context, HttpCli
     if (context.Request.Headers.IfRange.Count > 0) request.Headers.TryAddWithoutValidation("If-Range", context.Request.Headers.IfRange.ToString());
     using var response = await client.SendAsync(request, context.Request.Method == "HEAD" ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
     context.Response.StatusCode = (int)response.StatusCode;
+    if (response.Content.Headers.ContentEncoding.Count != 0)
+    {
+        context.Response.StatusCode = StatusCodes.Status502BadGateway;
+        return;
+    }
     foreach (var header in response.Headers) context.Response.Headers[header.Key] = header.Value.ToArray();
     foreach (var header in response.Content.Headers) if (!string.Equals(header.Key, "Content-Encoding", StringComparison.OrdinalIgnoreCase)) context.Response.Headers[header.Key] = header.Value.ToArray();
     if (context.Request.Method != "HEAD") await response.Content.CopyToAsync(context.Response.Body, context.RequestAborted);

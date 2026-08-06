@@ -126,7 +126,7 @@ namespace FourSaas.AutoUpdater.Server.Migrations
 
                     b.HasKey("RepositoryId", "ProductId", "Channel");
 
-                    b.HasIndex("RepositoryId", "ProductId", "ChannelSequence")
+                    b.HasIndex("RepositoryId", "ProductId", "Channel", "ChannelSequence")
                         .IsUnique();
 
                     b.ToTable("Channels");
@@ -216,6 +216,34 @@ namespace FourSaas.AutoUpdater.Server.Migrations
 
                     b.Property<bool>("Used")
                         .HasColumnType("boolean");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset?>("ClaimedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("ConsumedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("InvalidatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("MultipartUploadId")
+                        .HasColumnType("text");
+
+                    b.Property<long?>("MultipartPartSize")
+                        .HasColumnType("bigint");
+
+                    b.Property<bool>("MultipartCompleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool>("MultipartCompleting")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("MultipartPartsJson")
+                        .HasColumnType("jsonb");
 
                     b.HasKey("GrantId");
 
@@ -355,7 +383,7 @@ namespace FourSaas.AutoUpdater.Server.Migrations
                     b.Property<string>("ReleaseId")
                         .HasColumnType("text");
 
-                    b.HasKey("Id");
+                    b.HasKey("Id", "At");
 
                     b.HasIndex("At");
 
@@ -388,6 +416,7 @@ namespace FourSaas.AutoUpdater.Server.Migrations
                     b.Property<string>("Scope").HasColumnType("text");
                     b.Property<string>("Name").HasColumnType("text");
                     b.Property<long>("NextValue").HasColumnType("bigint");
+                    b.Property<string>("AllocatedSequencesJson").HasColumnType("jsonb");
                     b.HasKey("RepositoryId", "Scope", "Name");
                     b.ToTable("SequenceReservations");
                 });

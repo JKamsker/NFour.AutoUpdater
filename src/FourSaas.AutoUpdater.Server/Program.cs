@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
 using FourSaas.AutoUpdater.Core;
@@ -7,6 +8,7 @@ using FourSaas.AutoUpdater.Server;
 using FourSaas.AutoUpdater.Storage;
 using FourSaas.AutoUpdater.Storage.Local;
 using FourSaas.AutoUpdater.Storage.S3;
+using FourSaas.AutoUpdater.Storage.Ftp;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 
@@ -16,12 +18,26 @@ var storageBackend = Environment.GetEnvironmentVariable("FOURSUP_STORAGE_BACKEND
 if (storageBackend == "s3")
 {
     var bucket = Environment.GetEnvironmentVariable("FOURSUP_STORAGE_BUCKET") ?? throw new InvalidOperationException("FOURSUP_STORAGE_BUCKET is required for the S3 server backend.");
-    builder.Services.AddSingleton<IWritableObjectStore>(_ => new S3ObjectStore(bucket, Environment.GetEnvironmentVariable("FOURSUP_STORAGE_PREFIX") ?? "", serviceUrl: Uri.TryCreate(Environment.GetEnvironmentVariable("FOURSUP_S3_ENDPOINT"), UriKind.Absolute, out var endpoint) ? endpoint : null, accessKey: Environment.GetEnvironmentVariable("FOURSUP_S3_ACCESS_KEY"), secretKey: Environment.GetEnvironmentVariable("FOURSUP_S3_SECRET_KEY")));
+    builder.Services.AddSingleton<IWritableObjectStore>(_ => CreateS3Store(bucket, Environment.GetEnvironmentVariable("FOURSUP_STORAGE_PREFIX") ?? ""));
 }
 else if (!string.IsNullOrWhiteSpace(storageRoot)) builder.Services.AddSingleton<IWritableObjectStore>(_ => new LocalObjectStore(storageRoot));
+else if (storageBackend == "ftp")
+{
+    var ftpText = Environment.GetEnvironmentVariable("FOURSUP_STORAGE_FTP_URI") ?? throw new InvalidOperationException("FOURSUP_STORAGE_FTP_URI is required for the FTP server backend.");
+    if (!Uri.TryCreate(ftpText, UriKind.Absolute, out var ftpUri) || ftpUri.Scheme is not ("ftp" or "ftps")) throw new InvalidOperationException("FOURSUP_STORAGE_FTP_URI must be an absolute ftp(s) URI.");
+    var ftpUser = Environment.GetEnvironmentVariable("FOURSUP_STORAGE_FTP_USER") ?? ftpUri.UserInfo.Split(':').FirstOrDefault() ?? "anonymous";
+    var ftpPassword = Environment.GetEnvironmentVariable("FOURSUP_STORAGE_FTP_PASSWORD") ?? "anonymous@";
+    builder.Services.AddSingleton<IWritableObjectStore>(_ => new FtpObjectStore(ftpUri, new NetworkCredential(ftpUser, ftpPassword), enableSsl: ftpUri.Scheme == "ftps"));
+}
 var databaseConnection = Environment.GetEnvironmentVariable("FOURSUP_DATABASE");
+if (!string.IsNullOrWhiteSpace(storageRoot) || storageBackend is "s3" or "ftp")
+    if (string.IsNullOrWhiteSpace(databaseConnection) && !string.Equals(Environment.GetEnvironmentVariable("FOURSUP_ALLOW_EPHEMERAL_STATE"), "1", StringComparison.Ordinal))
+        throw new InvalidOperationException("FOURSUP_DATABASE is required for a served control plane; set FOURSUP_ALLOW_EPHEMERAL_STATE=1 only for single-process development.");
 if (!string.IsNullOrWhiteSpace(databaseConnection))
+{
     builder.Services.AddDbContextFactory<ManagementDbContext>(options => options.UseNpgsql(databaseConnection));
+    builder.Services.AddHostedService<TelemetryRetentionService>();
+}
 var oidcAuthority = Environment.GetEnvironmentVariable("FOURSUP_OIDC_AUTHORITY");
 if (!string.IsNullOrWhiteSpace(oidcAuthority))
 {
@@ -60,9 +76,19 @@ builder.Services.AddSingleton<ManagementState>(serviceProvider =>
         var servedPrefix = Environment.GetEnvironmentVariable("FOURSUP_STORAGE_PREFIX") ?? "";
         if (string.Equals(stagingBucket, Environment.GetEnvironmentVariable("FOURSUP_STORAGE_BUCKET"), StringComparison.Ordinal) && (string.IsNullOrWhiteSpace(stagingPrefix) || string.IsNullOrWhiteSpace(servedPrefix) || stagingPrefix.StartsWith(servedPrefix, StringComparison.Ordinal) || servedPrefix.StartsWith(stagingPrefix, StringComparison.Ordinal)))
             throw new InvalidOperationException("FOURSUP_STAGING_PREFIX must be a non-overlapping prefix when S3 staging shares the served bucket.");
-        stagingStore = new S3ObjectStore(stagingBucket, stagingPrefix, serviceUrl: Uri.TryCreate(Environment.GetEnvironmentVariable("FOURSUP_S3_ENDPOINT"), UriKind.Absolute, out var stagingEndpoint) ? stagingEndpoint : null, accessKey: Environment.GetEnvironmentVariable("FOURSUP_S3_ACCESS_KEY"), secretKey: Environment.GetEnvironmentVariable("FOURSUP_S3_SECRET_KEY"));
+        stagingStore = CreateS3Store(stagingBucket, stagingPrefix);
     }
-    else if (servedStore is not null) stagingStore = new LocalObjectStore(stagingRoot!);
+    else if (servedStore is not null && stagingBackend == "local") stagingStore = new LocalObjectStore(stagingRoot!);
+    if (servedStore is not null && stagingBackend == "ftp")
+    {
+        var stagingFtpText = Environment.GetEnvironmentVariable("FOURSUP_STAGING_FTP_URI") ?? throw new InvalidOperationException("FOURSUP_STAGING_FTP_URI is required for FTP staging.");
+        if (!Uri.TryCreate(stagingFtpText, UriKind.Absolute, out var stagingFtpUri) || stagingFtpUri.Scheme is not ("ftp" or "ftps")) throw new InvalidOperationException("FOURSUP_STAGING_FTP_URI must be an absolute ftp(s) URI.");
+        var stagingUser = Environment.GetEnvironmentVariable("FOURSUP_STAGING_FTP_USER") ?? stagingFtpUri.UserInfo.Split(':').FirstOrDefault() ?? "anonymous";
+        var stagingPassword = Environment.GetEnvironmentVariable("FOURSUP_STAGING_FTP_PASSWORD") ?? "anonymous@";
+        stagingStore = new FtpObjectStore(stagingFtpUri, new NetworkCredential(stagingUser, stagingPassword), enableSsl: stagingFtpUri.Scheme == "ftps");
+    }
+    else if (servedStore is not null && stagingBackend is not ("local" or "s3"))
+        throw new InvalidOperationException($"Unsupported FOURSUP_STAGING_BACKEND '{stagingBackend}'.");
     var persistencePath = string.IsNullOrWhiteSpace(databaseConnection) ? Environment.GetEnvironmentVariable("FOURSUP_STATE_PATH") ?? Path.Combine(Directory.GetCurrentDirectory(), "4sup-state.json") : null;
     var state = new ManagementState(servedStore, persistencePath, stagingStore, serviceProvider.GetService<IDbContextFactory<ManagementDbContext>>(), repositoryId)
     {
@@ -98,14 +124,20 @@ app.Use(async (context, next) =>
     }
     await next();
 });
+var managementState = app.Services.GetRequiredService<ManagementState>();
 if (!string.IsNullOrWhiteSpace(databaseConnection))
 {
     await using var scope = app.Services.CreateAsyncScope();
     var database = scope.ServiceProvider.GetRequiredService<ManagementDbContext>();
     await database.Database.MigrateAsync();
-    await scope.ServiceProvider.GetRequiredService<ManagementState>().LoadDatabaseAsync();
+    await managementState.LoadDatabaseAsync();
 }
-if (!string.IsNullOrWhiteSpace(oidcAuthority)) app.UseAuthentication();
+await managementState.EnsureRepositoryDescriptorAsync();
+if (!string.IsNullOrWhiteSpace(oidcAuthority))
+{
+    app.UseAuthentication();
+    app.UseAuthorization();
+}
 app.Use(async (context, next) =>
 {
     var isWrite = context.Request.Method is not "GET" and not "HEAD" and not "OPTIONS";
@@ -147,16 +179,23 @@ app.Use(async (context, next) =>
     await next();
 });
 
-app.MapGet("/api/v1/.well-known/4sup", (HttpRequest request, ManagementState state) => Results.Json(new { api = $"{request.Scheme}://{request.Host}", versions = new[] { "v1" }, repositoryBaseUrl = state.RepositoryBaseUrl, minimumClientVersion = "1.0.0" })).WithMetadata(new EndpointPolicyMetadata("anonymous"));
-app.MapGet("/api/v1/repositories/{repo}/products", (string repo, ManagementState state) => state.IsConfiguredRepository(repo) ? Results.Json(state.Products.Keys.OrderBy(x => x, StringComparer.Ordinal)) : Results.NotFound()).WithMetadata(new EndpointPolicyMetadata("anonymous"));
-app.MapGet("/api/v1/products/{product}/channels/{channel}", (string product, string channel, ManagementState state) => state.Channels.TryGetValue((product, channel), out var bytes) ? Results.Bytes(bytes, "application/json") : Results.NotFound()).WithMetadata(new EndpointPolicyMetadata("anonymous"));
-app.MapGet("/api/v1/products/{product}/releases/{release}", (string product, string release, ManagementState state) => state.Releases.TryGetValue((product, release), out var bytes) ? Results.Bytes(bytes, "application/json") : Results.NotFound()).WithMetadata(new EndpointPolicyMetadata("anonymous"));
-app.MapGet("/api/v1/products/{product}/revocations", (string product, ManagementState state) => state.Revocations.TryGetValue((product, "revocations"), out var bytes) ? Results.Bytes(bytes, "application/json") : Results.NotFound()).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+var discovery = (HttpRequest request, ManagementState state) => Results.Json(new { api = $"{request.Scheme}://{request.Host}", versions = new[] { "v1" }, repositoryBaseUrl = state.RepositoryBaseUrl, minimumClientVersion = "1.0.0" });
+app.MapGet("/.well-known/4sup", discovery).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+// Keep the versioned alias for older control-plane clients while the normative
+// discovery route remains at the root of the server host.
+app.MapGet("/api/v1/.well-known/4sup", discovery).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+app.MapGet("/health/ready", (ManagementState state) => state.IsRepositoryUnavailable
+    ? Results.Json(new { ready = false, unavailable = true }, statusCode: StatusCodes.Status503ServiceUnavailable)
+    : Results.Ok(new { ready = true, unavailable = false })).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+app.MapGet("/api/v1/repositories/{repo}/products", (string repo, ManagementState state) => state.IsRepositoryUnavailable ? Results.StatusCode(StatusCodes.Status503ServiceUnavailable) : state.IsConfiguredRepository(repo) ? Results.Json(state.Products.Keys.OrderBy(x => x, StringComparer.Ordinal)) : Results.NotFound()).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+app.MapGet("/api/v1/products/{product}/channels/{channel}", (string product, string channel, ManagementState state, HttpContext context) => state.ReadPublicDocumentAsync(new RepositoryLayout(new RepositoryLayoutTemplates()).Channel(product, channel), state.Channels, (product, channel), context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+app.MapGet("/api/v1/products/{product}/releases/{release}", (string product, string release, ManagementState state, HttpContext context) => state.ReadPublicDocumentAsync(new RepositoryLayout(new RepositoryLayoutTemplates()).Release(product, release), state.Releases, (product, release), context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("anonymous"));
+app.MapGet("/api/v1/products/{product}/revocations", (string product, ManagementState state, HttpContext context) => state.ReadPublicDocumentAsync(new RepositoryLayout(new RepositoryLayoutTemplates()).Revocations(product), state.Revocations, (product, "revocations"), context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("anonymous"));
 app.MapPost("/api/v1/telemetry", (HttpRequest request, ManagementState state) => state.RecordTelemetryAsync(request, request.HttpContext.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("anonymous"));
 app.MapPost("/api/v1/repositories/{repo}/blobs/query", async (string repo, HttpRequest request, ManagementState state) =>
 {
     var requested = await ReadStringsAsync(request);
-    var present = state.QueryBlobs(repo, requested).ToHashSet(StringComparer.Ordinal);
+    var present = (await state.QueryBlobsAsync(repo, requested, request.HttpContext.RequestAborted).ConfigureAwait(false)).ToHashSet(StringComparer.Ordinal);
     return Results.Json(new { present = requested.Where(present.Contains).ToArray(), absent = requested.Where(x => !present.Contains(x)).ToArray() });
 }).WithMetadata(new EndpointPolicyMetadata("publisher"));
 app.MapPost("/api/v1/repositories/{repo}/sequences/{scope}/{name}", (string repo, string scope, string name, ManagementState state, HttpContext context) => state.AllocateSequenceAsync(repo, scope, name, context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
@@ -165,9 +204,12 @@ app.MapPost("/api/v1/repositories/{repo}/packages/{package}/versions/{version}/f
 app.MapPost("/api/v1/repositories/{repo}/packages/{package}/versions/{version}/publish", (string repo, string package, string version, ManagementState state) => state.PublishPackageVersion(repo, package, version)).WithMetadata(new EndpointPolicyMetadata("publisher"));
 app.MapPost("/api/v1/repositories/{repo}/publish/sessions", (string repo, ManagementState state) => Results.Ok(state.OpenSession(repo))).WithMetadata(new EndpointPolicyMetadata("publisher"));
 app.MapPost("/api/v1/repositories/{repo}/publish/sessions/{id}/grants", (string repo, string id, HttpRequest request, ManagementState state) => state.CreateGrantsAsync(id, request, repo)).WithMetadata(new EndpointPolicyMetadata("publisher"));
-app.MapPost("/api/v1/repositories/{repo}/publish/sessions/{id}/seal", (string repo, string id, ManagementState state, HttpContext context) => state.SealSessionAsync(id, context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
+app.MapPost("/api/v1/repositories/{repo}/publish/sessions/{sessionId}/grants/{grantId}/complete", (string repo, string sessionId, string grantId, HttpRequest request, ManagementState state) => state.CompleteMultipartGrantAsync(repo, sessionId, grantId, request, request.HttpContext.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
+app.MapPost("/api/v1/repositories/{repo}/publish/sessions/{sessionId}/grants/{grantId}/abort", (string repo, string sessionId, string grantId, ManagementState state, HttpContext context) => state.AbortMultipartGrantAsync(repo, sessionId, grantId, context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
+app.MapPost("/api/v1/repositories/{repo}/publish/sessions/{id}/seal", (string repo, string id, ManagementState state, HttpContext context) => state.SealSessionAsync(repo, id, context.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
 app.MapPut("/api/v1/products/{product}/releases/{release}/lock", async (string product, string release, HttpRequest request, ManagementState state) => await state.PlaceSignedAsync("release-lock", product, release, request, state.Releases)).WithMetadata(new EndpointPolicyMetadata("operator"));
 app.MapPut("/api/v1/products/{product}/channels/{channel}", async (string product, string channel, HttpRequest request, ManagementState state) => await state.PlaceSignedAsync("channel-pointer", product, channel, request, state.Channels)).WithMetadata(new EndpointPolicyMetadata("operator"));
+app.MapPut("/api/v1/repositories/{repo}/keys", (string repo, HttpRequest request, ManagementState state) => state.PlaceSignedKeyManifestAsync(repo, request, request.HttpContext.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("operator"));
 app.MapPost("/api/v1/products/{product}/releases/drafts", (string product, HttpRequest request, ManagementState state) => state.CreateReleaseDraftAsync(product, request, request.HttpContext.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
 app.MapPost("/api/v1/products/{product}/releases/drafts/{draft}/check", (string product, string draft, ManagementState state) => state.CheckReleaseDraft(product, draft)).WithMetadata(new EndpointPolicyMetadata("publisher"));
 app.MapPost("/api/v1/products/{product}/releases/drafts/{draft}/coverage", (string product, string draft, HttpRequest request, ManagementState state) => state.RegisterReleaseDraftCoverageAsync(product, draft, request, request.HttpContext.RequestAborted)).WithMetadata(new EndpointPolicyMetadata("publisher"));
@@ -190,6 +232,24 @@ var unclassifiedEndpoints = app.Services.GetRequiredService<EndpointDataSource>(
     .ToArray();
 if (unclassifiedEndpoints.Length != 0) throw new InvalidOperationException($"Every control-plane endpoint must declare an explicit policy: {string.Join(", ", unclassifiedEndpoints)}");
 app.Run();
+
+static S3ProviderProfile S3ProviderProfileFromEnvironment()
+{
+    var value = Environment.GetEnvironmentVariable("FOURSUP_S3_PROVIDER") ?? "aws";
+    if (!Enum.TryParse<S3ProviderProfile>(value, true, out var profile)) throw new InvalidOperationException($"Unknown FOURSUP_S3_PROVIDER '{value}'.");
+    return profile;
+}
+
+static S3ObjectStore CreateS3Store(string bucket, string prefix)
+{
+    var profile = S3ProviderProfileFromEnvironment();
+    var serviceUrl = Uri.TryCreate(Environment.GetEnvironmentVariable("FOURSUP_S3_ENDPOINT"), UriKind.Absolute, out var endpoint) ? endpoint : null;
+    var accessKey = Environment.GetEnvironmentVariable("FOURSUP_S3_ACCESS_KEY");
+    var secretKey = Environment.GetEnvironmentVariable("FOURSUP_S3_SECRET_KEY");
+    return profile is S3ProviderProfile.Aws or S3ProviderProfile.Minio or S3ProviderProfile.R2
+        ? new S3ConditionalObjectStore(bucket, prefix, serviceUrl: serviceUrl, accessKey: accessKey, secretKey: secretKey, providerProfile: profile)
+        : new S3ObjectStore(bucket, prefix, serviceUrl: serviceUrl, accessKey: accessKey, secretKey: secretKey, providerProfile: profile);
+}
 
 static async ValueTask<string[]> ReadStringsAsync(HttpRequest request)
 {

@@ -156,16 +156,14 @@ The glob engine still exists, but only on the publishing side.
                                minimumInstalledRelease satisfied; minimumClientVersion satisfied
 2. Acquire the install lock    named mutex; reports WHO holds it, not just "blocked"
 3. Write .4sup/plan.json       makes the operation resumable from this point on
-4. Acquire process/service     tickets — stop what must be stopped, record what was running
-5. Fetch                       all blobs, deduped by hash, into .4sup/staging/{hash},
+4. Fetch                       all blobs, deduped by hash, into .4sup/staging/{hash},
                                VERIFYING sha256 as bytes land
-6. ── barrier ──               nothing is written into the install tree until every blob is
+5. ── barrier ──               nothing is written into the install tree until every blob is
                                present and verified
-7. Materialise                 hardlink-or-copy staged blobs into place; escalate on lock
-8. Delete                      the delete set; prune emptied directories
-9. COMMIT                      atomic + durable rewrite of .4sup/state.jsonl
-10. Restore tickets            restart what was running, restore service start types
-11. Remove .4sup/plan.json     the operation is over
+6. Materialise                 hardlink-or-copy staged blobs into place; escalate on lock
+7. Delete                      the delete set; prune emptied directories
+8. COMMIT                      atomic + durable rewrite of .4sup/state.jsonl
+9. Remove .4sup/plan.json      the operation is over
 ```
 
 **Step 6 is the single most important line in this document.** "All blobs present and verified
@@ -318,7 +316,7 @@ Normative rules for every mutation — write, replace, delete, and directory cre
 The adversarial cases — junction swap, symlink race, mount point, case collision, parent
 replacement mid-apply — are explicit tests ([12](12-testing.md) §7), not review items.
 
-## 4. Locked files, processes and services
+## 4. Locked files and processes
 
 On Windows, patching a game whose launcher holds a handle to `bin/game.exe` simply fails:
 `File.Move` throws. The new plan carries the reference's **ticket pattern** forward — it is the
@@ -326,26 +324,18 @@ one part of the reference that is unambiguously production-hardened — and fixe
 
 ```csharp
 public enum LockedFilePolicy { Fail, RenameAside, PendingReboot, AskUser }
-public enum RestartBehavior  { Never, WhenStarted, Always }
 ```
 
-A ticket captures pre-mutation state (`OriginalStartType`, `OriginalStatus`, `WasRunning`,
-`SessionId`) and exposes `Restore*` verbs, so "leave the machine as you found it" is the
-default. Two details carried over verbatim:
-
-- **Set a Windows service's `StartType` to `Manual` before stopping it**, so the SCM cannot
-  auto-restart it mid-patch; restore afterwards. Three lines; prevents a real class of
-  corruption.
-- **Rename-aside** to `{path}.old-{n}` when a move fails, so the running process keeps its
-  handle to the old inode and the new file lands.
+The applier does not stop, restart, or otherwise control services or processes. **Rename-aside**
+to `{path}.old-{n}` when a move fails allows the existing handle to remain valid while the new
+file lands.
 
 What is **not** carried over: the reference's unconditional
 `Process.Kill(entireProcessTree: true)` of whoever holds the handle, which will happily kill
 `explorer.exe` or an antivirus scanner. Escalation is now an explicit per-file policy, defaulting
 to `RenameAside` for `Replace` files and `Fail` for anything else.
 
-`Restart Manager` (`RstrtMgr.dll`) is used to *identify* holders for the error message; it is
-not used to terminate them.
+Service and process control, including holder inspection, is outside 4sup's scope.
 
 ## 5. The local content cache (CAS)
 
@@ -423,8 +413,8 @@ manual command depends on whether the engine globs `ui/**` at startup —
   half-applied.
 - Forward state across the update: config and local databases must be copied from the old
   content root, or config silently resets.
-- For the service host: rewrite the SCM `BinaryPath` and `Environment.Exit(1)` into the
-  configured failure action, with a `WaitTimeGenerator` backoff (15 s → 10 min over 20 actions).
+- For a host process: exit into its configured failure action with a `WaitTimeGenerator`
+  backoff (15 s → 10 min over 20 actions).
 - Version-collision suffixes (`{ver}`, `{ver}-1`, `{ver}-2`) for republished builds.
 
 `minimumClientVersion` on both `repo.json` and the channel pointer lets a repository refuse an
@@ -437,7 +427,7 @@ Not a GUI, but the seam one needs. Carried over from the reference, which got th
 - `[Route]`-attributed controllers over a named pipe, with `IAsyncEnumerable<T>` as a
   first-class response shape and `CancellationToken` injected from the request context — so
   progress streams incrementally instead of buffering.
-- **One protocol in both directions**: the service pushes progress by opening a normal request
+- **One protocol in both directions**: the host pushes progress by opening a normal request
   to a route the *client* hosts. No second channel, no second serializer.
 - A `UseInProcess(...)` transport swap so the entire IPC stack runs inside one process for
   design-time and debug builds. This is how GUI work gets done without a service installed, and

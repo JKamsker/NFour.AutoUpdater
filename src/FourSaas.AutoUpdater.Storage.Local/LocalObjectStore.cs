@@ -3,7 +3,7 @@ using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Local;
 
-public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideVerifier
+public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideTransferStore, IServerSideVerifier
 {
     private readonly string _root;
     public LocalObjectStore(string root) => _root = Path.GetFullPath(root);
@@ -22,7 +22,9 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
             var restart = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
             return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = restart, ActualStartOffset = 0, StatusCode = 200, Validator = validator });
         }
-        if (offset < 0 || offset > info.Length) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (offset > info.Length)
+            return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = Stream.Null, ActualStartOffset = 0, StatusCode = 416, Validator = validator });
         var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
         stream.Position = offset;
         return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = stream, ActualStartOffset = offset, StatusCode = offset == 0 ? 200 : 206, Validator = validator });
@@ -53,6 +55,7 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
         try
         {
             File.Move(temporary, destination, overwrite: true);
+            FlushContainingDirectory(destination);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
@@ -60,7 +63,11 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
     {
         await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
         var path = Resolve(key);
-        if (File.Exists(path)) File.Delete(path);
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+            FlushContainingDirectory(path);
+        }
     }
     public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
@@ -71,7 +78,7 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
         var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
         try
         {
-            try { File.Move(temporary, destination, overwrite: false); return true; }
+            try { File.Move(temporary, destination, overwrite: false); FlushContainingDirectory(destination); return true; }
             catch (IOException) when (File.Exists(destination)) { return false; }
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
@@ -90,6 +97,7 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
             if (await ContentHash.ComputeAsync(verification, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false) != expectedDigest)
                 throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
             File.Move(temporary, destination, overwrite: false);
+            FlushContainingDirectory(destination);
             return true;
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
@@ -102,14 +110,53 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
         var info = new FileInfo(destination);
         if (!info.Exists || expected.Kind != ObjectValidatorKind.SizeAndMtime || Validator(info).Value != expected.Value) return false;
         var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
-        try { File.Move(temporary, destination, overwrite: true); return true; }
+        try { File.Move(temporary, destination, overwrite: true); FlushContainingDirectory(destination); return true; }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
     public async ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
         await using var keyLock = await AcquireKeyLockAsync(destination, cancellationToken).ConfigureAwait(false);
         var sourcePath = Resolve(source); var destinationPath = Resolve(destination); Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-        File.Copy(sourcePath, destinationPath, overwrite);
+        if (!overwrite && File.Exists(destinationPath)) throw new IOException($"Destination '{destination}' already exists.");
+        var temporary = destinationPath + ".copy-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        try
+        {
+            await using (var input = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                output.Flush(flushToDisk: true);
+            }
+            File.Move(temporary, destinationPath, overwrite);
+            FlushContainingDirectory(destinationPath);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+    public async ValueTask<bool> TryCopyFromAsync(IReadableObjectStore sourceStore, ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
+    {
+        if (sourceStore is not LocalObjectStore local) return false;
+        var sourcePath = local.Resolve(source);
+        if (!File.Exists(sourcePath)) throw new FileNotFoundException(source.Value);
+        await using var keyLock = await AcquireKeyLockAsync(destination, cancellationToken).ConfigureAwait(false);
+        var destinationPath = Resolve(destination);
+        if (!overwrite && File.Exists(destinationPath)) throw new IOException($"Destination '{destination}' already exists.");
+        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+        var temporary = destinationPath + ".copy-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        try
+        {
+            await using (var input = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                output.Flush(flushToDisk: true);
+            }
+            File.Move(temporary, destinationPath, overwrite);
+            FlushContainingDirectory(destinationPath);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        return true;
     }
     public async ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expected, CancellationToken cancellationToken = default)
     {
@@ -160,6 +207,21 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
     private bool IsInternalPath(string path)
     {
         var lockRoot = Path.Combine(_root, ".4sup-locks") + Path.DirectorySeparatorChar;
-        return path.StartsWith(lockRoot, StringComparison.Ordinal) || Path.GetFileName(path).Contains(".tmp-", StringComparison.Ordinal);
+        var fileName = Path.GetFileName(path);
+        return path.StartsWith(lockRoot, StringComparison.Ordinal)
+            || fileName.Contains(".tmp-", StringComparison.Ordinal)
+            || fileName.Contains(".copy-", StringComparison.Ordinal);
+    }
+
+    private static void FlushContainingDirectory(string path)
+    {
+        if (OperatingSystem.IsWindows()) return;
+        try
+        {
+            using var directory = new FileStream(Path.GetDirectoryName(path)!, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            directory.Flush(flushToDisk: true);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }

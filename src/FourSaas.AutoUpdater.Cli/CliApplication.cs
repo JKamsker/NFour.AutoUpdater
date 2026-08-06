@@ -8,10 +8,10 @@ using FourSaas.AutoUpdater.Storage.Local;
 using FourSaas.AutoUpdater.Storage.S3;
 using FourSaas.AutoUpdater.Storage.Ftp;
 using FourSaas.AutoUpdater.Storage.Brokering;
-using FourSaas.AutoUpdater.Client.Windows;
 using System.Net;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace FourSaas.AutoUpdater.Cli;
 
@@ -91,7 +91,7 @@ public static class CliApplication
         }
     }
 
-    private static void PrintHelp() => Console.WriteLine("4sup — content-addressed variant updater\n\nCommands: install, update, switch, rollback, plan, status, verify, explain, pkg, release, channel, gc, mirror, prune, verify-repo, config, daemon\n\nDevelopment helpers: parse-address <address>, select --select=axis=value, verify-path <path>\n\nExit codes: 0 success, 1 validation, 2 usage, 3 backend, 4 precondition, 5 integrity, 6 concurrency, 7 cancelled.");
+    private static void PrintHelp() => Console.WriteLine("4sup — content-addressed variant updater\n\nCommands: install, update, switch, rollback, plan, status, verify, explain, pkg, release, channel, gc, mirror, prune, verify-repo, config, daemon\n\nTrust: first-party installs use the compiled root; self-hosted first install requires --trust-on-first-use with --trusted-key.\n\nDevelopment helpers: parse-address <address>, select --select=axis=value, verify-path <path>\n\nExit codes: 0 success, 1 validation, 2 usage, 3 backend, 4 precondition, 5 integrity, 6 concurrency, 7 cancelled.");
 
     private static async ValueTask<int> ConfigurationCommandAsync(string[] args)
     {
@@ -115,10 +115,33 @@ public static class CliApplication
     private static async ValueTask<int> DaemonCommandAsync(string[] args)
     {
         if (!string.Equals(args.FirstOrDefault(), "run", StringComparison.Ordinal)) throw new FormatException("daemon requires run.");
+        var positional = Positional(args.Skip(1)).ToArray();
+        if (positional.Length is < 1 or > 2) throw new FormatException("daemon run requires <install-root> or <repository-address> <install-root>.");
+        var intervalText = GetOptionValue(args, "--interval");
+        var intervalSeconds = 900;
+        if (intervalText is not null && (!int.TryParse(intervalText, NumberStyles.Integer, CultureInfo.InvariantCulture, out intervalSeconds) || intervalSeconds < 5 || intervalSeconds > 86400))
+            throw new FormatException("--interval must be between 5 and 86400 seconds.");
+        var once = args.Contains("--once", StringComparer.Ordinal);
+        var command = positional.Length == 2 ? "install" : "update";
+        var workflowArgs = positional.Length == 2 ? positional : [positional[0]];
         using var cancellation = new CancellationTokenSource();
         Console.CancelKeyPress += (_, eventArgs) => { eventArgs.Cancel = true; cancellation.Cancel(); };
-        await Task.Delay(Timeout.InfiniteTimeSpan, cancellation.Token).ConfigureAwait(false);
-        return 0;
+        while (true)
+        {
+            cancellation.Token.ThrowIfCancellationRequested();
+            try
+            {
+                var result = await InstallWorkflowAsync(workflowArgs, apply: true, command).ConfigureAwait(false);
+                if (once) return result;
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return 7; }
+            catch (Exception ex) when (!once && ex is IOException or HttpRequestException or UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"daemon: transient update failure: {ex.Message}");
+            }
+            if (once) return 0;
+            await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), cancellation.Token).ConfigureAwait(false);
+        }
     }
 
     private static async ValueTask<int> StatusAsync(string[] args)
@@ -153,6 +176,8 @@ public static class CliApplication
         if (args.Contains("--repair", StringComparer.Ordinal)) return await InstallWorkflowAsync(args, apply: true, command: "update").ConfigureAwait(false);
         if (document is null) throw new ApplyPreconditionException("No install ledger exists; use --rebuild-state with an explicit repository target.");
         var issues = new List<object>();
+        if (args.Contains("--rehash-cas", StringComparer.Ordinal))
+            await AddCasVerificationIssuesAsync(ResolveCacheRoot(), issues).ConfigureAwait(false);
         var unmanaged = document.Files.Values.Where(x => x.State == "adopted").Select(x => x.Path.Value).ToArray();
         foreach (var file in document.Files.Values.Where(x => x.State != "adopted" && x.Content is not null))
         {
@@ -167,10 +192,53 @@ public static class CliApplication
         return issues.Count == 0 ? 0 : 5;
     }
 
+    private static async ValueTask AddCasVerificationIssuesAsync(string cacheRoot, List<object> issues, CancellationToken cancellationToken = default)
+    {
+        if (!Directory.Exists(cacheRoot))
+        {
+            issues.Add(new { path = cacheRoot, issue = "cas-missing" });
+            return;
+        }
+        foreach (var path in Directory.EnumerateFiles(cacheRoot, "*", SearchOption.AllDirectories))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Path.GetFileName(path).Contains(".tmp-", StringComparison.Ordinal)) continue;
+            var relative = Path.GetRelativePath(cacheRoot, path).Replace(Path.DirectorySeparatorChar, '/');
+            var parts = relative.Split('/');
+            if (parts.Length != 4 || parts[1].Length != 2 || parts[2].Length != 2 || !ContentHash.TryParse(parts[0] + ":" + parts[3], out var expected))
+            {
+                issues.Add(new { path = relative, issue = "cas-layout" });
+                continue;
+            }
+            var hex = parts[3].ToLowerInvariant();
+            if (!string.Equals(parts[1], hex[..2], StringComparison.Ordinal) || !string.Equals(parts[2], hex[2..4], StringComparison.Ordinal))
+            {
+                issues.Add(new { path = relative, issue = "cas-shard" });
+                continue;
+            }
+            await using var stream = File.OpenRead(path);
+            var actual = await ContentHash.ComputeAsync(stream, expected.Algorithm, cancellationToken).ConfigureAwait(false);
+            if (actual != expected) issues.Add(new { path = relative, issue = "cas-digest-mismatch", expected = expected.ToString(), actual = actual.ToString() });
+        }
+    }
+
+    private static string ResolveCacheRoot()
+    {
+        var cacheRoot = Environment.GetEnvironmentVariable("FOURSUP_CAS_ROOT");
+        if (!string.IsNullOrWhiteSpace(cacheRoot)) return Path.GetFullPath(cacheRoot);
+        if (OperatingSystem.IsWindows())
+        {
+            var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            return Path.Combine(string.IsNullOrWhiteSpace(localData) ? Environment.CurrentDirectory : localData, "4Story", "4sup", "cas");
+        }
+        var cacheBase = Environment.GetEnvironmentVariable("XDG_CACHE_HOME");
+        if (string.IsNullOrWhiteSpace(cacheBase)) cacheBase = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache");
+        return Path.Combine(cacheBase, "4sup", "cas");
+    }
+
     private static async ValueTask<LedgerDocument> RebuildStateAsync(string root, LedgerDocument? existing, string[] args)
     {
-        var trusted = ParseTrustedKeys(args);
-        if (trusted.Count == 0) throw new CryptographicException("--rebuild-state requires at least one --trusted-key=<keyId>:<base64url>.");
+        var trusted = ParseTrustedKeysOrFirstParty(args);
         var repositoryTarget = GetOptionValue(args, "--repository");
         string addressText;
         VariantSelection selection;
@@ -216,7 +284,7 @@ public static class CliApplication
             ReleaseId = verified.Lock.ReleaseId, ReleaseSequence = verified.Lock.Sequence,
             ReleaseDigest = ContentHash.Compute(verified.EnvelopeBytes), Selection = selection, SelectionId = selection.SelectionId,
             FileSetId = composed.FileSetId, LastChannelSequence = verified.Pointer?.ChannelSequence ?? existing?.Lock.LastChannelSequence ?? 0,
-            KeySequence = existing?.Lock.KeySequence ?? 0, RevocationSequence = existing?.Lock.RevocationSequence ?? 0,
+            KeySequence = existing?.Lock.KeySequence ?? 0, KeyManifestDigest = existing?.Lock.KeyManifestDigest, RevocationSequence = existing?.Lock.RevocationSequence ?? 0, RevocationDigest = existing?.Lock.RevocationDigest,
             TrustedKeyIds = trusted.Keys.OrderBy(x => x, StringComparer.Ordinal).ToImmutableArray(),
             TrustedKeys = trusted.ToImmutableDictionary(x => x.Key, x => Base64Url.Encode(x.Value), StringComparer.Ordinal),
             AppliedAt = DateTimeOffset.UtcNow
@@ -279,7 +347,7 @@ public static class CliApplication
         }
     }
 
-    private static bool OptionTakesValue(string option) => option is "--select" or "--trusted-key" or "--sign" or "--path" or "--to" or "--repository" or "--release" or "--rules" or "--keep-releases" or "--min-age" or "--effect" or "--reason" or "--config" or "--contentRoot" or "--api" or "--token" or "--repository-id" or "--pinned-root-key";
+    private static bool OptionTakesValue(string option) => option is "--select" or "--trusted-key" or "--sign" or "--path" or "--to" or "--repository" or "--release" or "--rules" or "--keep-releases" or "--min-age" or "--effect" or "--reason" or "--config" or "--contentRoot" or "--api" or "--token" or "--repository-id" or "--pinned-root-key" or "--minimum-client-version" or "--write-target" or "--interval";
 
     private static async ValueTask<int> InstallWorkflowAsync(string[] args, bool apply, string command)
     {
@@ -288,6 +356,7 @@ public static class CliApplication
         if (string.IsNullOrWhiteSpace(installRoot)) throw new FormatException(command == "install" ? "install requires <repository-address> <install-root>." : $"{command} requires <install-root>.");
         var ledger = new InstallLedger(installRoot);
         var previous = await ledger.ReadAsync().ConfigureAwait(false);
+        LedgerDocument? historicalRollback = null;
         string addressText;
         if (command == "install") addressText = ResolveAlias(positional[0]);
         else
@@ -298,14 +367,44 @@ public static class CliApplication
             if (command == "rollback")
             {
                 var history = await ledger.ReadHistoryAsync().ConfigureAwait(false);
-                if (!history.Any(x => string.Equals(x.Lock.ReleaseId, target, StringComparison.Ordinal)))
+                historicalRollback = history.LastOrDefault(x => string.Equals(x.Lock.ReleaseId, target, StringComparison.Ordinal));
+                if (historicalRollback is null)
                     throw new ApplyPreconditionException($"Release '{target}' is not present in this install's local history; local rollback will not fetch an unrelated release.");
             }
             var reference = target is null ? (previous.Lock.Channel is null ? "release:" + previous.Lock.ReleaseId : previous.Lock.Channel) : "release:" + target;
             addressText = new Uri(new Uri(previous.Lock.RepositoryUri, UriKind.Absolute), previous.Lock.ProductId + "@" + reference).ToString();
         }
         var address = RepositoryAddress.Parse(ResolveAlias(addressText));
-        var trusted = ParseTrustedKeys(args).ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.Ordinal);
+        if (previous is not null && command == "install" && !string.Equals(previous.Lock.RepositoryUri, address.BaseUri.ToString(), StringComparison.OrdinalIgnoreCase)
+            && !args.Contains("--yes", StringComparer.Ordinal))
+            throw new ApplyPreconditionException("The install root is already pinned to a different repository; pass --yes to explicitly rebind it.");
+        var suppliedTrust = ParseTrustedKeys(args).ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.Ordinal);
+        var compiledRoots = CompiledTrustRoots.FirstParty;
+        var trusted = suppliedTrust.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.Ordinal);
+        if (previous is null)
+        {
+            if (suppliedTrust.TryGetValue(CompiledTrustRoots.FirstPartyKeyId, out var suppliedRoot))
+            {
+                var compiledRoot = compiledRoots[CompiledTrustRoots.FirstPartyKeyId];
+                if (!CryptographicOperations.FixedTimeEquals(suppliedRoot, compiledRoot))
+                    throw new CryptographicException($"The supplied first-party root '{CompiledTrustRoots.FirstPartyKeyId}' differs from the key compiled into this client.");
+                if (suppliedTrust.Keys.Any(x => !string.Equals(x, CompiledTrustRoots.FirstPartyKeyId, StringComparison.Ordinal)))
+                    throw new CryptographicException("A first-party bootstrap may contain only the compiled trust root.");
+                trusted = new Dictionary<string, byte[]>(compiledRoots, StringComparer.Ordinal);
+            }
+            else if (suppliedTrust.Count == 0)
+            {
+                trusted = new Dictionary<string, byte[]>(compiledRoots, StringComparer.Ordinal);
+            }
+            else if (!args.Contains("--trust-on-first-use", StringComparer.Ordinal))
+            {
+                throw new ApplyPreconditionException("This repository is not signed by the compiled first-party root. First install requires explicit --trust-on-first-use consent.");
+            }
+            else
+            {
+                Console.Error.WriteLine("TOFU consent recorded for the supplied repository trust key(s); they will be pinned in the install ledger.");
+            }
+        }
         if (previous?.Lock.TrustedKeys.Count > 0)
         {
             var persisted = new Dictionary<string, byte[]>(StringComparer.Ordinal);
@@ -316,26 +415,45 @@ public static class CliApplication
                 persisted[pair.Key] = key;
                 if (trusted.TryGetValue(pair.Key, out var supplied) && !CryptographicOperations.FixedTimeEquals(supplied, key))
                     throw new CryptographicException($"Trusted key '{pair.Key}' differs from the key pinned in the install ledger.");
-                if (!trusted.ContainsKey(pair.Key))
-                    throw new CryptographicException($"Trusted key '{pair.Key}' is pinned in the install ledger and must be supplied again.");
             }
             if (trusted.Keys.Any(keyId => !persisted.ContainsKey(keyId)))
                 throw new CryptographicException("The supplied trust set contains a key that is not pinned in the install ledger.");
             if (trusted.Count == 0) trusted = persisted;
+            if (persisted.TryGetValue(CompiledTrustRoots.FirstPartyKeyId, out var persistedRoot))
+            {
+                if (!CryptographicOperations.FixedTimeEquals(persistedRoot, compiledRoots[CompiledTrustRoots.FirstPartyKeyId]))
+                    throw new CryptographicException($"The persisted first-party root '{CompiledTrustRoots.FirstPartyKeyId}' differs from the key compiled into this client.");
+                trusted[CompiledTrustRoots.FirstPartyKeyId] = compiledRoots[CompiledTrustRoots.FirstPartyKeyId].ToArray();
+            }
         }
+        if (previous is not null && previous.Lock.TrustedKeys.ContainsKey(CompiledTrustRoots.FirstPartyKeyId)
+            && !trusted.ContainsKey(CompiledTrustRoots.FirstPartyKeyId))
+            throw new CryptographicException($"The persisted first-party root '{CompiledTrustRoots.FirstPartyKeyId}' is missing from the current trust set.");
         if (trusted.Count == 0) throw new CryptographicException("No trusted Ed25519 public key was supplied; use --trusted-key=<keyId>:<base64url>.");
         var trustBeforeManifest = trusted.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.Ordinal);
         var selectionValues = OptionValues(args, "--select").ToArray();
-        var selection = selectionValues.Length == 0 && previous is not null ? previous.Lock.Selection : SelectionParser.Parse(selectionValues);
+        var selection = historicalRollback is not null
+            ? historicalRollback.Lock.Selection
+            : selectionValues.Length == 0 && previous is not null ? previous.Lock.Selection : SelectionParser.Parse(selectionValues);
         await using var store = CreateReadStore(address);
         var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
         descriptor.ValidateAgainst(address.BaseUri);
         var reader = new RepositoryReader(store, descriptor);
         var keySequence = previous?.Lock.KeySequence ?? 0;
+        ContentHash? currentKeysDigest = previous?.Lock.KeyManifestDigest;
         IReadOnlyDictionary<string, VerificationKey>? validityKeys = null;
         try
         {
-            var currentKeys = await reader.ReadKeyManifestAsync(trusted, keySequence, GetOptionValue(args, "--pinned-root-key"), DateTimeOffset.UtcNow, cancellationToken: default).ConfigureAwait(false);
+            // A first-party install keeps the compiled root pinned for the entire
+            // lifetime of the ledger. Self-hosted TOFU installs deliberately have
+            // no implicit root pin and must opt into their own trust policy.
+            var pinnedRoot = GetOptionValue(args, "--pinned-root-key")
+                ?? (trusted.ContainsKey(CompiledTrustRoots.FirstPartyKeyId) ? CompiledTrustRoots.FirstPartyKeyId : null);
+            var currentKeys = await reader.ReadKeyManifestAsync(trusted, keySequence, previous?.Lock.KeyManifestDigest, pinnedRoot, DateTimeOffset.UtcNow, cancellationToken: default).ConfigureAwait(false);
+            if (previous is not null && !previous.Lock.TrustedKeys.ContainsKey(CompiledTrustRoots.FirstPartyKeyId)
+                && currentKeys.Manifest.KeySequence > previous.Lock.KeySequence
+                && !ConfirmTrustChange(args, currentKeys.Manifest.KeySequence))
+                throw new ApplyPreconditionException("This self-hosted repository changed its trust manifest; explicit confirmation is required.");
             validityKeys = currentKeys.Manifest.Keys
                 .Where(x => !currentKeys.Manifest.RevokedKeyIds.Contains(x.KeyId, StringComparer.Ordinal))
                 .ToDictionary(x => x.KeyId, x => new VerificationKey(Base64Url.Decode(x.PublicKey), x.NotBefore, x.NotAfter), StringComparer.Ordinal);
@@ -343,25 +461,49 @@ public static class CliApplication
                 .Where(x => !currentKeys.Manifest.RevokedKeyIds.Contains(x.KeyId, StringComparer.Ordinal))
                 .ToDictionary(x => x.KeyId, x => Base64Url.Decode(x.PublicKey), StringComparer.Ordinal);
             keySequence = currentKeys.Manifest.KeySequence;
+            currentKeysDigest = ContentHash.Compute(currentKeys.EnvelopeBytes);
         }
         catch (FileNotFoundException) { }
         var verified = address.ReleaseRef.StartsWith("channel:", StringComparison.Ordinal)
             ? await reader.ReadChannelReleaseAsync(address.ProductId, address.ReleaseRef[8..], trusted).ConfigureAwait(false)
             : await reader.ReadReleaseAsync(address.ProductId, address.ReleaseRef[8..], trusted).ConfigureAwait(false);
-        var revocations = await reader.ReadRevocationsAsync(address.ProductId, trusted, previous?.Lock.RevocationSequence).ConfigureAwait(false);
+        if (historicalRollback is not null)
+        {
+            if (ContentHash.Compute(verified.EnvelopeBytes) != historicalRollback.Lock.ReleaseDigest || verified.Lock.ProductId != historicalRollback.Lock.ProductId || verified.Lock.ReleaseId != historicalRollback.Lock.ReleaseId)
+                throw new CryptographicException($"Repository release '{verified.Lock.ReleaseId}' does not match the exact release envelope recorded in local rollback history.");
+        }
+        var revocations = await reader.ReadRevocationsAsync(address.ProductId, trusted, previous?.Lock.RevocationSequence, previous?.Lock.RevocationDigest).ConfigureAwait(false);
+        if (previous?.Lock.RevocationSequence > 0 && revocations is null)
+            throw new ApplyPreconditionException("The repository revocation document is missing; refusing to forget previously accepted revocations.");
+        if (previous is not null && revocations is not null && previous.Lock.KnownRevocations.Any(oldEntry => !revocations.Document.Entries.Contains(oldEntry)))
+            throw new ApplyPreconditionException("The repository revocation document removed a previously accepted entry.");
         if (validityKeys is not null)
         {
             EnsureDocumentSigner(verified.Envelope, validityKeys, verified.Lock.CreatedAt);
             if (verified.Pointer is { } channelPointer && verified.PointerEnvelope is { } pointerEnvelope) EnsureDocumentSigner(pointerEnvelope, validityKeys, channelPointer.UpdatedAt);
             if (revocations is not null)
             {
-                var revocationTime = revocations.Document.Entries.IsDefaultOrEmpty ? DateTimeOffset.UtcNow : revocations.Document.Entries.Max(x => x.At);
-                EnsureDocumentSigner(revocations.Envelope, validityKeys, revocationTime);
+                EnsureDocumentSigner(revocations.Envelope, validityKeys, revocations.Document.UpdatedAt);
             }
         }
-        if (revocations is { Document.Entries.IsDefaultOrEmpty: false } && revocations.Document.Entries.Max(x => x.At) < DateTimeOffset.UtcNow.Subtract(TimeSpan.FromDays(7)))
-            throw new ApplyPreconditionException("The revocation document is stale; refusing to make an install decision without a fresh control document.");
+        if (revocations is not null && (revocations.Document.UpdatedAt < DateTimeOffset.UtcNow.Subtract(TimeSpan.FromDays(7)) || revocations.Document.UpdatedAt > DateTimeOffset.UtcNow.Add(TimeSpan.FromDays(7))))
+            throw new ApplyPreconditionException("The revocation document is outside the freshness bound; refusing to make an install decision without a fresh control document.");
         var revocation = revocations?.Document.Entries.LastOrDefault(x => string.Equals(x.ReleaseId, verified.Lock.ReleaseId, StringComparison.Ordinal) && string.Equals(x.Action, "yank", StringComparison.Ordinal));
+        var installedRevocation = previous is null
+            ? null
+            : revocations?.Document.Entries.LastOrDefault(x => string.Equals(x.ReleaseId, previous.Lock.ReleaseId, StringComparison.Ordinal) && string.Equals(x.Action, "yank", StringComparison.Ordinal));
+        if (apply && command != "rollback" && installedRevocation?.Effect == RevocationEffect.ForceMove && string.Equals(previous?.Lock.ReleaseId, verified.Lock.ReleaseId, StringComparison.Ordinal))
+        {
+            if (!ConfirmForceMove(args, previous, verified.Lock.ReleaseId))
+                throw new ApplyPreconditionException($"Release '{verified.Lock.ReleaseId}' is force-move yanked; waiting for the channel head to advance to a replacement release.");
+            throw new ApplyPreconditionException($"Release '{verified.Lock.ReleaseId}' is force-move yanked; the channel still points at the yanked release, so no safe replacement is available yet.");
+        }
+        if (apply && command != "rollback" && installedRevocation?.Effect == RevocationEffect.ForceMove && !string.Equals(previous?.Lock.ReleaseId, verified.Lock.ReleaseId, StringComparison.Ordinal))
+        {
+            if (!ConfirmForceMove(args, previous, verified.Lock.ReleaseId))
+                throw new ApplyPreconditionException($"Installed release '{previous!.Lock.ReleaseId}' is force-move yanked; confirmation is required before moving to channel head '{verified.Lock.ReleaseId}'.");
+            Console.Error.WriteLine($"warning: installed release '{previous!.Lock.ReleaseId}' is force-move yanked; moving to channel head '{verified.Lock.ReleaseId}'.");
+        }
         if (apply && command != "rollback" && revocation is not null)
         {
             var isRepair = args.Contains("--repair", StringComparer.Ordinal);
@@ -381,9 +523,21 @@ public static class CliApplication
         if (verified.Pointer is { } pointer)
         {
             var previousSequence = previous?.Lock.LastChannelSequence ?? 0;
-            var accepted = ControlDocumentPolicy.AcceptChannel(pointer, verified.Lock.ProductId, pointer.Channel, previousSequence, DateTimeOffset.UtcNow, TimeSpan.FromDays(7), previous?.Lock.ReleaseSequence);
+            var accepted = ControlDocumentPolicy.AcceptChannel(pointer, verified.Lock.ProductId, pointer.Channel, previousSequence, DateTimeOffset.UtcNow, TimeSpan.FromDays(7), previous?.Lock.ReleaseSequence, typeof(CliApplication).Assembly.GetName().Version ?? new Version(1, 0, 0));
             if (!accepted.Accepted) throw new ApplyPreconditionException(accepted.Error ?? "Channel pointer was rejected by freshness or replay policy.");
+            if (accepted.IsRollback) Console.Error.WriteLine($"warning: channel {pointer.Channel} moved from release sequence {previous?.Lock.ReleaseSequence} to older sequence {pointer.ReleaseSequence} by signed rollback.");
         }
+        var clientVersion = typeof(CliApplication).Assembly.GetName().Version ?? new Version(1, 0, 0);
+        var minimumClientVersions = new List<Version>();
+        foreach (var minimumText in new[] { descriptor.MinimumClientVersion, verified.Pointer?.MinimumClientVersion })
+        {
+            if (string.IsNullOrWhiteSpace(minimumText)) continue;
+            if (!Version.TryParse(minimumText, out var minimum)) throw new ApplyPreconditionException($"Repository minimumClientVersion '{minimumText}' is invalid.");
+            minimumClientVersions.Add(minimum);
+        }
+        var minimumClientVersion = minimumClientVersions.Count == 0 ? null : minimumClientVersions.Max();
+        if (minimumClientVersion is not null && clientVersion < minimumClientVersion)
+            throw new ApplyPreconditionException($"This updater ({clientVersion}) is older than the repository minimum client version ({minimumClientVersion}).");
         var resolution = new VariantResolver().Resolve(verified.Lock, selection);
         if (!resolution.IsValid)
         {
@@ -397,6 +551,8 @@ public static class CliApplication
             PrintDiagnostics(composed.Diagnostics);
             return 1;
         }
+        if (historicalRollback is not null && composed.FileSetId != historicalRollback.Lock.FileSetId)
+            throw new CryptographicException($"Repository release '{verified.Lock.ReleaseId}' does not reproduce the historical file set recorded for local rollback.");
         var current = previous?.Files;
         var observedPaths = (current?.Keys ?? Enumerable.Empty<VirtualPath>()).Concat(composed.Files.Keys);
         var observed = await new LocalTreeScanner().ScanAsync(installRoot, observedPaths, composed.Files.Keys, HashPolicy.Changed).ConfigureAwait(false);
@@ -411,17 +567,26 @@ public static class CliApplication
             RepositoryUri = address.BaseUri.ToString(), ProductId = verified.Lock.ProductId, Channel = address.ReleaseRef.StartsWith("channel:", StringComparison.Ordinal) ? address.ReleaseRef[8..] : null,
             ReleaseId = verified.Lock.ReleaseId, ReleaseSequence = verified.Lock.Sequence, ReleaseDigest = ContentHash.Compute(verified.EnvelopeBytes), Selection = resolution.Selection, SelectionId = resolution.Selection.SelectionId,
             FileSetId = composed.FileSetId, LastChannelSequence = verified.Pointer?.ChannelSequence ?? previous?.Lock.LastChannelSequence ?? 0,
-            KeySequence = keySequence, RevocationSequence = revocations?.Document.RevocationSequence ?? previous?.Lock.RevocationSequence ?? 0,
+            KeySequence = keySequence, KeyManifestDigest = currentKeysDigest, RevocationSequence = revocations?.Document.RevocationSequence ?? previous?.Lock.RevocationSequence ?? 0, RevocationDigest = revocations is null ? previous?.Lock.RevocationDigest : ContentHash.Compute(revocations.EnvelopeBytes),
+            KnownRevocations = revocations?.Document.Entries ?? previous?.Lock.KnownRevocations ?? [],
             TrustedKeyIds = trusted.Keys.OrderBy(x => x, StringComparer.Ordinal).ToImmutableArray(),
-            TrustedKeys = trustBeforeManifest.Concat(trusted.Where(x => !trustBeforeManifest.ContainsKey(x.Key)))
-                .ToImmutableDictionary(x => x.Key, x => Base64Url.Encode(x.Value), StringComparer.Ordinal),
+            TrustedKeys = trusted.ToImmutableDictionary(x => x.Key, x => Base64Url.Encode(x.Value), StringComparer.Ordinal),
             AppliedAt = DateTimeOffset.UtcNow
         };
         var cacheRoot = Environment.GetEnvironmentVariable("FOURSUP_CAS_ROOT");
         if (string.IsNullOrWhiteSpace(cacheRoot))
         {
-            var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            cacheRoot = Path.Combine(string.IsNullOrWhiteSpace(localData) ? Environment.CurrentDirectory : localData, "4sup", "cas");
+            if (OperatingSystem.IsWindows())
+            {
+                var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                cacheRoot = Path.Combine(string.IsNullOrWhiteSpace(localData) ? Environment.CurrentDirectory : localData, "4Story", "4sup", "cas");
+            }
+            else
+            {
+                var cacheBase = Environment.GetEnvironmentVariable("XDG_CACHE_HOME");
+                if (string.IsNullOrWhiteSpace(cacheBase)) cacheBase = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache");
+                cacheRoot = Path.Combine(cacheBase, "4sup", "cas");
+            }
         }
         var protectedCacheEntries = previous?.Files.Values.Where(x => x.Content is not null).Select(x => x.Content!.Value).ToHashSet() ?? new HashSet<ContentHash>();
         var mirrors = new[] { (IReadableObjectStore)store }
@@ -429,9 +594,27 @@ public static class CliApplication
             .Where(x => !string.Equals(x.ToString().TrimEnd('/'), address.BaseUri.ToString().TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
             .Select(x => (IReadableObjectStore)new HttpObjectStore(x)))
             .ToArray();
-        await new InstallApplier().ApplyAsync(installRoot, plan, composed, installLock, store, layout, ledger, mirrors: mirrors, cache: new LocalContentCache(cacheRoot), protectedCacheEntries: protectedCacheEntries, ticketProvider: OperatingSystem.IsWindows() ? new WindowsApplyTicketProvider() : null, preconditions: new ApplyPreconditions { MinimumInstalledReleaseSequence = verified.Lock.MinimumInstalledRelease, CurrentInstalledReleaseSequence = previous?.Lock.ReleaseSequence, ClientVersion = new Version(1, 0), MinimumClientVersion = descriptor.MinimumClientVersion is null ? null : Version.Parse(descriptor.MinimumClientVersion) }).ConfigureAwait(false);
+        await new InstallApplier().ApplyAsync(installRoot, plan, composed, installLock, store, layout, ledger, mirrors: mirrors, cache: new LocalContentCache(cacheRoot), protectedCacheEntries: protectedCacheEntries, preconditions: new ApplyPreconditions { MinimumInstalledReleaseSequence = verified.Lock.MinimumInstalledRelease, CurrentInstalledReleaseSequence = previous?.Lock.ReleaseSequence, ClientVersion = clientVersion, MinimumClientVersion = minimumClientVersion }).ConfigureAwait(false);
         Console.WriteLine(args.Contains("--json", StringComparer.Ordinal) ? JsonSerializer.Serialize(new { applied = true, release = verified.Lock.ReleaseId, fileSetId = composed.FileSetId.ToString() }) : $"applied {verified.Lock.ReleaseId} ({composed.FileSetId})");
         return 0;
+    }
+
+    private static bool ConfirmForceMove(string[] args, LedgerDocument? previous, string targetRelease)
+    {
+        if (args.Contains("--yes", StringComparer.Ordinal)) return true;
+        if (Console.IsInputRedirected) return false;
+        Console.Error.Write($"Release '{previous?.Lock.ReleaseId ?? targetRelease}' is force-move yanked. Confirm moving to '{targetRelease}' [y/N]: ");
+        var answer = Console.ReadLine()?.Trim();
+        return string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase) || string.Equals(answer, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ConfirmTrustChange(string[] args, long sequence)
+    {
+        if (args.Contains("--yes", StringComparer.Ordinal)) return true;
+        if (Console.IsInputRedirected) return false;
+        Console.Error.Write($"The repository trust manifest advanced to sequence {sequence}. Accept this self-hosted key change [y/N]: ");
+        var answer = Console.ReadLine()?.Trim();
+        return string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase) || string.Equals(answer, "yes", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async ValueTask<int> PackageCommandAsync(string[] args)
@@ -458,8 +641,8 @@ public static class CliApplication
         if (subcommand == "list")
         {
             var keys = new List<string>();
-            if (store is IListableObjectStore listable)
-                await foreach (var key in listable.ListAsync($"packages/{packageId.Value}/", cancellationToken: default).ConfigureAwait(false)) keys.Add(key.Value);
+            foreach (var indexVersion in await ReadPackageIndexVersionsAsync(store, layout, packageId).ConfigureAwait(false))
+                keys.Add(indexVersion.ManifestPath);
             Console.WriteLine(JsonSerializer.Serialize(new { package = packageId.Value, manifests = keys.OrderBy(x => x, StringComparer.Ordinal).ToArray() }));
             return 0;
         }
@@ -486,7 +669,7 @@ public static class CliApplication
         if (!sliced.IsValid) return 1;
         var package = sliced.Packages.FirstOrDefault(x => x.Id == packageId) ?? throw new FormatException($"Slice rules do not define package '{packageId}'.");
         var destinationText = GetOptionValue(args, "--to") ?? new ConfigurationLoader().Load().DefaultServer ?? throw new FormatException("pkg publish requires --to or a configured defaultServer.");
-        var target = ParseRepositoryOnly(destinationText);
+        var target = ParseRepositoryOnly(destinationText, write: true);
         if (target.Address.Backend is "http" or "https")
             return await PublishPackageViaApiAsync(args, target.Address, packageId, versionLabel, sequence, package).ConfigureAwait(false);
         await using var destination = CreateWriteStore(target.Address);
@@ -556,11 +739,10 @@ public static class CliApplication
         if (subcommand == "new") return await NewReleaseCommandAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
         if (subcommand == "publish") return await PublishReleaseCommandAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
         var target = ParseTarget(args.ElementAtOrDefault(1) ?? throw new FormatException($"release {subcommand} requires a repository target."), "release", null);
-        var trusted = ParseTrustedKeys(args);
-        if (trusted.Count == 0) throw new CryptographicException("No trusted key was supplied.");
+        var trusted = ParseTrustedKeysOrFirstParty(args);
         // `release check` is a read-only operation and must work against the
         // anonymous HTTP projection.  Publishing still obtains the write transport.
-        IReadableObjectStore store = subcommand == "check" ? CreateReadStore(target.Address) : CreateWriteStore(target.Address);
+        IReadableObjectStore store = CreateReadStore(target.Address);
         await using (store.ConfigureAwait(false))
         {
         var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
@@ -677,6 +859,7 @@ public static class CliApplication
         var from = GetOptionValue(args, "--from") ?? throw new FormatException("release new requires --from <release-id>.");
         var repositoryText = GetOptionValue(args, "--repository") ?? new ConfigurationLoader().Load().DefaultLocalRepository ?? throw new FormatException("release new requires --repository or a configured defaultLocalRepository.");
         var target = ParseTarget(repositoryText.TrimEnd('/') + "/" + product + "@release:" + from, "release", null);
+        var writeTarget = ParseTarget(repositoryText.TrimEnd('/') + "/" + product + "@release:" + from, "release", null, write: true);
         var trusted = ParseTrustedKeys(args);
         if (trusted.Count == 0) throw new CryptographicException("release new requires --trusted-key for the previous release.");
         if (target.Address.Backend is "http" or "https")
@@ -706,27 +889,29 @@ public static class CliApplication
             return 0;
         }
         if (!long.TryParse(GetOptionValue(args, "--seq"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var sequence) || sequence < 1) throw new FormatException("release new requires a positive --seq.");
-        await using var store = CreateWriteStore(target.Address);
-        var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
+        await using var readStore = CreateReadStore(target.Address);
+        var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(readStore).ConfigureAwait(false);
         descriptor.ValidateAgainst(target.Address.BaseUri);
-        var reader = new RepositoryReader(store, descriptor);
+        var reader = new RepositoryReader(readStore, descriptor);
         var previous = await reader.ReadReleaseAsync(product, from, trusted).ConfigureAwait(false);
-        var repository = new StaticRepository(store, descriptor);
+        var repository = new StaticRepository(readStore, descriptor);
         var manifests = new Dictionary<PackageId, PackageManifest>(await LoadPinnedManifestsAsync(repository, previous.Lock).ConfigureAwait(false));
         foreach (var bump in OptionValues(args, "--bump"))
         {
             var separator = bump.LastIndexOf('@');
             if (separator <= 0 || separator == bump.Length - 1 || !PackageId.TryCreate(bump[..separator], out var packageId)) throw new FormatException("--bump must use package-id@version.");
-            var manifest = await ReadManifestByLabelAsync(store, layout, packageId, bump[(separator + 1)..]).ConfigureAwait(false) ?? throw new FileNotFoundException($"Bumped manifest '{bump}' was not found.");
+            var manifest = await ReadManifestByLabelAsync(readStore, layout, packageId, bump[(separator + 1)..]).ConfigureAwait(false) ?? throw new FileNotFoundException($"Bumped manifest '{bump}' was not found.");
             manifests[packageId] = manifest;
         }
         var built = await new ReleaseBuilder().BuildAsync(product, releaseId, sequence, previous.Lock.Axes, previous.Lock.Requirements, manifests, layout, DateTimeOffset.UtcNow, repository, previous.Lock.MinimumInstalledRelease).ConfigureAwait(false);
         var draftBytes = RepositoryJson.Serialize(built.Release);
+        await using var store = CreateWriteStore(writeTarget.Address);
+        var (_, writeLayout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
         await using (var draft = new MemoryStream(draftBytes, writable: false))
         {
-            if (store is not IConditionalWriteStore conditional || !await conditional.PutIfAbsentAsync(layout.Release(product, releaseId), draft, draftBytes.LongLength).ConfigureAwait(false)) throw new InstallConcurrencyException($"Release draft '{releaseId}' already exists or the repository lacks conditional writes.");
+            if (store is not IConditionalWriteStore conditional || !await conditional.PutIfAbsentAsync(writeLayout.Release(product, releaseId), draft, draftBytes.LongLength).ConfigureAwait(false)) throw new InstallConcurrencyException($"Release draft '{releaseId}' already exists or the repository lacks conditional writes.");
         }
-        await new ReleaseBuilder().WriteCoverageAsync(built.Release, built.Coverage, layout, store).ConfigureAwait(false);
+        await new ReleaseBuilder().WriteCoverageAsync(built.Release, built.Coverage, writeLayout, store).ConfigureAwait(false);
         Console.WriteLine(JsonSerializer.Serialize(new { draft = built.Release, coverageDigest = built.CoverageDigest.ToString() }, SignedDocument.JsonOptions));
         return 0;
     }
@@ -735,6 +920,7 @@ public static class CliApplication
     {
         var value = Positional(args).FirstOrDefault() ?? throw new FormatException("release publish requires a repository target.");
         var target = ParseTarget(value, "release", null);
+        var writeTarget = ParseTarget(value, "release", null, write: true);
         var signing = ParseSigningKey(args);
         if (target.Address.Backend is "http" or "https")
         {
@@ -770,22 +956,22 @@ public static class CliApplication
             Console.WriteLine(JsonSerializer.Serialize(new { published = true, brokered = true, release = remotePublished.ReleaseId, digest = signedRemote.Digest.ToString() }));
             return 0;
         }
-        await using var store = CreateWriteStore(target.Address);
-        var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
+        await using var readStore = CreateReadStore(target.Address);
+        var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(readStore).ConfigureAwait(false);
         descriptor.ValidateAgainst(target.Address.BaseUri);
         var releaseId = target.Address.ReleaseRef.StartsWith("release:", StringComparison.Ordinal) ? target.Address.ReleaseRef[8..] : throw new FormatException("release publish requires @release:<id>.");
         var key = layout.Release(target.Address.ProductId, releaseId);
-        var head = await store.HeadAsync(key).ConfigureAwait(false) ?? throw new FileNotFoundException(key.Value);
-        var existing = await store.OpenAsync(key).ConfigureAwait(false) ?? throw new FileNotFoundException(key.Value);
+        var head = await readStore.HeadAsync(key).ConfigureAwait(false) ?? throw new FileNotFoundException(key.Value);
+        var existing = await readStore.OpenAsync(key).ConfigureAwait(false) ?? throw new FileNotFoundException(key.Value);
         byte[] draftBytes;
         await using (existing.ConfigureAwait(false)) draftBytes = await ReadAllAsync(existing.Content).ConfigureAwait(false);
         var draft = RepositoryJson.Deserialize<ReleaseLock>(draftBytes, rejectUnknownFields: true);
         var published = new ReleaseBuilder().Publish(draft);
-        var repository = new StaticRepository(store, descriptor);
+        var repository = new StaticRepository(readStore, descriptor);
         var manifests = await LoadPinnedManifestsAsync(repository, published).ConfigureAwait(false);
         var gateDiagnostics = await new PublishGate().CheckAsync(published, manifests, new FileSetComposer(), repository).ConfigureAwait(false);
         if (gateDiagnostics.Any(x => x.IsError)) throw new InvalidDataException("Release publish gate failed: " + string.Join("; ", gateDiagnostics.Where(x => x.IsError).Select(x => x.Code + " " + x.Message)));
-        var coverageObject = await store.OpenAsync(layout.Coverage(published.ProductId, published.ReleaseId)).ConfigureAwait(false) ?? throw new InvalidDataException("Release publish requires coverage.json.");
+        var coverageObject = await readStore.OpenAsync(layout.Coverage(published.ProductId, published.ReleaseId)).ConfigureAwait(false) ?? throw new InvalidDataException("Release publish requires coverage.json.");
         await using (coverageObject.ConfigureAwait(false))
         {
             var coverageBytes = await ReadAllAsync(coverageObject.Content).ConfigureAwait(false);
@@ -793,14 +979,18 @@ public static class CliApplication
             if (coverage.Digest is not { } digest || digest != published.CoverageDigest || ContentHash.Compute(CoverageGenerator.SerializeForDigest(coverage)) != published.CoverageDigest) throw new CryptographicException("coverage.json does not match coverageDigest.");
         }
         var signed = new ReleaseSigner().SignRelease(published, signing.KeyId, signing.PrivateKey);
-        if (store is not IConditionalWriteStore conditional || head.Validator is null) throw new IOException("release publish requires a conditional-write backend.");
+        await using var store = CreateWriteStore(writeTarget.Address);
+        var (_, writeLayout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
+        var writeKey = writeLayout.Release(published.ProductId, releaseId);
+        var writeHead = await store.HeadAsync(writeKey) ?? throw new FileNotFoundException(writeKey.Value);
+        if (store is not IConditionalWriteStore conditional || writeHead.Validator is null) throw new IOException("release publish requires a conditional-write backend.");
         await using var body = new MemoryStream(signed.EnvelopeBytes, writable: false);
-        if (!await conditional.CompareAndSwapAsync(key, head.Validator, body, signed.EnvelopeBytes.LongLength).ConfigureAwait(false)) throw new InstallConcurrencyException("release publish lost its conditional-write race.");
+        if (!await conditional.CompareAndSwapAsync(writeKey, writeHead.Validator, body, signed.EnvelopeBytes.LongLength).ConfigureAwait(false)) throw new InstallConcurrencyException("release publish lost its conditional-write race.");
         var writableStore = store as IWritableObjectStore ?? throw new IOException("release publish requires a writable repository transport.");
-        var projections = new StaticProjectionWriter(writableStore, layout);
+        var projections = new StaticProjectionWriter(writableStore, writeLayout);
         await projections.WriteReleaseBundleAsync(published.ProductId, published.ReleaseId, signed.EnvelopeBytes, manifests.Values).ConfigureAwait(false);
         await projections.WriteRepositoryDescriptorAsync(descriptor).ConfigureAwait(false);
-        await WriteReleaseIndexAsync(writableStore, layout, published, signed.EnvelopeBytes).ConfigureAwait(false);
+        await WriteReleaseIndexAsync(writableStore, writeLayout, published, signed.EnvelopeBytes).ConfigureAwait(false);
         Console.WriteLine(JsonSerializer.Serialize(new { published = true, release = published.ReleaseId, digest = signed.Digest.ToString() }));
         return 0;
     }
@@ -811,9 +1001,14 @@ public static class CliApplication
         if (subcommand is "promote" or "rollback") return await WriteChannelCommandAsync(subcommand, args).ConfigureAwait(false);
         if (subcommand == "yank") return await WriteYankCommandAsync(args).ConfigureAwait(false);
         if (subcommand != "show") throw new FormatException("Unknown channel command.");
-        var target = ParseTarget(args.ElementAtOrDefault(1) ?? throw new FormatException("channel show requires <repo/product@channel>."), "channel", "live");
-        var trusted = ParseTrustedKeys(args);
-        if (trusted.Count == 0) throw new CryptographicException("No trusted key was supplied.");
+        var targetText = args.ElementAtOrDefault(1) ?? throw new FormatException("channel show requires <product> <channel> or <repo/product@channel>.");
+        if (args.ElementAtOrDefault(2) is { } channel && !channel.StartsWith("--", StringComparison.Ordinal))
+        {
+            var repositoryBase = GetOptionValue(args, "--repository") ?? new ConfigurationLoader().Load().DefaultServer ?? throw new FormatException("Provide --repository or configure defaultServer.");
+            targetText = repositoryBase.TrimEnd('/') + "/" + targetText + "@channel:" + channel;
+        }
+        var target = ParseTarget(targetText, "channel", "live");
+        var trusted = ParseTrustedKeysOrFirstParty(args);
         await using var store = CreateReadStore(target.Address);
         var (descriptor, _) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
         descriptor.ValidateAgainst(target.Address.BaseUri);
@@ -833,6 +1028,7 @@ public static class CliApplication
         if (!Enum.TryParse<RevocationEffect>(effectText.Replace("-", string.Empty, StringComparison.Ordinal), ignoreCase: true, out var effect)) throw new FormatException("Unknown revocation effect.");
         var repositoryBase = GetOptionValue(args, "--repository") ?? new ConfigurationLoader().Load().DefaultServer ?? throw new FormatException("Provide --repository or configure defaultServer.");
         var target = ParseTarget(repositoryBase.TrimEnd('/') + "/" + product + "@channel:live", "channel", null);
+        var writeTarget = ParseTarget(repositoryBase.TrimEnd('/') + "/" + product + "@channel:live", "channel", null, write: true);
         var trusted = ParseTrustedKeys(args);
         var signing = ParseSigningKey(args);
         if (trusted.Count == 0) throw new CryptographicException("No trusted public key was supplied.");
@@ -844,16 +1040,20 @@ public static class CliApplication
         var current = await reader.ReadRevocationsAsync(product, trusted).ConfigureAwait(false);
         var reason = GetOptionValue(args, "--reason") ?? "release yanked by operator";
         var entry = new RevocationEntry { ReleaseId = releaseId, Action = "yank", Effect = effect, Reason = reason, At = DateTimeOffset.UtcNow };
-        var document = new RevocationDocument { ProductId = product, RevocationSequence = (current?.Document.RevocationSequence ?? 0) + 1, Entries = (current?.Document.Entries ?? []).Add(entry) };
+        var document = new RevocationDocument { ProductId = product, RevocationSequence = (current?.Document.RevocationSequence ?? 0) + 1, UpdatedAt = DateTimeOffset.UtcNow, Entries = (current?.Document.Entries ?? []).Add(entry) };
         var signed = new ReleaseSigner().SignRevocations(document, signing.KeyId, signing.PrivateKey);
         if (target.Address.Backend is "http" or "https")
         {
             await using var api = CreateManagementApi(target.Address, args);
-            await api.PlaceSignedRevocationAsync(product, releaseId, signed.EnvelopeBytes).ConfigureAwait(false);
-            Console.WriteLine(JsonSerializer.Serialize(new { yanked = true, brokered = true, product, release = releaseId, effect, revocationSequence = document.RevocationSequence }));
+            var repositoryId = GetOptionValue(args, "--repository-id") ?? Environment.GetEnvironmentVariable("FOURSUP_REPOSITORY_ID") ?? target.Address.BaseUri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "default";
+            var allocatedSequence = await api.AllocateSequenceAsync(repositoryId, "revocation", product).ConfigureAwait(false);
+            var allocatedDocument = document with { RevocationSequence = allocatedSequence };
+            var allocatedSigned = new ReleaseSigner().SignRevocations(allocatedDocument, signing.KeyId, signing.PrivateKey);
+            await api.PlaceSignedRevocationAsync(product, releaseId, allocatedSigned.EnvelopeBytes).ConfigureAwait(false);
+            Console.WriteLine(JsonSerializer.Serialize(new { yanked = true, brokered = true, product, release = releaseId, effect, revocationSequence = allocatedDocument.RevocationSequence }));
             return 0;
         }
-        await using var writeStore = CreateWriteStore(target.Address);
+        await using var writeStore = CreateWriteStore(writeTarget.Address);
         var key = layout.Revocations(product);
         if (writeStore is not IConditionalWriteStore conditional) throw new IOException("channel yank requires a conditional-write backend.");
         await using var body = new MemoryStream(signed.EnvelopeBytes, writable: false);
@@ -888,6 +1088,7 @@ public static class CliApplication
         if (!Identifier.IsValid(channel, "channel", out var identifierError)) throw new FormatException(identifierError ?? "Channel target is invalid.");
         var repositoryBase = GetOptionValue(args, "--repository") ?? new ConfigurationLoader().Load().DefaultServer ?? throw new FormatException("Provide --repository or configure defaultServer.");
         var target = ParseTarget(repositoryBase.TrimEnd('/') + "/" + product + "@" + channel, "channel", null);
+        var writeTarget = ParseTarget(repositoryBase.TrimEnd('/') + "/" + product + "@" + channel, "channel", null, write: true);
         var trusted = ParseTrustedKeys(args);
         var signing = ParseSigningKey(args);
         if (trusted.Count == 0) throw new CryptographicException("No trusted public key was supplied.");
@@ -897,32 +1098,53 @@ public static class CliApplication
         var reader = new RepositoryReader(readStore, descriptor);
         var current = await reader.ReadChannelAsync(product, channel, trusted).ConfigureAwait(false);
         var releaseId = GetOptionValue(args, "--release");
-        if (string.IsNullOrWhiteSpace(releaseId) && subcommand == "rollback" && readStore is IListableObjectStore listable)
+        if (string.IsNullOrWhiteSpace(releaseId) && subcommand == "rollback")
         {
             var candidates = new List<VerifiedRelease>();
-            await foreach (var releaseObject in listable.ListAsync($"products/{product}/releases/", cancellationToken: default).ConfigureAwait(false))
+            var indexed = await ReadReleaseIndexAsync(readStore, layout, product).ConfigureAwait(false);
+            if (indexed.Count > 0)
             {
-                if (!releaseObject.Value.EndsWith("/release.lock.json", StringComparison.Ordinal)) continue;
-                var parts = releaseObject.Value.Split('/');
-                if (parts.Length < 4) continue;
-                try
+                foreach (var releaseObject in indexed)
                 {
-                    var candidate = await reader.ReadReleaseAsync(product, parts[^2], trusted).ConfigureAwait(false);
-                    if (candidate.Lock.Sequence < current.Pointer.ReleaseSequence) candidates.Add(candidate);
+                    if (releaseObject.Sequence >= current.Pointer.ReleaseSequence) continue;
+                    try
+                    {
+                        var candidate = await reader.ReadReleaseAsync(product, releaseObject.ReleaseId, trusted, releaseObject.LockDigest).ConfigureAwait(false);
+                        if (candidate.Lock.Sequence < current.Pointer.ReleaseSequence) candidates.Add(candidate);
+                    }
+                    catch (Exception) { }
                 }
-                catch (Exception) { }
+            }
+            else if (readStore is IListableObjectStore listable)
+            {
+                await foreach (var releaseObject in listable.ListAsync($"products/{product}/releases/", cancellationToken: default).ConfigureAwait(false))
+                {
+                    if (!releaseObject.Value.EndsWith("/release.lock.json", StringComparison.Ordinal)) continue;
+                    var parts = releaseObject.Value.Split('/');
+                    if (parts.Length < 4) continue;
+                    try
+                    {
+                        var candidate = await reader.ReadReleaseAsync(product, parts[^2], trusted).ConfigureAwait(false);
+                        if (candidate.Lock.Sequence < current.Pointer.ReleaseSequence) candidates.Add(candidate);
+                    }
+                    catch (Exception) { }
+                }
             }
             releaseId = candidates.OrderByDescending(x => x.Lock.Sequence).ThenByDescending(x => x.Lock.ReleaseId, StringComparer.Ordinal).FirstOrDefault()?.Lock.ReleaseId;
         }
         if (string.IsNullOrWhiteSpace(releaseId)) throw new FormatException($"channel {subcommand} requires an older published release or --release <release-id>.");
         var release = await reader.ReadReleaseAsync(product, releaseId, trusted).ConfigureAwait(false);
+        if (subcommand == "rollback" && release.Lock.Sequence >= current.Pointer.ReleaseSequence)
+            throw new ApplyPreconditionException($"Rollback target '{release.Lock.ReleaseId}' (sequence {release.Lock.Sequence}) is not older than the channel head (sequence {current.Pointer.ReleaseSequence}).");
         var channelSequence = current.Pointer.ChannelSequence + 1;
         if (target.Address.Backend is "http" or "https")
         {
             await using var allocationApi = CreateManagementApi(target.Address, args);
             channelSequence = await allocationApi.AllocateSequenceAsync(GetOptionValue(args, "--repository-id") ?? Environment.GetEnvironmentVariable("FOURSUP_REPOSITORY_ID") ?? target.Address.BaseUri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "default", "channel", product + ":" + channel).ConfigureAwait(false);
         }
-        var pointer = new ChannelAuthoring().Promote(product, channel, channelSequence, current.Pointer.ChannelSequence, release.Lock.ReleaseId, release.Lock.Sequence, ContentHash.Compute(release.EnvelopeBytes), DateTimeOffset.UtcNow) with { Reason = subcommand == "rollback" ? "rollback" : null };
+        var minimumClientVersion = GetOptionValue(args, "--minimum-client-version") ?? current.Pointer.MinimumClientVersion;
+        if (minimumClientVersion is not null && !Version.TryParse(minimumClientVersion, out _)) throw new FormatException("--minimum-client-version must be a valid semantic version.");
+        var pointer = new ChannelAuthoring().Promote(product, channel, channelSequence, current.Pointer.ChannelSequence, release.Lock.ReleaseId, release.Lock.Sequence, ContentHash.Compute(release.EnvelopeBytes), DateTimeOffset.UtcNow, minimumClientVersion) with { Reason = subcommand == "rollback" ? "rollback" : null };
         var signed = new ReleaseSigner().SignChannel(pointer, signing.KeyId, signing.PrivateKey);
         if (target.Address.Backend is "http" or "https")
         {
@@ -931,7 +1153,7 @@ public static class CliApplication
             Console.WriteLine(JsonSerializer.Serialize(pointer));
             return 0;
         }
-        await using var writeStore = CreateWriteStore(target.Address);
+        await using var writeStore = CreateWriteStore(writeTarget.Address);
         var key = layout.Channel(product, channel);
         var head = await writeStore.HeadAsync(key).ConfigureAwait(false);
         if (writeStore is not IConditionalWriteStore conditional)
@@ -956,29 +1178,105 @@ public static class CliApplication
         await using var store = CreateReadStore(target.Address);
         var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(store).ConfigureAwait(false);
         descriptor.ValidateAgainst(target.Address.BaseUri);
-        if (store is not IListableObjectStore listable) throw new IOException("verify-repo --deep requires a listable backend.");
         var deep = args.Contains("--deep", StringComparer.Ordinal) || args.Contains("--rehash-cas", StringComparer.Ordinal);
-        var trusted = ParseTrustedKeys(args);
-        if (deep && trusted.Count == 0) throw new CryptographicException("verify-repo --deep requires --trusted-key=<keyId>:<base64url>.");
+        var trusted = ParseTrustedKeysOrFirstParty(args);
         var repository = new StaticRepository(store, descriptor);
         var checkedObjects = 0; var errors = new List<string>();
+        var writeTargetText = GetOptionValue(args, "--write-target");
+        if (writeTargetText is not null)
+        {
+            var writeTarget = ParseRepositoryOnly(writeTargetText, write: true);
+            await using var writeStore = CreateWriteStore(writeTarget.Address);
+            await CheckWriteReadPairingAsync(writeStore, store, errors).ConfigureAwait(false);
+        }
+        if (target.Address.Backend is "http" or "https")
+            await CheckHttpStagingIsolationAsync(target.Address.BaseUri, errors).ConfigureAwait(false);
+        if (store is not IListableObjectStore listable)
+        {
+            var knownKeys = new HashSet<ObjectKey> { new("repo.json"), layout.KeyManifest() };
+            foreach (var product in descriptor.Products)
+            {
+                knownKeys.Add(layout.Channel(product, "live"));
+                knownKeys.Add(layout.Channel(product, "ptr"));
+                knownKeys.Add(layout.ReleaseIndex(product));
+                knownKeys.Add(layout.Revocations(product));
+                try
+                {
+                    foreach (var row in await ReadReleaseIndexAsync(store, layout, product).ConfigureAwait(false))
+                    {
+                        var lockKey = new ObjectKey(row.LockPath);
+                        knownKeys.Add(lockKey);
+                        knownKeys.Add(layout.ReleaseBundle(product, row.ReleaseId));
+                        knownKeys.Add(layout.Coverage(product, row.ReleaseId));
+                        var lockResult = await store.OpenAsync(lockKey).ConfigureAwait(false);
+                        if (lockResult is null) continue;
+                        await using (lockResult.ConfigureAwait(false))
+                        {
+                            var lockEnvelope = SignedDocument.DeserializeEnvelope(await ReadAllAsync(lockResult.Content).ConfigureAwait(false));
+                            var release = SignedDocument.DeserializePayload<ReleaseLock>(Base64Url.Decode(lockEnvelope.Payload));
+                            foreach (var pin in release.Packages)
+                            {
+                                knownKeys.Add(new ObjectKey(pin.ManifestPath));
+                                knownKeys.Add(layout.PackageIndex(pin.Id));
+                            }
+                        }
+                    }
+                }
+                catch (FileNotFoundException ex) { errors.Add($"missing-index:{product}:{ex.Message}"); }
+            }
+            foreach (var key in knownKeys)
+            {
+                var head = await store.HeadAsync(key).ConfigureAwait(false);
+                if (head is null) { if (key.Value == "repo.json") errors.Add($"missing-head:{key.Value}"); continue; }
+                checkedObjects++;
+                if (head.ContentEncoding is not null) errors.Add($"content-encoding:{key.Value}");
+                if (store.Capabilities.HasFlag(StorageCapabilities.Range) && !head.AcceptRanges) errors.Add($"range:{key.Value}");
+                if (target.Address.Backend is "http" or "https" && string.IsNullOrWhiteSpace(head.CacheControl)) errors.Add($"cache-control:{key.Value}:missing");
+                if (target.Address.Backend is "http" or "https" && head.CacheControl is not null)
+                {
+                    var expectedCache = ExpectedCacheControl(key);
+                    if (!string.Equals(head.CacheControl, expectedCache, StringComparison.OrdinalIgnoreCase)) errors.Add($"cache-control:{key.Value}:{head.CacheControl}");
+                }
+                if (deep && (key.Value == layout.KeyManifest().Value || key.Value.Contains("/channels/", StringComparison.Ordinal) || key.Value.EndsWith("/revocations.json", StringComparison.Ordinal)))
+                {
+                    var read = await store.OpenAsync(key).ConfigureAwait(false);
+                    if (read is null) { errors.Add($"missing:{key.Value}"); continue; }
+                    await using (read.ConfigureAwait(false))
+                    {
+                        try
+                        {
+                            using var bytes = new MemoryStream(); await read.Content.CopyToAsync(bytes).ConfigureAwait(false);
+                            var envelope = SignedDocument.DeserializeEnvelope(bytes.ToArray());
+                            if (!SignedDocument.Verify(envelope, trusted, out _, out var error)) errors.Add($"signature:{key.Value}:{error}");
+                        }
+                        catch (Exception ex) when (ex is FormatException or InvalidDataException or CryptographicException) { errors.Add($"document:{key.Value}:{ex.Message}"); }
+                    }
+                }
+            }
+            if (deep)
+                await VerifyRepositoryGraphAsync(store, descriptor, layout, repository, trusted, null, errors).ConfigureAwait(false);
+            Console.WriteLine(JsonSerializer.Serialize(new { valid = errors.Count == 0, checkedObjects, errors }));
+            return errors.Count == 0 ? 0 : 5;
+        }
+        var listedKeys = new HashSet<ObjectKey>();
         await foreach (var key in listable.ListAsync(cancellationToken: default).ConfigureAwait(false))
         {
+            listedKeys.Add(key);
             var head = await store.HeadAsync(key).ConfigureAwait(false);
             if (head is null) { errors.Add($"missing-head:{key.Value}"); continue; }
             if (head.ContentEncoding is not null) errors.Add($"content-encoding:{key.Value}");
-            if (deep && descriptor.Capabilities.HasFlag(StorageCapabilities.Range) && !head.AcceptRanges) errors.Add($"range:{key.Value}");
-            if (deep && head.CacheControl is not null)
+            if (store.Capabilities.HasFlag(StorageCapabilities.Range) && !head.AcceptRanges) errors.Add($"range:{key.Value}");
+            if ((target.Address.Backend is "http" or "https") && string.IsNullOrWhiteSpace(head.CacheControl)) errors.Add($"cache-control:{key.Value}:missing");
+            else if ((target.Address.Backend is "http" or "https") && head.CacheControl is not null)
             {
-                var expectedCache = key.Value.StartsWith("products/", StringComparison.Ordinal) && key.Value.Contains("/channels/", StringComparison.Ordinal)
-                    ? "max-age=30, must-revalidate"
-                    : key.Value == "repo.json" ? "max-age=300" : "public, max-age=31536000, immutable";
+                var expectedCache = ExpectedCacheControl(key);
                 if (!string.Equals(head.CacheControl, expectedCache, StringComparison.OrdinalIgnoreCase)) errors.Add($"cache-control:{key.Value}:{head.CacheControl}");
             }
             if (key.Value.StartsWith("blobs/", StringComparison.Ordinal))
             {
-                var name = key.Value.Split('/').LastOrDefault();
-                if (name is null || !ContentHash.TryParse("sha256:" + name, out var hash)) { errors.Add($"unparseable:{key.Value}"); continue; }
+                var parts = key.Value.Split('/');
+                var name = parts.LastOrDefault();
+                if (parts.Length != 5 || parts[1] != "sha256" || name is null || !string.Equals(name, name.ToLowerInvariant(), StringComparison.Ordinal) || parts[2] != name[..2] || parts[3] != name[2..4] || !ContentHash.TryParse("sha256:" + name, out var hash)) { errors.Add($"unparseable:{key.Value}"); continue; }
                 var read = await store.OpenAsync(key).ConfigureAwait(false);
                 if (read is null) { errors.Add($"missing:{key.Value}"); continue; }
                 await using (read.ConfigureAwait(false)) if (await ContentHash.ComputeAsync(read.Content).ConfigureAwait(false) != hash) errors.Add($"digest:{key.Value}");
@@ -997,7 +1295,7 @@ public static class CliApplication
                 }
                 catch (Exception ex) when (ex is FormatException or InvalidDataException or CryptographicException or FileNotFoundException) { errors.Add($"manifest:{key.Value}:{ex.Message}"); }
             }
-            else if (deep && key.Value.StartsWith("products/", StringComparison.Ordinal) && (key.Value.EndsWith("/release.lock.json", StringComparison.Ordinal) || key.Value.Contains("/channels/", StringComparison.Ordinal)))
+            else if (deep && (key.Value == layout.KeyManifest().Value || (key.Value.StartsWith("products/", StringComparison.Ordinal) && (key.Value.EndsWith("/release.lock.json", StringComparison.Ordinal) || key.Value.Contains("/channels/", StringComparison.Ordinal) || key.Value.EndsWith("/revocations.json", StringComparison.Ordinal)))))
             {
                 try
                 {
@@ -1013,13 +1311,162 @@ public static class CliApplication
             }
             checkedObjects++;
         }
+        if (deep)
+            await VerifyRepositoryGraphAsync(store, descriptor, layout, repository, trusted, listedKeys, errors).ConfigureAwait(false);
         Console.WriteLine(JsonSerializer.Serialize(new { valid = errors.Count == 0, checkedObjects, errors }));
         return errors.Count == 0 ? 0 : 5;
     }
 
+    private static async ValueTask VerifyRepositoryGraphAsync(IReadableObjectStore store, RepositoryDescriptor descriptor, RepositoryLayout layout, StaticRepository repository, IReadOnlyDictionary<string, byte[]> trusted, IReadOnlySet<ObjectKey>? listedKeys, List<string> errors)
+    {
+        foreach (var packageId in (listedKeys is null ? Enumerable.Empty<ObjectKey>() : listedKeys).Select(x => x.Value.Split('/')).Where(x => x.Length >= 3 && x[0] == "packages" && x[^1] == "package.json").Select(x => x[1]).Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                var id = new PackageId(packageId);
+                var rows = await ReadPackageIndexVersionsAsync(store, layout, id).ConfigureAwait(false);
+                foreach (var row in rows)
+                {
+                    if (!ContentHash.TryParse(row.ManifestDigest.ToString(), out var digest)) { errors.Add($"index-manifest-digest:{packageId}:{row.Version}"); continue; }
+                    var manifest = await repository.GetManifestAsync(id, new PackageVersion(row.Version, row.Sequence), digest).ConfigureAwait(false);
+                    if (manifest is null) errors.Add($"index-manifest-missing:{packageId}:{row.Version}");
+                }
+            }
+            catch (Exception ex) when (ex is FormatException or InvalidDataException or FileNotFoundException or CryptographicException)
+            { errors.Add($"package-index:{packageId}:{ex.Message}"); }
+        }
+
+        foreach (var product in descriptor.Products)
+        {
+            IReadOnlyList<ReleaseIndexRow> rows;
+            try { rows = await ReadReleaseIndexAsync(store, layout, product).ConfigureAwait(false); }
+            catch (Exception ex) when (ex is FormatException or InvalidDataException or FileNotFoundException or CryptographicException) { errors.Add($"release-index:{product}:{ex.Message}"); continue; }
+            foreach (var row in rows)
+            {
+                try
+                {
+                    var verified = await new RepositoryReader(store, descriptor).ReadReleaseAsync(product, row.ReleaseId, trusted).ConfigureAwait(false);
+                    if (ContentHash.Compute(verified.EnvelopeBytes) != row.LockDigest) errors.Add($"release-index-digest:{product}/{row.ReleaseId}");
+                    var coverageKey = layout.Coverage(product, row.ReleaseId);
+                    var coverage = await store.OpenAsync(coverageKey).ConfigureAwait(false);
+                    if (coverage is null) errors.Add($"missing-coverage:{coverageKey}");
+                    else
+                    {
+                        await using (coverage.ConfigureAwait(false))
+                        {
+                            var coverageBytes = await ReadAllAsync(coverage.Content).ConfigureAwait(false);
+                            try
+                            {
+                                var coverageDocument = RepositoryJson.Deserialize<CoverageDocument>(coverageBytes, rejectUnknownFields: true);
+                                var digest = ContentHash.Compute(CoverageGenerator.SerializeForDigest(coverageDocument));
+                                if (coverageDocument.Digest is not { } storedDigest || storedDigest != digest || digest != row.CoverageDigest || digest != verified.Lock.CoverageDigest)
+                                    errors.Add($"coverage-digest:{coverageKey}");
+                            }
+                            catch (Exception ex) when (ex is FormatException or InvalidDataException or JsonException)
+                            { errors.Add($"coverage:{coverageKey}:{ex.Message}"); }
+                        }
+                    }
+                    foreach (var pin in verified.Lock.Packages)
+                    {
+                        var manifest = await repository.GetManifestAsync(pin.Id, pin.Version, pin.ManifestDigest).ConfigureAwait(false);
+                        if (manifest is null) { errors.Add($"missing-manifest:{pin.Id}@{pin.Version}"); continue; }
+                        await foreach (var entry in repository.ReadFileTableAsync(manifest).ConfigureAwait(false))
+                            if (listedKeys is not null && entry.Kind == FileEntryKind.File && !listedKeys.Contains(layout.Blob(entry.Content))) errors.Add($"missing-blob:{entry.Content}");
+                    }
+                }
+                catch (Exception ex) when (ex is FormatException or InvalidDataException or FileNotFoundException or CryptographicException)
+                { errors.Add($"release-graph:{product}/{row.ReleaseId}:{ex.Message}"); }
+            }
+        }
+
+        foreach (var product in descriptor.Products)
+            foreach (var channel in ChannelsForProduct(product, listedKeys))
+            {
+                try
+                {
+                    var pointer = await new RepositoryReader(store, descriptor).ReadChannelAsync(product, channel, trusted).ConfigureAwait(false);
+                    var release = await new RepositoryReader(store, descriptor).ReadReleaseAsync(product, pointer.Pointer.ReleaseId, trusted, pointer.Pointer.ReleaseDigest).ConfigureAwait(false);
+                    if (release.Lock.Sequence != pointer.Pointer.ReleaseSequence) errors.Add($"channel-release-sequence:{product}/{channel}");
+                }
+                catch (FileNotFoundException) { }
+                catch (Exception ex) when (ex is FormatException or InvalidDataException or CryptographicException)
+                { errors.Add($"channel:{product}/{channel}:{ex.Message}"); }
+            }
+    }
+
+    private static IEnumerable<string> ChannelsForProduct(string product, IReadOnlySet<ObjectKey>? listedKeys)
+    {
+        if (listedKeys is null)
+            return ["live", "ptr"];
+
+        return listedKeys
+            .Select(key => key.Value.Split('/'))
+            .Where(parts => parts.Length == 4 && parts[0] == "products" && parts[1] == product && parts[2] == "channels" && parts[3].EndsWith(".json", StringComparison.Ordinal))
+            .Select(parts => parts[3][..^5])
+            .Where(channel => Identifier.IsValid(channel, 64))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(channel => channel, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static async ValueTask CheckHttpStagingIsolationAsync(Uri repositoryBase, List<string> errors, CancellationToken cancellationToken = default)
+    {
+        using var client = new HttpClient(new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None });
+        var probe = new Uri(repositoryBase, "_staging/4sup-verify-known");
+        try
+        {
+            using var response = await client.GetAsync(probe, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            if (response.StatusCode is not (System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Forbidden))
+                errors.Add($"staging-isolation:{(int)response.StatusCode}");
+        }
+        catch (HttpRequestException ex) { errors.Add($"staging-isolation:{ex.Message}"); }
+    }
+
+    private static string ExpectedCacheControl(ObjectKey key)
+    {
+        if (key.Value == "repo.json") return "max-age=300";
+        if (key.Value.Contains("/channels/", StringComparison.Ordinal)) return "max-age=30, must-revalidate";
+        if (key.Value == "keys.json"
+            || key.Value.EndsWith("/revocations.json", StringComparison.Ordinal)
+            || key.Value.EndsWith("/index.json", StringComparison.Ordinal)
+            || key.Value.Contains("/index.", StringComparison.Ordinal)
+            || key.Value.EndsWith("/product.json", StringComparison.Ordinal))
+            return "max-age=30, must-revalidate";
+        return "public, max-age=31536000, immutable";
+    }
+
+    private static async ValueTask CheckWriteReadPairingAsync(IWritableObjectStore writeStore, IReadableObjectStore readStore, List<string> errors, CancellationToken cancellationToken = default)
+    {
+        // _staging is intentionally hidden from the anonymous read endpoint.  A
+        // probe written there can therefore only prove isolation, never pairing.
+        // Use a disposable served-tree key for the positive write/read check and
+        // validate _staging separately in CheckHttpStagingIsolationAsync.
+        var key = new ObjectKey($"_verify-repo/4sup-{Guid.NewGuid():N}.bin");
+        var payload = Encoding.UTF8.GetBytes("4sup verify-repo pairing probe\n" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        try
+        {
+            await using var body = new MemoryStream(payload, writable: false);
+            await writeStore.PutAsync(key, body, payload.LongLength, cancellationToken).ConfigureAwait(false);
+            var read = await readStore.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (read is null) { errors.Add("write-read-pairing:probe-not-visible"); return; }
+            await using (read.ConfigureAwait(false))
+            {
+                using var received = new MemoryStream();
+                await read.Content.CopyToAsync(received, cancellationToken).ConfigureAwait(false);
+                if (!received.ToArray().AsSpan().SequenceEqual(payload)) errors.Add("write-read-pairing:bytes-differ");
+            }
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or InvalidDataException)
+        { errors.Add($"write-read-pairing:{ex.Message}"); }
+        finally
+        {
+            try { await writeStore.DeleteAsync(key, CancellationToken.None).ConfigureAwait(false); } catch (Exception) { }
+        }
+    }
+
     private static async ValueTask<int> GarbageCollectCommandAsync(string[] args)
     {
-        var target = ParseRepositoryOnly(args.FirstOrDefault() ?? throw new FormatException("gc requires a repository target."));
+        var target = ParseRepositoryOnly(args.FirstOrDefault() ?? throw new FormatException("gc requires a repository target."), write: true);
         var trusted = ParseTrustedKeys(args);
         if (trusted.Count == 0) throw new CryptographicException("No trusted key was supplied for GC live-set verification.");
         await using var store = CreateReadStore(target.Address);
@@ -1057,7 +1504,7 @@ public static class CliApplication
     private static async ValueTask<int> MirrorCommandAsync(string[] args)
     {
         if (args.Length < 2) throw new FormatException("mirror requires <source> <destination>. ");
-        var source = ParseRepositoryOnly(args[0]); var destination = ParseRepositoryOnly(args[1]);
+        var source = ParseRepositoryOnly(args[0]); var destination = ParseRepositoryOnly(args[1], write: true);
         var channel = GetOptionValue(args, "--channel");
         await using var sourceStore = CreateReadStore(source.Address);
         if (sourceStore is not IListableObjectStore sourceListable) throw new IOException("mirror source must be listable.");
@@ -1079,6 +1526,68 @@ public static class CliApplication
             if (manifest.Id != id || !string.Equals(manifest.Version.Label, label, StringComparison.Ordinal)) throw new InvalidDataException("Package manifest identity does not match its path.");
             return manifest;
         }
+    }
+
+    private static async ValueTask<IReadOnlyList<PackageIndexVersion>> ReadPackageIndexVersionsAsync(IReadableObjectStore store, RepositoryLayout layout, PackageId packageId, CancellationToken cancellationToken = default)
+    {
+        var versions = new List<PackageIndexVersion>();
+        var foundIndex = false;
+        for (var page = 0; page < 4096; page++)
+        {
+            ReadResult? result = null;
+            foreach (var key in PackageIndexKeys(layout, packageId, page))
+            {
+                result = await store.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
+                if (result is not null) break;
+            }
+            if (result is null) break;
+            foundIndex = true;
+            await using (result.ConfigureAwait(false))
+            {
+                var document = RepositoryJson.Deserialize<PackageIndexDocument>(await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false), rejectUnknownFields: true);
+                if (document.SchemaVersion != 1 || !string.Equals(document.PackageId, packageId.Value, StringComparison.Ordinal)) throw new InvalidDataException("Package index identity or schema is invalid.");
+                versions.AddRange(document.Versions);
+                if (document.Versions.Count == 0) break;
+            }
+        }
+        if (!foundIndex) throw new FileNotFoundException($"Package index for '{packageId}' is missing.");
+        return versions;
+    }
+
+    private static async ValueTask<IReadOnlyList<ReleaseIndexRow>> ReadReleaseIndexAsync(IReadableObjectStore store, RepositoryLayout layout, string productId, CancellationToken cancellationToken = default)
+    {
+        var releases = new List<ReleaseIndexRow>();
+        var foundIndex = false;
+        for (var page = 0; page < 4096; page++)
+        {
+            ReadResult? result = null;
+            foreach (var key in ReleaseIndexKeys(layout, productId, page))
+            {
+                result = await store.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
+                if (result is not null) break;
+            }
+            if (result is null) break;
+            foundIndex = true;
+            await using (result.ConfigureAwait(false))
+            {
+                var document = RepositoryJson.Deserialize<ReleaseIndexDocument>(await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false), rejectUnknownFields: true);
+                if (document.SchemaVersion != 1 || !string.Equals(document.ProductId, productId, StringComparison.Ordinal)) throw new InvalidDataException("Release index identity or schema is invalid.");
+                releases.AddRange(document.Releases);
+                if (document.Releases.Count == 0) break;
+            }
+        }
+        if (!foundIndex) throw new FileNotFoundException($"Release index for '{productId}' is missing.");
+        return releases;
+    }
+
+    private static IEnumerable<ObjectKey> PackageIndexKeys(RepositoryLayout layout, PackageId packageId, int page)
+    {
+        yield return layout.PackageIndex(packageId, page);
+    }
+
+    private static IEnumerable<ObjectKey> ReleaseIndexKeys(RepositoryLayout layout, string productId, int page)
+    {
+        yield return layout.ReleaseIndex(productId, page);
     }
 
     private static async ValueTask WritePackageIndexAsync(IWritableObjectStore store, RepositoryLayout layout, PackageManifest added, PackageId packageId, CancellationToken cancellationToken = default)
@@ -1135,7 +1644,7 @@ public static class CliApplication
     private static async ValueTask<IReadOnlyDictionary<PackageId, PackageManifest>> LoadPinnedManifestsAsync(StaticRepository repository, ReleaseLock release, CancellationToken cancellationToken = default)
     {
         var result = new Dictionary<PackageId, PackageManifest>();
-        foreach (var pin in release.Packages) result[pin.Id] = await repository.GetManifestAsync(pin.Id, pin.Version, pin.ManifestDigest, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException($"Manifest '{pin.Id}@{pin.Version}' is missing.");
+        foreach (var pin in release.Packages) result[pin.Id] = await repository.GetManifestAsync(pin.Id, new PackageVersion(pin.Version.Label, pin.Sequence), pin.ManifestDigest, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException($"Manifest '{pin.Id}@{pin.Version}' is missing.");
         return result;
     }
 
@@ -1149,7 +1658,7 @@ public static class CliApplication
         if (address.Backend is "http" or "https") return new HttpObjectStore(address.BaseUri);
         if (address.Backend is "file") return new LocalObjectStore(address.BaseUri.LocalPath);
         if (address.Backend is "s3") return CreateS3Store(address);
-        if (address.Backend is "ftp") return CreateFtpStore(address);
+        if (address.Backend is "ftp") throw new IOException("FTP is a write transport only; configure the paired HTTP read endpoint for client and repository reads.");
         if (address.Backend is "local")
         {
             var configured = Environment.GetEnvironmentVariable("FOURSUP_LOCAL_ROOT");
@@ -1187,7 +1696,13 @@ public static class CliApplication
         var endpoint = Environment.GetEnvironmentVariable("FOURSUP_S3_ENDPOINT");
         var accessKey = Environment.GetEnvironmentVariable("FOURSUP_S3_ACCESS_KEY");
         var secretKey = Environment.GetEnvironmentVariable("FOURSUP_S3_SECRET_KEY");
-        return new S3ObjectStore(address.BaseUri.Host, address.BaseUri.AbsolutePath.Trim('/'), serviceUrl: string.IsNullOrWhiteSpace(endpoint) ? null : new Uri(endpoint), accessKey: accessKey, secretKey: secretKey);
+        var profileText = Environment.GetEnvironmentVariable("FOURSUP_S3_PROVIDER") ?? "aws";
+        if (!Enum.TryParse<S3ProviderProfile>(profileText, ignoreCase: true, out var profile))
+            throw new FormatException($"Unknown FOURSUP_S3_PROVIDER '{profileText}'. Use aws, minio, r2, b2, or generic.");
+        var serviceUrl = string.IsNullOrWhiteSpace(endpoint) ? null : new Uri(endpoint);
+        return profile is S3ProviderProfile.Aws or S3ProviderProfile.Minio or S3ProviderProfile.R2
+            ? new S3ConditionalObjectStore(address.BaseUri.Host, address.BaseUri.AbsolutePath.Trim('/'), serviceUrl: serviceUrl, accessKey: accessKey, secretKey: secretKey, providerProfile: profile)
+            : new S3ObjectStore(address.BaseUri.Host, address.BaseUri.AbsolutePath.Trim('/'), serviceUrl: serviceUrl, accessKey: accessKey, secretKey: secretKey, providerProfile: profile);
     }
 
     private static FtpObjectStore CreateFtpStore(RepositoryAddress address)
@@ -1199,10 +1714,46 @@ public static class CliApplication
         return new FtpObjectStore(address.BaseUri, new NetworkCredential(user, password), enableSsl: !string.Equals(Environment.GetEnvironmentVariable("FOURSUP_FTP_TLS"), "0", StringComparison.Ordinal));
     }
 
+    private sealed record PackageIndexDocument
+    {
+        public required int SchemaVersion { get; init; }
+        public required string PackageId { get; init; }
+        public required IReadOnlyList<PackageIndexVersion> Versions { get; init; }
+    }
+
+    private sealed record PackageIndexVersion
+    {
+        public required string Version { get; init; }
+        public required long Sequence { get; init; }
+        public required string ManifestPath { get; init; }
+        public required ContentHash ManifestDigest { get; init; }
+        public required int FileCount { get; init; }
+        public required long InstallSize { get; init; }
+        public required long DownloadSize { get; init; }
+    }
+
+    private sealed record ReleaseIndexDocument
+    {
+        public required int SchemaVersion { get; init; }
+        public required string ProductId { get; init; }
+        public required IReadOnlyList<ReleaseIndexRow> Releases { get; init; }
+    }
+
+    private sealed record ReleaseIndexRow
+    {
+        public required string ReleaseId { get; init; }
+        public required long Sequence { get; init; }
+        public required string LockPath { get; init; }
+        public required ContentHash LockDigest { get; init; }
+        public required ContentHash CoverageDigest { get; init; }
+        public required DateTimeOffset CreatedAt { get; init; }
+    }
+
     private sealed record CommandTarget(RepositoryAddress Address, string PackageOrProduct, string? ReleaseOrVersion);
 
-    private static CommandTarget ParseTarget(string value, string coordinateKind, string? defaultCoordinate)
+    private static CommandTarget ParseTarget(string value, string coordinateKind, string? defaultCoordinate, bool write = false)
     {
+        value = ResolveAlias(value, write);
         var at = value.LastIndexOf('@');
         var left = at > 0 ? value[..at] : value;
         var coordinate = at > 0 ? value[(at + 1)..] : defaultCoordinate;
@@ -1213,11 +1764,12 @@ public static class CliApplication
         return new CommandTarget(address, address.ProductId, raw.StartsWith(coordinateKind + ":", StringComparison.Ordinal) ? raw[(coordinateKind.Length + 1)..] : raw);
     }
 
-    private static CommandTarget ParseRepositoryOnly(string value)
+    private static CommandTarget ParseRepositoryOnly(string value, bool write = false)
     {
         var configuration = new ConfigurationLoader().Load();
         var configuredAlias = configuration.Aliases.FirstOrDefault(x => string.Equals(x.Name, value, StringComparison.Ordinal));
-        var resolved = configuredAlias?.Address ?? value;
+        var configuredStorage = configuration.Storages.FirstOrDefault(x => string.Equals(x.Name, value, StringComparison.Ordinal));
+        var resolved = (write ? configuredStorage?.WriteUrl : configuredStorage?.ReadUrl) ?? configuredAlias?.Address ?? value;
         if (Uri.TryCreate(resolved, UriKind.Absolute, out var absolute) && absolute.Scheme is "http" or "https" or "file" or "s3" or "ftp")
             return new CommandTarget(new RepositoryAddress(absolute.Scheme, new Uri(absolute.ToString().TrimEnd('/') + "/"), "repo", "channel:live"), "repo", null);
         if (Path.IsPathFullyQualified(resolved))
@@ -1229,7 +1781,7 @@ public static class CliApplication
         throw new FormatException("Repository target must be an absolute URI/path or a configured alias.");
     }
 
-    private static string ResolveAlias(string value)
+    private static string ResolveAlias(string value, bool write = false)
     {
         var at = value.LastIndexOf('@');
         if (at <= 0) return value;
@@ -1239,7 +1791,9 @@ public static class CliApplication
         var aliasName = left[..slash];
         var configuration = new ConfigurationLoader().Load();
         var alias = configuration.Aliases.FirstOrDefault(x => string.Equals(x.Name, aliasName, StringComparison.Ordinal));
-        return alias is null ? value : alias.Address.TrimEnd('/') + "/" + left[(slash + 1)..] + value[at..];
+        var storage = configuration.Storages.FirstOrDefault(x => string.Equals(x.Name, aliasName, StringComparison.Ordinal));
+        var endpoint = (write ? storage?.WriteUrl : storage?.ReadUrl) ?? alias?.Address;
+        return endpoint is null ? value : endpoint.TrimEnd('/') + "/" + left[(slash + 1)..] + value[at..];
     }
 
     private static IReadOnlyDictionary<string, byte[]> ParseTrustedKeys(IEnumerable<string> args)
@@ -1261,6 +1815,14 @@ public static class CliApplication
         return keys;
     }
 
+    private static IReadOnlyDictionary<string, byte[]> ParseTrustedKeysOrFirstParty(IEnumerable<string> args)
+    {
+        var supplied = ParseTrustedKeys(args);
+        return supplied.Count == 0
+            ? new Dictionary<string, byte[]>(CompiledTrustRoots.FirstParty, StringComparer.Ordinal)
+            : supplied;
+    }
+
     private static void EnsureDocumentSigner(SignedEnvelope envelope, IReadOnlyDictionary<string, VerificationKey> keys, DateTimeOffset documentTime)
     {
         var skewHours = double.TryParse(Environment.GetEnvironmentVariable("FOURSUP_CLOCK_SKEW_HOURS"), NumberStyles.Float, CultureInfo.InvariantCulture, out var configured) && configured >= 0 && configured <= 168 ? configured : 24;
@@ -1269,12 +1831,21 @@ public static class CliApplication
 
     private static (string KeyId, byte[] PrivateKey) ParseSigningKey(IEnumerable<string> args)
     {
-        var value = GetOptionValue(args, "--sign") ?? throw new FormatException("A signing key is required via --sign=keyId:base64url.");
+        var value = GetOptionValue(args, "--sign") ?? throw new FormatException("A signing key id is required via --sign=<keyId>; the private key must come from FOURSUP_SIGNING_KEY_<keyId> or FOURSUP_SIGNING_KEYS.");
         var separator = value.IndexOf(':');
-        if (separator <= 0) throw new FormatException("--sign must use keyId:base64url.");
-        var keyId = value[..separator];
+        if (separator > 0) throw new UnauthorizedAccessException("Private signing keys may not be supplied in process arguments; use FOURSUP_SIGNING_KEY_<keyId> or FOURSUP_SIGNING_KEYS.");
+        var keyId = separator > 0 ? value[..separator] : value;
         if (!Identifier.IsValid(keyId, "keyId", out var error)) throw new FormatException(error);
-        var privateKey = Base64Url.Decode(value[(separator + 1)..]);
+        var encoded = separator > 0 ? value[(separator + 1)..] : Environment.GetEnvironmentVariable("FOURSUP_SIGNING_KEY_" + keyId);
+        if (string.IsNullOrWhiteSpace(encoded))
+        {
+            var configured = Environment.GetEnvironmentVariable("FOURSUP_SIGNING_KEYS");
+            encoded = configured?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(x => x.IndexOf(':') is var split && split > 0 && string.Equals(x[..split], keyId, StringComparison.Ordinal) ? x[(split + 1)..] : null)
+                .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+        }
+        if (string.IsNullOrWhiteSpace(encoded)) throw new FormatException($"No private signing key is configured for '{keyId}'; set FOURSUP_SIGNING_KEY_{keyId} or FOURSUP_SIGNING_KEYS.");
+        var privateKey = Base64Url.Decode(encoded);
         if (privateKey.Length != 32) throw new FormatException("Ed25519 private keys must be 32 bytes.");
         return (keyId, privateKey);
     }

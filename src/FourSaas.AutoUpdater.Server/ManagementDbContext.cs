@@ -38,14 +38,18 @@ public sealed class ManagementDbContext(DbContextOptions<ManagementDbContext> op
         modelBuilder.Entity<ReleaseRow>().HasKey(x => new { x.RepositoryId, x.ProductId, x.ReleaseId });
         modelBuilder.Entity<ReleaseRow>().HasIndex(x => new { x.RepositoryId, x.ProductId, x.Sequence }).IsUnique();
         modelBuilder.Entity<ChannelRow>().HasKey(x => new { x.RepositoryId, x.ProductId, x.Channel });
-        modelBuilder.Entity<ChannelRow>().HasIndex(x => new { x.RepositoryId, x.ProductId, x.ChannelSequence }).IsUnique();
+        modelBuilder.Entity<ChannelRow>().HasIndex(x => new { x.RepositoryId, x.ProductId, x.Channel, x.ChannelSequence }).IsUnique();
         modelBuilder.Entity<PublishSessionRow>().HasKey(x => x.SessionId);
         modelBuilder.Entity<AuditEventRow>().HasKey(x => x.Id);
         modelBuilder.Entity<AuditEventRow>().HasIndex(x => x.At);
         modelBuilder.Entity<TrustedKeyRow>().HasKey(x => new { x.RepositoryId, x.KeyId });
         modelBuilder.Entity<RevocationRow>().HasKey(x => new { x.RepositoryId, x.ProductId });
         modelBuilder.Entity<PublishGrantRow>().HasKey(x => x.GrantId);
-        modelBuilder.Entity<TelemetryRow>().HasKey(x => x.Id);
+        modelBuilder.Entity<PublishGrantRow>().Property(x => x.MultipartPartsJson).HasColumnType("jsonb");
+        // PostgreSQL partitioned tables require a partition key in a primary key.
+        // The identity remains globally unique in practice, while (Id, At) is the
+        // relational key accepted by every partition.
+        modelBuilder.Entity<TelemetryRow>().HasKey(x => new { x.Id, x.At });
         modelBuilder.Entity<TelemetryRow>().HasIndex(x => x.At);
         modelBuilder.Entity<SequenceReservationRow>().HasKey(x => new { x.RepositoryId, x.Scope, x.Name });
     }
@@ -100,6 +104,15 @@ public sealed class PublishGrantRow
     public long Length { get; set; }
     public DateTimeOffset ExpiresAt { get; set; }
     public bool Used { get; set; }
+    public string Status { get; set; } = "issued";
+    public DateTimeOffset? ClaimedAt { get; set; }
+    public DateTimeOffset? ConsumedAt { get; set; }
+    public DateTimeOffset? InvalidatedAt { get; set; }
+    public string? MultipartUploadId { get; set; }
+    public long? MultipartPartSize { get; set; }
+    public bool MultipartCompleted { get; set; }
+    public bool MultipartCompleting { get; set; }
+    public string? MultipartPartsJson { get; set; }
 }
 public sealed class TelemetryRow { public long Id { get; set; } public DateTimeOffset At { get; set; } public string? ProductId { get; set; } public string? ReleaseId { get; set; } public string? PayloadJson { get; set; } }
-public sealed class SequenceReservationRow { public required string RepositoryId { get; set; } public required string Scope { get; set; } public required string Name { get; set; } public long NextValue { get; set; } }
+public sealed class SequenceReservationRow { public required string RepositoryId { get; set; } public required string Scope { get; set; } public required string Name { get; set; } public long NextValue { get; set; } public string? AllocatedSequencesJson { get; set; } }

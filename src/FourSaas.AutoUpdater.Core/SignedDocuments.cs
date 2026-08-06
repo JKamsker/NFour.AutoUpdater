@@ -53,7 +53,7 @@ public static class SignedDocument
         var input = SigningInput(envelope.Type, payload);
         foreach (var signature in envelope.Signatures)
         {
-            if (!string.Equals(signature.Algorithm, "ed25519", StringComparison.OrdinalIgnoreCase) || !trustedKeys.TryGetValue(signature.KeyId, out var publicKey)) continue;
+            if (!string.Equals(signature.Algorithm, "ed25519", StringComparison.Ordinal) || !trustedKeys.TryGetValue(signature.KeyId, out var publicKey)) continue;
             byte[] bytes;
             try { bytes = Base64Url.Decode(signature.Signature); } catch (FormatException) { continue; }
             var verifier = new Ed25519Signer();
@@ -96,7 +96,7 @@ public static class SignedDocument
         var input = SigningInput(envelope.Type, payload);
         foreach (var signature in envelope.Signatures)
         {
-            if (!string.Equals(signature.Algorithm, "ed25519", StringComparison.OrdinalIgnoreCase) || !trustedKeys.TryGetValue(signature.KeyId, out var key) || key.PublicKey.Length != 32) continue;
+            if (!string.Equals(signature.Algorithm, "ed25519", StringComparison.Ordinal) || !trustedKeys.TryGetValue(signature.KeyId, out var key) || key.PublicKey.Length != 32) continue;
             byte[] bytes;
             try { bytes = Base64Url.Decode(signature.Signature); } catch (FormatException) { continue; }
             var verifier = new Ed25519Signer();
@@ -156,9 +156,9 @@ public sealed class RevocationEffectJsonConverter : JsonConverter<RevocationEffe
         var value = reader.GetString();
         return value switch
         {
-            "block-install" or "blockInstall" => RevocationEffect.BlockInstall,
-            "block-repair" or "blockRepair" => RevocationEffect.BlockRepair,
-            "force-move" or "forceMove" => RevocationEffect.ForceMove,
+            "block-install" => RevocationEffect.BlockInstall,
+            "block-repair" => RevocationEffect.BlockRepair,
+            "force-move" => RevocationEffect.ForceMove,
             _ => throw new JsonException($"Unknown revocation effect '{value}'.")
         };
     }
@@ -176,20 +176,31 @@ public static class JsonRules
 {
     public static void Validate(ReadOnlySpan<byte> bytes)
     {
+        var hasNonWhitespace = false;
+        foreach (var value in bytes)
+            if (value is not ((byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n')) { hasNonWhitespace = true; break; }
+        if (!hasNonWhitespace) throw new FormatException("Signed JSON must not be empty.");
         var reader = new Utf8JsonReader(bytes, new JsonReaderOptions { CommentHandling = JsonCommentHandling.Disallow, AllowTrailingCommas = false });
         var stack = new Stack<HashSet<string>>();
+        var sawToken = false;
         while (reader.Read())
         {
+            sawToken = true;
             switch (reader.TokenType)
             {
                 case JsonTokenType.StartObject: stack.Push(new HashSet<string>(StringComparer.Ordinal)); break;
-                case JsonTokenType.PropertyName: if (stack.Count == 0 || !stack.Peek().Add(reader.GetString() ?? string.Empty)) throw new FormatException("Duplicate JSON object property."); break;
+                case JsonTokenType.PropertyName:
+                    var propertyName = reader.GetString() ?? throw new FormatException("JSON property names may not be null.");
+                    ValidateString(propertyName);
+                    if (stack.Count == 0 || !stack.Peek().Add(propertyName)) throw new FormatException("Duplicate JSON object property.");
+                    break;
                 case JsonTokenType.Null: throw new FormatException("Null is not valid in a signed document.");
                 case JsonTokenType.Number: if (!reader.TryGetInt64(out _)) throw new FormatException("Signed-document numbers must be int64 integers."); break;
                 case JsonTokenType.String: ValidateString(reader.GetString()); break;
                 case JsonTokenType.EndObject: if (stack.Count > 0) stack.Pop(); break;
             }
         }
+        if (!sawToken || stack.Count != 0) throw new FormatException("Signed JSON is incomplete.");
         if (reader.BytesConsumed != bytes.Length) throw new FormatException("Trailing bytes after signed JSON document.");
     }
 

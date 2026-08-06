@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://4story.example/schemas/key-manifest.schema.json",
+  "$id": "https://4sup.invalid/schemas/key-manifest.schema.json",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "keySequence", "keys", "revokedKeyIds"],

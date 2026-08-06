@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://4story.example/schemas/release-bundle.schema.json",
+  "$id": "https://4sup.invalid/schemas/release-bundle.schema.json",
   "type": "object", "additionalProperties": false,
   "required": ["schemaVersion", "lockEnvelope", "inline"],
   "properties": {

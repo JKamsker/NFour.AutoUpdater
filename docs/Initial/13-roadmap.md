@@ -124,7 +124,7 @@ test in this phase.
 - Hardlink-first materialisation; the local CAS as a specified subsystem.
 - Single durable commit; the crash-recovery table executed as tests.
 - Delete + directory pruning; `Preserve`/`Orphan` handling.
-- Locked-file policy ladder; `Client.Windows` service/process tickets.
+- Locked-file handling remains an explicit caller concern; Windows service/process control is out of scope.
 - Free space bucketed by volume; the same-volume staging assertion.
 - `verify --repair --rebuild-state`.
 - Progress and cancellation contracts.

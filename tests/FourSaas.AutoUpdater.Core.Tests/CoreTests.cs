@@ -124,8 +124,28 @@ public sealed class CoreTests
             ]
         };
         Assert.True(ControlDocumentPolicy.ValidateKeyManifest(rotated, new HashSet<string>(["root"], StringComparer.Ordinal), "root", now, TimeSpan.FromHours(1), out var error), error);
+        var substituted = rotated with { Keys = [rotated.Keys[0] with { PublicKey = Base64Url.Encode(second.PublicKey) }, rotated.Keys[1]] };
+        Assert.False(ControlDocumentPolicy.ValidateKeyManifest(substituted, new Dictionary<string, byte[]> { ["root"] = first.PublicKey }, "root", now, TimeSpan.FromHours(1), out _));
         var empty = rotated with { RevokedKeyIds = ["root", "next"] };
         Assert.False(ControlDocumentPolicy.ValidateKeyManifest(empty, new HashSet<string>(["root"], StringComparer.Ordinal), "root", now, TimeSpan.FromHours(1), out _));
+    }
+
+    [Fact]
+    public void ChannelRollbackIsAcceptedOnlyAsAForwardChannelSequence()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rollback = new ChannelPointer
+        {
+            ProductId = "product", Channel = "live", ChannelSequence = 419, SupersedesChannelSequence = 418,
+            ReleaseId = "r417", ReleaseSequence = 417, ReleaseDigest = ContentHash.Compute("r417"u8), UpdatedAt = now
+        };
+        var accepted = ControlDocumentPolicy.AcceptChannel(rollback, "product", "live", 418, now, TimeSpan.FromDays(1), 418, new Version(1, 0, 0));
+        Assert.True(accepted.Accepted, accepted.Error);
+        Assert.True(accepted.IsRollback);
+
+        var restored = rollback with { ChannelSequence = 418, SupersedesChannelSequence = 417 };
+        var rejected = ControlDocumentPolicy.AcceptChannel(restored, "product", "live", 418, now, TimeSpan.FromDays(1), 418, new Version(1, 0, 0));
+        Assert.False(rejected.Accepted);
     }
 
     private static PackageId Id(string value) => new(value);

@@ -58,6 +58,11 @@ is keyed by SHA-256: storage can then enforce the key itself
 5 GiB still need server-side verification. **"S3-compatible" is not one capability set:** B2
 has no reliable conditional writes and weaker LIST consistency; R2 has no object tagging.
 
+The implementation selects an explicit provider profile (`aws`, `minio`, `r2`, `b2`, or
+`generic`) through `FOURSUP_S3_PROVIDER`. AWS/MinIO/R2 use the conditional-write typed surface;
+B2 and generic S3 expose the reduced byte-store surface and fail closed if conditional placement
+is requested.
+
 **Cost:** at ~$0.0004/1000 GET, 50k GETs × 100k players ≈ 5×10⁹ requests ≈ **$2,000 in request
 charges per patch**, before egress.
 
@@ -93,7 +98,7 @@ stale at one edge and fresh at another for the TTL.
 **Can:** full directory semantics; **atomic rename within a volume** (the commit primitive);
 **atomic create-if-absent** (`FileMode.CreateNew` / `O_EXCL`) — strictly better than the
 reference's racy `File.Exists` probe (`LocalPatchFileRepository.cs:133-145`); hardlinks;
-reflink/CoW clone (ReFS/btrfs/XFS/APFS, needs P/Invoke); Restart Manager.
+reflink/CoW clone (ReFS/btrfs/XFS/APFS, needs P/Invoke).
 
 **Cannot:** cross-volume rename is not atomic; **rename gives atomicity, not durability** —
 without `fsync` of the file and of the containing directory, power loss can lose it, and .NET has

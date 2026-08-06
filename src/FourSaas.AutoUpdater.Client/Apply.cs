@@ -50,43 +50,78 @@ public sealed class BlobFetcher
             validator = null;
         }
 
-        for (var attempt = 0; attempt < 3; attempt++)
+        Exception? lastFailure = null;
+        for (var attempt = 0; attempt < 5; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await using var response = await store.OpenAsync(key, offset, validator, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException($"Blob '{key}' was not found.");
-            var restart = response.StatusCode == 416 || response.ActualStartOffset != offset || (offset > 0 && response.StatusCode == 200);
-            if (restart)
+            try
             {
-                DeleteIfPresent(stagingPath);
-                DeleteIfPresent(metadataPath);
-                offset = 0;
-                validator = null;
-                continue;
-            }
-            if (offset > 0 && response.StatusCode != 206)
-                throw new IOException($"The storage backend did not honor the validated range for '{key}'.");
-            if (offset == 0 && response.Validator is { } initialValidator)
-            {
-                validator = initialValidator;
-                await WriteValidatorAsync(metadataPath, expected, initialValidator, cancellationToken).ConfigureAwait(false);
-            }
+                await using var response = await store.OpenAsync(key, offset, validator, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException($"Blob '{key}' was not found.");
+                var restart = response.StatusCode == 416 || response.ActualStartOffset != offset || (offset > 0 && response.StatusCode == 200);
+                if (restart)
+                {
+                    DeleteIfPresent(stagingPath);
+                    DeleteIfPresent(metadataPath);
+                    offset = 0;
+                    validator = null;
+                    continue;
+                }
+                if (offset > 0 && response.StatusCode != 206)
+                    throw new IOException($"The storage backend did not honor the validated range for '{key}'.");
+                if (offset == 0 && response.Validator is { } initialValidator)
+                {
+                    validator = initialValidator;
+                    await WriteValidatorAsync(metadataPath, expected, initialValidator, cancellationToken).ConfigureAwait(false);
+                }
 
-            await using (var target = new FileStream(stagingPath, offset == 0 ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
-                await response.Content.CopyToAsync(target, cancellationToken).ConfigureAwait(false);
+                // Hash the bytes as they cross the response/staging boundary. On a
+                // resumed transfer the already-staged prefix is fed into the same
+                // incremental hash first, so integrity never depends on a second
+                // full-file read after the download completes.
+                using var hash = IncrementalHash.CreateHash(expected.Algorithm switch
+                {
+                    HashAlgorithmId.Sha256 => HashAlgorithmName.SHA256,
+                    HashAlgorithmId.Sha512 => HashAlgorithmName.SHA512,
+                    HashAlgorithmId.Md5 => HashAlgorithmName.MD5,
+                    _ => throw new NotSupportedException($"Hash algorithm {expected.Algorithm} is not supported by the downloader.")
+                });
+                if (offset > 0)
+                {
+                    await using var prefix = File.OpenRead(stagingPath);
+                    var prefixBuffer = new byte[128 * 1024];
+                    int prefixRead;
+                    while ((prefixRead = await prefix.ReadAsync(prefixBuffer, cancellationToken).ConfigureAwait(false)) > 0)
+                        hash.AppendData(prefixBuffer, 0, prefixRead);
+                }
+                await using (var target = new FileStream(stagingPath, offset == 0 ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+                await using (var hashedResponse = new HashingWriteStream(target, hash))
+                    await response.Content.CopyToAsync(hashedResponse, cancellationToken).ConfigureAwait(false);
 
-            await using var verify = File.OpenRead(stagingPath);
-            var actual = await ContentHash.ComputeAsync(verify, expected.Algorithm, cancellationToken).ConfigureAwait(false);
-            if (actual != expected)
-            {
-                DeleteIfPresent(stagingPath);
+                offset = new FileInfo(stagingPath).Length;
+                var actual = new ContentHash(expected.Algorithm, hash.GetHashAndReset());
+                if (actual != expected)
+                    throw new InvalidDataException($"Blob '{key}' failed content verification.");
                 DeleteIfPresent(metadataPath);
-                throw new InvalidDataException($"Blob '{key}' failed content verification.");
+                return offset;
             }
-            DeleteIfPresent(metadataPath);
-            return new FileInfo(stagingPath).Length;
+            catch (OperationCanceledException) { throw; }
+            catch (InvalidDataException) { throw; }
+            catch (IOException ex) when (attempt < 4)
+            {
+                lastFailure = ex;
+                offset = File.Exists(stagingPath) ? new FileInfo(stagingPath).Length : 0;
+                if (offset == 0 || validator is not { IsStrong: true })
+                {
+                    DeleteIfPresent(stagingPath);
+                    DeleteIfPresent(metadataPath);
+                    offset = 0;
+                    validator = null;
+                }
+                await Task.Delay(TimeSpan.FromSeconds(1 << attempt), cancellationToken).ConfigureAwait(false);
+            }
         }
 
-        throw new IOException($"The storage backend changed or refused the validator for '{key}' while resuming.");
+        throw new IOException($"The storage backend changed or refused the validator for '{key}' while resuming.", lastFailure);
     }
 
     public async ValueTask<long> FetchFromMirrorsAsync(IReadOnlyList<IReadableObjectStore> mirrors, ObjectKey key, ContentHash expected, string stagingPath, CancellationToken cancellationToken = default, Action<IReadableObjectStore>? demoteMirror = null)
@@ -139,6 +174,7 @@ public sealed class BlobFetcher
             stream.Flush(flushToDisk: true);
         }
         File.Move(temporary, path, overwrite: true);
+        FlushContainingDirectory(path);
     }
 
     private static void DeleteIfPresent(string path)
@@ -151,7 +187,31 @@ public sealed class BlobFetcher
         try { if (File.Exists(path)) File.Delete(path); } catch (IOException) { }
     }
 
+    private static void FlushContainingDirectory(string path)
+    {
+        if (OperatingSystem.IsWindows()) return;
+        try
+        {
+            using var directory = new FileStream(Path.GetDirectoryName(path)!, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            directory.Flush(flushToDisk: true);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     private sealed record ResumeMetadata(string ExpectedHash, ObjectValidatorKind Kind, string Value, bool IsStrong);
+
+    private sealed class HashingWriteStream(Stream inner, IncrementalHash hash) : Stream
+    {
+        public override void Write(byte[] buffer, int offset, int count) { inner.Write(buffer, offset, count); if (count > 0) hash.AppendData(buffer, offset, count); }
+        public override void Write(ReadOnlySpan<byte> buffer) { inner.Write(buffer); if (!buffer.IsEmpty) hash.AppendData(buffer); }
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) { await inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false); if (count > 0) hash.AppendData(buffer, offset, count); }
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) { await inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false); if (!buffer.IsEmpty) hash.AppendData(buffer.Span); }
+        protected override void Dispose(bool disposing) { if (disposing) inner.Flush(); base.Dispose(disposing); }
+        public override ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public override bool CanRead => false; public override bool CanSeek => false; public override bool CanWrite => inner.CanWrite; public override long Length => inner.Length; public override long Position { get => inner.Position; set => throw new NotSupportedException(); }
+        public override void Flush() => inner.Flush(); public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken); public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException(); public override void SetLength(long value) => inner.SetLength(value); public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException(); public override int Read(Span<byte> buffer) => throw new NotSupportedException(); public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => throw new NotSupportedException(); public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
 }
 
 public sealed class InstallApplier
@@ -171,23 +231,15 @@ public sealed class InstallApplier
         IInstallLockProvider? lockProvider = null,
         ApplyPreconditions? preconditions = null,
         IReadOnlyList<IReadableObjectStore>? mirrors = null,
-        IReadOnlySet<ContentHash>? protectedCacheEntries = null,
-        IApplyTicketProvider? ticketProvider = null)
+        IReadOnlySet<ContentHash>? protectedCacheEntries = null)
     {
         progress ??= new NullApplyProgressSink();
         ValidateRoot(installRoot);
-        preconditions ??= new ApplyPreconditions();
+        if (preconditions is null) throw new ApplyPreconditionException("ApplyPreconditions are required; the caller must provide the verified protocol preconditions.");
         preconditions.Validate(installRoot, plan);
         lockProvider ??= new FileInstallLockProvider();
         await using var installLease = await lockProvider.AcquireAsync(installRoot, cancellationToken).ConfigureAwait(false);
-        ticketProvider ??= new NoopApplyTicketProvider();
-        IApplyTicketLease? ticketLease = null;
-
-        try
-        {
         var metadata = Path.Combine(installRoot, ".4sup");
-        if (ticketProvider is IRecoverableApplyTicketProvider recoverableTickets)
-            await recoverableTickets.RecoverAsync(installRoot, cancellationToken).ConfigureAwait(false);
         var staging = Path.Combine(metadata, "staging");
         var planPath = Path.Combine(metadata, "plan.json");
         Directory.CreateDirectory(staging);
@@ -212,9 +264,6 @@ public sealed class InstallApplier
             }
         }
         else await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
-        // Persist the complete plan before stopping services or processes.  A crash after this
-        // point leaves a durable recovery point that the next invocation can adopt.
-        ticketLease = await ticketProvider.AcquireAsync(installRoot, plan.Operations, cancellationToken).ConfigureAwait(false);
         var total = plan.BytesToDownload; var downloaded = 0L; var fetchNumber = 0;
         await progress.ReportAsync(new ApplyProgress { Phase = ApplyPhase.Fetching, DownloadedBytes = 0, TotalDownloadBytes = total, WrittenBytes = 0, TotalWriteBytes = plan.BytesToWrite, FilesDone = 0, FilesTotal = plan.Operations.Length }, cancellationToken).ConfigureAwait(false);
         var configuredParallelism = int.TryParse(Environment.GetEnvironmentVariable("FOURSUP_PARALLELISM"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var configured) ? configured : source.RecommendedParallelism;
@@ -278,7 +327,7 @@ public sealed class InstallApplier
             switch (operation)
             {
                 case FileOperation.EnsureDirectory directory:
-                    if (SecureInstallOperations.TryEnsureDirectory(installRoot, directory.Path)) break;
+                    if (SecureInstallOperations.TryEnsureDirectory(installRoot, directory.Path, expectedParent)) break;
                     var directoryPath = ResolveManaged(installRoot, directory.Path);
                     if (Directory.Exists(directoryPath) && new DirectoryInfo(directoryPath).Attributes.HasFlag(FileAttributes.ReparsePoint)) throw new IOException($"Managed directory is a reparse point: '{directory.Path}'.");
                     Directory.CreateDirectory(directoryPath);
@@ -301,7 +350,7 @@ public sealed class InstallApplier
                         if (!File.Exists(staged)) throw new InvalidDataException($"Verified staging blob for '{write.Path}' is missing.");
                         await VerifyStagedBlobAsync(staged, write.Content, cancellationToken).ConfigureAwait(false);
                         if (new FileInfo(staged).Length != write.Size) throw new InvalidDataException($"Verified blob size for '{write.Path}' does not match the manifest.");
-                        if (!SecureInstallOperations.TryReplaceFile(installRoot, write.Path, staged, write.Policy == FileInstallPolicy.Executable, expectedParent))
+                        if (!SecureInstallOperations.TryReplaceFile(installRoot, write.Path, staged, write.Policy == FileInstallPolicy.Executable, expectedParent, preferHardLink: write.Policy != FileInstallPolicy.Preserve))
                         {
                             var temporary = destination! + ".4sup-new-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
                             try
@@ -356,16 +405,6 @@ public sealed class InstallApplier
         await ledger.CommitAsync(installLock, nextFiles, cancellationToken).ConfigureAwait(false);
         foreach (var file in Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories)) File.Delete(file);
         File.Delete(planPath);
-        }
-        finally
-        {
-            // Restoration is cleanup, not part of the cancelled operation; it must still run.
-            if (ticketLease is not null)
-            {
-                try { await ticketLease.RestoreAsync(CancellationToken.None).ConfigureAwait(false); }
-                finally { await ticketLease.DisposeAsync().ConfigureAwait(false); }
-            }
-        }
     }
 
     private static async ValueTask<long> VerifyStagedBlobAsync(string path, ContentHash expected, CancellationToken cancellationToken)
@@ -518,6 +557,7 @@ public sealed class LocalContentCache
         if (await ContentHash.ComputeAsync(stream, hash.Algorithm, cancellationToken).ConfigureAwait(false) != hash)
         {
             try { File.SetAttributes(path, FileAttributes.Normal); File.Delete(path); } catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
             return false;
         }
         File.SetLastAccessTimeUtc(path, DateTime.UtcNow); return true;

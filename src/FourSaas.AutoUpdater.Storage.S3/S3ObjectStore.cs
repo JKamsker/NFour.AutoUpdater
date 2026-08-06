@@ -3,17 +3,38 @@ using Amazon.S3.Model;
 using FourSaas.AutoUpdater.Core;
 using FourSaas.AutoUpdater.Storage;
 
+using System.Globalization;
+
 namespace FourSaas.AutoUpdater.Storage.S3;
 
-public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IMultipartUploadStore, IPresigningStore, IUploadHeaderProvider, IServerSideVerifier
+public enum S3ProviderProfile
+{
+    Aws,
+    Minio,
+    R2,
+    B2,
+    Generic
+}
+
+public class S3ObjectStore : IListableObjectStore, IServerSideCopyStore, IServerSideTransferStore, IMultipartUploadStore, IMultipartGrantStore, IMultipartGarbageCollector, IPresigningStore, IUploadHeaderProvider, IServerSideVerifier
 {
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
+    private readonly string? _providerIdentity;
     private readonly bool _ownsClient;
-    public S3ObjectStore(string bucket, string prefix = "", IAmazonS3? client = null, Uri? serviceUrl = null, string? accessKey = null, string? secretKey = null)
+    private readonly S3ProviderProfile _providerProfile;
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _copyLocks = new(StringComparer.Ordinal);
+    public S3ObjectStore(string bucket, string prefix = "", IAmazonS3? client = null, Uri? serviceUrl = null, string? accessKey = null, string? secretKey = null, S3ProviderProfile providerProfile = S3ProviderProfile.Aws)
     {
         _bucket = bucket; _prefix = prefix.Trim('/');
+        _providerProfile = providerProfile;
+        // A server-side copy is safe across separate store instances only when
+        // both endpoint and explicitly configured credential identity agree. For
+        // opaque/default credential chains, reference equality is required below.
+        _providerIdentity = serviceUrl is null || string.IsNullOrWhiteSpace(accessKey)
+            ? null
+            : serviceUrl.GetLeftPart(UriPartial.Authority).TrimEnd('/').ToLowerInvariant() + "|" + accessKey;
         if (client is not null) _client = client;
         else
         {
@@ -22,7 +43,9 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
             _ownsClient = true;
         }
     }
-    public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ConditionalWrite | StorageCapabilities.ServerSideCopy | StorageCapabilities.Presigning | StorageCapabilities.Multipart | StorageCapabilities.Delete;
+    public S3ProviderProfile ProviderProfile => _providerProfile;
+    protected bool SupportsConditionalWrites => _providerProfile is S3ProviderProfile.Aws or S3ProviderProfile.Minio or S3ProviderProfile.R2;
+    public virtual StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ServerSideCopy | StorageCapabilities.Presigning | StorageCapabilities.Multipart | StorageCapabilities.Delete;
     public int RecommendedParallelism => 32;
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
@@ -32,6 +55,15 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
             if (ifMatch is not null) request.EtagToMatch = ifMatch.Value;
             var response = await _client.GetObjectAsync(request, cancellationToken).ConfigureAwait(false);
             if (!string.IsNullOrEmpty(response.Headers.ContentEncoding)) { response.Dispose(); throw new InvalidDataException($"Object '{key}' was served with forbidden Content-Encoding '{response.Headers.ContentEncoding}'."); }
+            if (offset > 0)
+            {
+                var contentRange = response.ContentRange;
+                if (response.HttpStatusCode != System.Net.HttpStatusCode.PartialContent || string.IsNullOrWhiteSpace(contentRange) || !contentRange.StartsWith($"bytes {offset}-", StringComparison.Ordinal))
+                {
+                    response.Dispose();
+                    return await OpenAsync(key, 0, null, cancellationToken).ConfigureAwait(false);
+                }
+            }
             return new ReadResult { Content = new ResponseStream(response), ActualStartOffset = offset, StatusCode = offset > 0 ? 206 : 200, Validator = new(ObjectValidatorKind.ETag, response.ETag) };
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) { return null; }
@@ -44,7 +76,7 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
     }
     public async ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
-        try { var response = await _client.GetObjectMetadataAsync(new GetObjectMetadataRequest { BucketName = _bucket, Key = FullKey(key) }, cancellationToken).ConfigureAwait(false); if (!string.IsNullOrEmpty(response.Headers.ContentEncoding)) throw new InvalidDataException($"Object '{key}' was served with forbidden Content-Encoding '{response.Headers.ContentEncoding}'."); return new ObjectHead(response.ContentLength, new(ObjectValidatorKind.ETag, response.ETag), null, null, true, response.LastModified.ToUniversalTime()); }
+        try { var response = await _client.GetObjectMetadataAsync(new GetObjectMetadataRequest { BucketName = _bucket, Key = FullKey(key) }, cancellationToken).ConfigureAwait(false); if (!string.IsNullOrEmpty(response.Headers.ContentEncoding)) throw new InvalidDataException($"Object '{key}' was served with forbidden Content-Encoding '{response.Headers.ContentEncoding}'."); return new ObjectHead(response.ContentLength, new(ObjectValidatorKind.ETag, response.ETag), null, null, true, response.LastModified.ToUniversalTime(), response.Headers.CacheControl); }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) { return null; }
     }
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -62,39 +94,60 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
     {
         var request = new PutObjectRequest { BucketName = _bucket, Key = FullKey(key), InputStream = content, AutoCloseStream = false };
         if (length is { } declared) request.Headers.ContentLength = declared;
+        request.Headers["Cache-Control"] = CacheControlFor(key);
         await _client.PutObjectAsync(request, cancellationToken).ConfigureAwait(false);
     }
 
-    public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    public virtual async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
+        EnsureConditionalWrites();
         var request = new PutObjectRequest { BucketName = _bucket, Key = FullKey(key), InputStream = content, AutoCloseStream = false };
         if (length is { } declared) request.Headers.ContentLength = declared;
+        request.Headers["Cache-Control"] = CacheControlFor(key);
         request.Headers["If-None-Match"] = "*";
         try { await _client.PutObjectAsync(request, cancellationToken).ConfigureAwait(false); return true; }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.PreconditionFailed || ex.StatusCode == System.Net.HttpStatusCode.Conflict) { return false; }
     }
 
-    public async ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    public virtual async ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
+        EnsureConditionalWrites();
         if (expected.Kind != ObjectValidatorKind.ETag || !expected.IsStrong) return false;
         var request = new PutObjectRequest { BucketName = _bucket, Key = FullKey(key), InputStream = content, AutoCloseStream = false };
         if (length is { } declared) request.Headers.ContentLength = declared;
+        request.Headers["Cache-Control"] = CacheControlFor(key);
         request.Headers["If-Match"] = expected.Value;
         try { await _client.PutObjectAsync(request, cancellationToken).ConfigureAwait(false); return true; }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.PreconditionFailed || ex.StatusCode == System.Net.HttpStatusCode.Conflict) { return false; }
     }
 
-    public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
+    public virtual async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
+        EnsureConditionalWrites();
         if (expectedDigest.Algorithm != HashAlgorithmId.Sha256) throw new NotSupportedException("S3 storage-enforced CAS requires sha256.");
         var expectedHex = Convert.ToHexString(expectedDigest.Value.Span).ToLowerInvariant();
         if (!string.Equals(key.Value.Split('/').Last(), expectedHex, StringComparison.Ordinal)) throw new ArgumentException("CAS key must end in the expected sha256 digest.", nameof(key));
         if (!content.CanSeek)
         {
-            await using var buffered = new MemoryStream();
-            await content.CopyToAsync(buffered, cancellationToken).ConfigureAwait(false);
-            buffered.Position = 0;
-            return await PutIfAbsentAsync(key, expectedDigest, buffered, buffered.Length, cancellationToken).ConfigureAwait(false);
+            // A grant may arrive as a network stream and can be many gigabytes.
+            // Spooling it to a bounded temporary file preserves the mandatory
+            // verify-before-upload behavior without making the publisher's RAM
+            // usage proportional to the object size.
+            var temporaryPath = Path.Combine(Path.GetTempPath(), "4sup-s3-cas-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+            try
+            {
+                await using (var buffered = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    await content.CopyToAsync(buffered, cancellationToken).ConfigureAwait(false);
+                    await buffered.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
+                await using var replay = new FileStream(temporaryPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                return await PutIfAbsentAsync(key, expectedDigest, replay, replay.Length, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                try { File.Delete(temporaryPath); } catch (IOException) { }
+            }
         }
         var original = content.Position;
         var computed = await ContentHash.ComputeAsync(content, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false);
@@ -102,7 +155,8 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
         content.Position = original;
         var request = new PutObjectRequest { BucketName = _bucket, Key = FullKey(key), InputStream = content, AutoCloseStream = false, ChecksumAlgorithm = ChecksumAlgorithm.SHA256, ChecksumSHA256 = Convert.ToBase64String(expectedDigest.Value.ToArray()) };
         if (length is { } declared) request.Headers.ContentLength = declared;
-        request.Headers["If-None-Match"] = "*";
+        request.Headers["Cache-Control"] = CacheControlFor(key);
+        if (SupportsConditionalWrites) request.Headers["If-None-Match"] = "*";
         try { await _client.PutObjectAsync(request, cancellationToken).ConfigureAwait(false); return true; }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.PreconditionFailed || ex.StatusCode == System.Net.HttpStatusCode.Conflict) { return false; }
     }
@@ -118,34 +172,203 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
             Expires = descriptor.ExpiresAt.UtcDateTime
         };
         request.Headers["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray());
+        request.Headers["If-None-Match"] = "*";
+        request.Headers["Content-Length"] = descriptor.ExpectedLength.ToString(CultureInfo.InvariantCulture);
         return ValueTask.FromResult(new Uri(_client.GetPreSignedURL(request), UriKind.Absolute));
     }
     public IReadOnlyDictionary<string, string> GetRequiredUploadHeaders(UploadGrantDescriptor descriptor)
-        => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray()) };
+        => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray()), ["If-None-Match"] = "*", ["Content-Length"] = descriptor.ExpectedLength.ToString(CultureInfo.InvariantCulture) };
     public async ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default) => await _client.DeleteObjectAsync(new DeleteObjectRequest { BucketName = _bucket, Key = FullKey(key) }, cancellationToken).ConfigureAwait(false);
     public async ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
-        if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
-        var sourceHead = await HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
-        const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
-        if (sourceHead.Length <= copyObjectLimit)
-        {
-            await _client.CopyObjectAsync(new CopyObjectRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = FullKey(destination), MetadataDirective = S3MetadataDirective.REPLACE }, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        var upload = await StartMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false);
-        var parts = new List<MultipartPart>();
+        var gate = _copyLocks.GetOrAdd(FullKey(destination), static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
+            var sourceHead = await HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
+            const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
+            if (sourceHead.Length <= copyObjectLimit)
+            {
+                var copy = new CopyObjectRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = FullKey(destination), MetadataDirective = S3MetadataDirective.REPLACE };
+                copy.Headers["Cache-Control"] = CacheControlFor(destination);
+                copy.Headers["Content-Encoding"] = string.Empty;
+                await _client.CopyObjectAsync(copy, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            var upload = await FindIncompleteMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false)
+                ?? await StartMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false);
+            var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
+                .ToDictionary(part => part.Number);
             var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
             var partNumber = 1;
             for (long first = 0; first < sourceHead.Length; first += partSize)
             {
                 var last = Math.Min(sourceHead.Length - 1, first + partSize - 1);
-                parts.Add(await CopyPartAsync(upload, source, partNumber++, first, last, cancellationToken).ConfigureAwait(false));
+                if (!partsByNumber.ContainsKey(partNumber))
+                    partsByNumber[partNumber] = await CopyPartAsync(upload, source, partNumber, first, last, cancellationToken).ConfigureAwait(false);
+                partNumber++;
             }
-            await CompleteMultipartUploadAsync(upload, parts, cancellationToken).ConfigureAwait(false);
+            await CompleteMultipartUploadAsync(upload, partsByNumber.Values.OrderBy(part => part.Number).ToArray(), cancellationToken).ConfigureAwait(false);
+        }
+        finally { gate.Release(); }
+    }
+    public async ValueTask<bool> TryCopyFromAsync(IReadableObjectStore sourceStore, ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
+    {
+        if (sourceStore is not S3ObjectStore remote) return false;
+        // CopyObject is provider-specific.  Never assume that two S3-shaped endpoints
+        // share an account/region or even implement the same copy API; the caller can
+        // fall back to a verified byte transfer when this identity is unknown.
+        if (!ReferenceEquals(_client, remote._client) && (_providerIdentity is null || !string.Equals(_providerIdentity, remote._providerIdentity, StringComparison.Ordinal))) return false;
+        var gate = _copyLocks.GetOrAdd(FullKey(destination), static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
+            var sourceHead = await remote.HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
+            const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
+            if (sourceHead.Length <= copyObjectLimit)
+            {
+                var copy = new CopyObjectRequest
+                {
+                    SourceBucket = remote._bucket,
+                    SourceKey = remote.FullKey(source),
+                    DestinationBucket = _bucket,
+                    DestinationKey = FullKey(destination),
+                    MetadataDirective = S3MetadataDirective.REPLACE
+                };
+                copy.Headers["Cache-Control"] = CacheControlFor(destination);
+                copy.Headers["Content-Encoding"] = string.Empty;
+                await _client.CopyObjectAsync(copy, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+
+            var upload = await FindIncompleteMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false)
+                ?? await StartMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false);
+            var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
+                .ToDictionary(part => part.Number);
+            var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
+            var partNumber = 1;
+            for (long first = 0; first < sourceHead.Length; first += partSize)
+            {
+                var last = Math.Min(sourceHead.Length - 1, first + partSize - 1);
+                if (!partsByNumber.ContainsKey(partNumber))
+                {
+                    var response = await _client.CopyPartAsync(new CopyPartRequest
+                    {
+                        SourceBucket = remote._bucket,
+                        SourceKey = remote.FullKey(source),
+                        DestinationBucket = _bucket,
+                        DestinationKey = FullKey(upload.Key),
+                        UploadId = upload.UploadId,
+                        PartNumber = partNumber,
+                        FirstByte = first,
+                        LastByte = last
+                    }, cancellationToken).ConfigureAwait(false);
+                    partsByNumber[partNumber] = new MultipartPart(partNumber, response.ETag, last - first + 1);
+                }
+                partNumber++;
+            }
+            await CompleteMultipartUploadAsync(upload, partsByNumber.Values.OrderBy(part => part.Number).ToArray(), cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        finally { gate.Release(); }
+    }
+    public async ValueTask<MultipartUpload> StartMultipartUploadAsync(ObjectKey key, CancellationToken cancellationToken = default)
+    {
+        var partSize = 16L * 1024 * 1024;
+        var request = new InitiateMultipartUploadRequest { BucketName = _bucket, Key = FullKey(key) };
+        request.Headers["Cache-Control"] = CacheControlFor(key);
+        request.Headers["Content-Encoding"] = string.Empty;
+        var response = await _client.InitiateMultipartUploadAsync(request, cancellationToken).ConfigureAwait(false);
+        return new MultipartUpload(key, response.UploadId, partSize);
+    }
+
+    public async ValueTask<MultipartUpload?> FindIncompleteMultipartUploadAsync(ObjectKey key, CancellationToken cancellationToken = default)
+    {
+        string? keyMarker = null;
+        string? uploadIdMarker = null;
+        MultipartUpload? newest = null;
+        DateTimeOffset newestAt = DateTimeOffset.MinValue;
+        do
+        {
+            var page = await _client.ListMultipartUploadsAsync(new ListMultipartUploadsRequest
+            {
+                BucketName = _bucket,
+                Prefix = FullKey(key),
+                KeyMarker = keyMarker,
+                UploadIdMarker = uploadIdMarker
+            }, cancellationToken).ConfigureAwait(false);
+            foreach (var candidate in page.MultipartUploads)
+            {
+                if (!string.Equals(candidate.Key, FullKey(key), StringComparison.Ordinal)) continue;
+                var initiated = candidate.Initiated.ToUniversalTime();
+                if (newest is null || initiated > newestAt)
+                {
+                    newest = new MultipartUpload(key, candidate.UploadId, 16L * 1024 * 1024);
+                    newestAt = initiated;
+                }
+            }
+            keyMarker = page.IsTruncated ? page.NextKeyMarker : null;
+            uploadIdMarker = page.IsTruncated ? page.NextUploadIdMarker : null;
+        }
+        while (keyMarker is not null);
+        return newest;
+    }
+
+    public async ValueTask<IReadOnlyList<MultipartPart>> ListPartsAsync(MultipartUpload upload, CancellationToken cancellationToken = default)
+    {
+        var result = new List<MultipartPart>();
+        string? partNumberMarker = null;
+        do
+        {
+            var page = await _client.ListPartsAsync(new ListPartsRequest
+            {
+                BucketName = _bucket,
+                Key = FullKey(upload.Key),
+                UploadId = upload.UploadId,
+                PartNumberMarker = partNumberMarker
+            }, cancellationToken).ConfigureAwait(false);
+            result.AddRange(page.Parts.Select(part => new MultipartPart(part.PartNumber, part.ETag, part.Size)));
+            partNumberMarker = page.IsTruncated ? page.NextPartNumberMarker.ToString(CultureInfo.InvariantCulture) : null;
+        }
+        while (partNumberMarker is not null);
+        return result;
+    }
+
+    public async ValueTask<BrokeredMultipartUpload> CreateBrokeredMultipartUploadAsync(UploadGrantDescriptor descriptor, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (descriptor.ExpectedLength <= 5L * 1024 * 1024 * 1024) throw new ArgumentException("Brokered multipart grants are reserved for objects larger than the S3 single-PUT limit.", nameof(descriptor));
+
+        var partSize = MultipartPartSizeFor(descriptor.ExpectedLength);
+        var request = new InitiateMultipartUploadRequest
+        {
+            BucketName = _bucket,
+            Key = FullKey(descriptor.StagingKey)
+        };
+        request.Headers["Cache-Control"] = CacheControlFor(descriptor.StagingKey);
+        var response = await _client.InitiateMultipartUploadAsync(request, cancellationToken).ConfigureAwait(false);
+        var upload = new MultipartUpload(descriptor.StagingKey, response.UploadId, partSize);
+        var partCount = checked((int)((descriptor.ExpectedLength + partSize - 1) / partSize));
+        var parts = ImmutableArray.CreateBuilder<PresignedUploadPart>(partCount);
+        try
+        {
+            for (var partNumber = 1; partNumber <= partCount; partNumber++)
+            {
+                var url = _client.GetPreSignedURL(new GetPreSignedUrlRequest
+                {
+                    BucketName = _bucket,
+                    Key = FullKey(descriptor.StagingKey),
+                    UploadId = response.UploadId,
+                    PartNumber = partNumber,
+                    Verb = HttpVerb.PUT,
+                    Expires = descriptor.ExpiresAt.UtcDateTime
+                });
+                parts.Add(new PresignedUploadPart(partNumber, new Uri(url, UriKind.Absolute), ImmutableDictionary<string, string>.Empty));
+            }
+            return new BrokeredMultipartUpload(upload, parts.MoveToImmutable());
         }
         catch
         {
@@ -153,10 +376,43 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
             throw;
         }
     }
-    public async ValueTask<MultipartUpload> StartMultipartUploadAsync(ObjectKey key, CancellationToken cancellationToken = default)
+
+    public ValueTask CompleteBrokeredMultipartUploadAsync(MultipartUpload upload, IReadOnlyList<MultipartPart> parts, CancellationToken cancellationToken = default)
+        => CompleteMultipartUploadAsync(upload, parts, cancellationToken);
+
+    public ValueTask<IReadOnlyList<MultipartPart>> ListBrokeredMultipartPartsAsync(MultipartUpload upload, CancellationToken cancellationToken = default)
+        => ListPartsAsync(upload, cancellationToken);
+
+    public ValueTask AbortBrokeredMultipartUploadAsync(MultipartUpload upload, CancellationToken cancellationToken = default)
+        => AbortMultipartUploadAsync(upload, cancellationToken);
+
+    public async ValueTask<int> AbortIncompleteMultipartUploadsAsync(string prefix, IReadOnlySet<string> preservedPrefixes, bool dryRun = false, CancellationToken cancellationToken = default)
     {
-        var response = await _client.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest { BucketName = _bucket, Key = FullKey(key), ChecksumAlgorithm = ChecksumAlgorithm.SHA256 }, cancellationToken).ConfigureAwait(false);
-        return new MultipartUpload(key, response.UploadId, 16L * 1024 * 1024);
+        var fullPrefix = FullKey(new ObjectKey(prefix.TrimEnd('/') + "/x"))[..^1];
+        string? keyMarker = null;
+        string? uploadIdMarker = null;
+        var count = 0;
+        do
+        {
+            var page = await _client.ListMultipartUploadsAsync(new ListMultipartUploadsRequest
+            {
+                BucketName = _bucket,
+                Prefix = fullPrefix,
+                KeyMarker = keyMarker,
+                UploadIdMarker = uploadIdMarker
+            }, cancellationToken).ConfigureAwait(false);
+            foreach (var upload in page.MultipartUploads)
+            {
+                if (preservedPrefixes.Any(preserved => upload.Key.StartsWith(FullKey(new ObjectKey(preserved.TrimEnd('/') + "/x"))[..^1], StringComparison.Ordinal))) continue;
+                count++;
+                if (!dryRun)
+                    await _client.AbortMultipartUploadAsync(new AbortMultipartUploadRequest { BucketName = _bucket, Key = upload.Key, UploadId = upload.UploadId }, cancellationToken).ConfigureAwait(false);
+            }
+            keyMarker = page.IsTruncated ? page.NextKeyMarker : null;
+            uploadIdMarker = page.IsTruncated ? page.NextUploadIdMarker : null;
+        }
+        while (keyMarker is not null);
+        return count;
     }
 
     public async ValueTask<MultipartPart> UploadPartAsync(MultipartUpload upload, int partNumber, Stream content, long length, CancellationToken cancellationToken = default)
@@ -191,6 +447,32 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
     }
     public async ValueTask DisposeAsync() { if (_ownsClient) _client.Dispose(); await ValueTask.CompletedTask; }
     private string FullKey(ObjectKey key) => string.IsNullOrEmpty(_prefix) ? key.Value : _prefix + "/" + key.Value;
+    private static long MultipartPartSizeFor(long length)
+    {
+        const long minimum = 16L * 1024 * 1024;
+        const long maximumParts = 10_000;
+        var required = (length + maximumParts - 1) / maximumParts;
+        var rounded = ((required + minimum - 1) / minimum) * minimum;
+        return Math.Max(minimum, rounded);
+    }
+    private static string CacheControlFor(ObjectKey key)
+    {
+        if (key.Value == "repo.json") return "max-age=300";
+        if (key.Value.Contains("/channels/", StringComparison.Ordinal)) return "max-age=30, must-revalidate";
+        if (key.Value == "keys.json"
+            || key.Value.EndsWith("/revocations.json", StringComparison.Ordinal)
+            || key.Value.EndsWith("/index.json", StringComparison.Ordinal)
+            || key.Value.Contains("/index.", StringComparison.Ordinal)
+            || key.Value.EndsWith("/product.json", StringComparison.Ordinal))
+            return "max-age=30, must-revalidate";
+        return "public, max-age=31536000, immutable";
+    }
+
+    private void EnsureConditionalWrites()
+    {
+        if (!SupportsConditionalWrites)
+            throw new NotSupportedException($"S3 provider profile '{_providerProfile}' does not guarantee conditional writes; use server-verified placement.");
+    }
     private sealed class ResponseStream(GetObjectResponse response) : Stream
     {
         private readonly Stream _inner = response.ResponseStream;
@@ -199,4 +481,21 @@ public sealed class S3ObjectStore : IListableObjectStore, IConditionalWriteStore
         public override bool CanRead => _inner.CanRead; public override bool CanSeek => _inner.CanSeek; public override bool CanWrite => false; public override long Length => _inner.Length; public override long Position { get => _inner.Position; set => _inner.Position = value; }
         public override void Flush() => _inner.Flush(); public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count); public override int Read(Span<byte> buffer) => _inner.Read(buffer); public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => _inner.ReadAsync(buffer, offset, count, ct); public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) => _inner.ReadAsync(buffer, ct); public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin); public override void SetLength(long value) => throw new NotSupportedException(); public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException(); public override void Write(ReadOnlySpan<byte> buffer) => throw new NotSupportedException(); public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) => throw new NotSupportedException(); public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) => throw new NotSupportedException();
     }
+}
+
+/// <summary>
+/// S3 provider profile with the conditional-write and content-addressed ports
+/// enabled.  Keeping this as a distinct type makes capability negotiation
+/// truthful for providers such as B2 that expose S3 syntax without a reliable
+/// create-if-absent primitive.
+/// </summary>
+public sealed class S3ConditionalObjectStore : S3ObjectStore, IConditionalWriteStore, IContentAddressedWriteStore
+{
+    public S3ConditionalObjectStore(string bucket, string prefix = "", IAmazonS3? client = null, Uri? serviceUrl = null, string? accessKey = null, string? secretKey = null, S3ProviderProfile providerProfile = S3ProviderProfile.Aws)
+        : base(bucket, prefix, client, serviceUrl, accessKey, secretKey, providerProfile)
+    {
+        if (!SupportsConditionalWrites) throw new ArgumentException($"Provider profile '{providerProfile}' does not support conditional writes.", nameof(providerProfile));
+    }
+
+    public override StorageCapabilities Capabilities => base.Capabilities | StorageCapabilities.ConditionalWrite;
 }

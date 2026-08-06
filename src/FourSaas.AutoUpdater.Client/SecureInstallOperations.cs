@@ -24,12 +24,12 @@ internal static class SecureInstallOperations
 
     public static bool Supported => OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() || OperatingSystem.IsWindows();
 
-    public static bool TryEnsureDirectory(string root, VirtualPath path)
+    public static bool TryEnsureDirectory(string root, VirtualPath path, FileIdentity? expectedParent = null)
     {
-        if (OperatingSystem.IsWindows()) return WindowsSecureInstallOperations.TryEnsureDirectory(root, path);
+        if (OperatingSystem.IsWindows()) return WindowsSecureInstallOperations.TryEnsureDirectory(root, path, expectedParent);
         if (!Supported) return false;
         using var rootHandle = OpenDirectory(root);
-        using var current = OpenOrCreateChildren(rootHandle, path.Value.Split('/'));
+        using var current = OpenOrCreateChildren(rootHandle, path.Value.Split('/'), expectedParent, path);
         return true;
     }
 
@@ -67,9 +67,9 @@ internal static class SecureInstallOperations
         return false;
     }
 
-    public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, bool executable = false, FileIdentity? expectedParent = null)
+    public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, bool executable = false, FileIdentity? expectedParent = null, bool preferHardLink = false)
     {
-        if (OperatingSystem.IsWindows()) return WindowsSecureInstallOperations.TryReplaceFile(root, path, stagedPath, expectedParent);
+        if (OperatingSystem.IsWindows()) return WindowsSecureInstallOperations.TryReplaceFile(root, path, stagedPath, expectedParent, preferHardLink);
         if (!Supported) return false;
         var components = path.Value.Split('/');
         using var rootHandle = OpenDirectory(root);
@@ -77,6 +77,15 @@ internal static class SecureInstallOperations
         VerifyParent(parent, expectedParent, path);
         var name = components[^1];
         var temporaryName = ".4sup-new-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        if (preferHardLink && !executable && LinkAt(AT_FDCWD, stagedPath, parent, temporaryName, 0) == 0)
+        {
+            try
+            {
+                if (RenameAt(parent, temporaryName, parent, name) != 0) ThrowLastError($"replace '{path}'");
+                return true;
+            }
+            finally { _ = UnlinkAt(parent, temporaryName, 0); }
+        }
         var descriptor = OpenAt(parent, temporaryName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0x1A4);
         if (descriptor < 0) ThrowLastError($"create temporary file '{path}'");
         try
@@ -125,12 +134,14 @@ internal static class SecureInstallOperations
             throw new ApplyPreconditionException($"Parent directory identity changed before mutating '{path}'.");
     }
 
-    private static SafeFileHandle OpenOrCreateChildren(SafeFileHandle root, IReadOnlyList<string> components)
+    private static SafeFileHandle OpenOrCreateChildren(SafeFileHandle root, IReadOnlyList<string> components, FileIdentity? expectedParent = null, VirtualPath? path = null)
     {
         var current = new SafeFileHandle(root.DangerousGetHandle(), ownsHandle: false);
-        foreach (var component in components)
+        for (var index = 0; index < components.Count; index++)
         {
+            var component = components[index];
             if (string.IsNullOrEmpty(component)) continue;
+            if (index == components.Count - 1 && path is not null) VerifyParent(current, expectedParent, path.Value);
             var made = MkdirAt(current, component, 0x1ED);
             if (made != 0 && Marshal.GetLastWin32Error() != EEXIST) ThrowLastError($"create managed directory '{component}'");
             var next = OpenAtHandle(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -179,5 +190,6 @@ internal static class SecureInstallOperations
     [DllImport("libc", SetLastError = true, EntryPoint = "mkdirat")] private static extern int MkdirAt(SafeFileHandle dirfd, string pathname, uint mode);
     [DllImport("libc", SetLastError = true, EntryPoint = "fchmod")] private static extern int Fchmod(int fd, uint mode);
     [DllImport("libc", SetLastError = true, EntryPoint = "renameat")] private static extern int RenameAt(SafeFileHandle olddirfd, string oldpath, SafeFileHandle newdirfd, string newpath);
+    [DllImport("libc", SetLastError = true, EntryPoint = "linkat")] private static extern int LinkAt(int olddirfd, string oldpath, SafeFileHandle newdirfd, string newpath, int flags);
     [DllImport("libc", SetLastError = true, EntryPoint = "unlinkat")] private static extern int UnlinkAt(SafeFileHandle dirfd, string pathname, int flags);
 }

@@ -95,6 +95,10 @@ which made the channel workflow unexecutable as written (review **H12**).
 4sup channel rollback fourstory.client live --sign 4s-2026     # new pointer, older release
 4sup channel show     fourstory.client live
 4sup channel yank     fourstory.client --release 2026.02.15-a --effect block-install --sign 4s-2026
+
+# Self-hosted repositories require an explicit trust-on-first-use consent.
+4sup install https://patch.example/fourstory.client@live /opt/fourstory \
+             --trusted-key=host-root:<base64url> --trust-on-first-use
 ```
 
 Each constructs the payload locally at `channelSequence + 1`, signs it, and submits the envelope

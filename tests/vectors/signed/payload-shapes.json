@@ -1,0 +1,1 @@
+{"type":"channel-pointer","expected":"exact-bytes","payloads":["{\"z\":{},\"message\":\"héllo \\\"quoted\\\" \\\\path\",\"large\":9223372036854775807,\"negative\":-9223372036854775808,\"a\":1}","{}"]}

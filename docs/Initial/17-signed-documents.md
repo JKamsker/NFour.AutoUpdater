@@ -181,6 +181,7 @@ invalidates its signature, and the API cannot author a replacement.
   "schemaVersion": 1,
   "productId": "fourstory.client",
   "revocationSequence": 7,
+  "updatedAt": "2026-02-15T20:00:00Z",
   "entries": [
     { "releaseId": "2026.02.15-a", "action": "yank",
       "effect": "block-install", "reason": "regression in ui.modern",
@@ -201,7 +202,8 @@ Never "force uninstall" — the updater does not delete a player's game because 
 yanked.
 
 `revocations.json` is class C: monotonic `revocationSequence`, signed, fetched alongside the
-channel pointer. A missing revocation document is treated as empty; a *stale* one is bounded by
+channel pointer. It carries an `updatedAt` UTC timestamp so even an empty document is
+freshness-bounded. A missing revocation document is treated as empty; a *stale* one is bounded by
 the same staleness rule as the channel pointer.
 
 ## 5. Key lifecycle

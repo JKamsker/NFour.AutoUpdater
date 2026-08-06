@@ -59,7 +59,10 @@ public sealed record VariantSelection
     public required ImmutableSortedDictionary<string, ImmutableSortedSet<string>> Axes { get; init; }
     public ImmutableSortedSet<string> this[string axis] => Axes.TryGetValue(axis, out var values) ? values : ImmutableSortedSet<string>.Empty;
     public bool Has(string axis, string value) => this[axis].Contains(value);
-    public string ToCanonicalString() => string.Join(';', Axes.Where(x => !x.Value.IsEmpty).Select(x => $"{x.Key}={string.Join(',', x.Value.OrderBy(static v => v, StringComparer.Ordinal))}"));
+    public string ToCanonicalString() => string.Join(';', Axes
+        .Where(x => !x.Value.IsEmpty)
+        .OrderBy(x => x.Key, StringComparer.Ordinal)
+        .Select(x => $"{x.Key}={string.Join(',', x.Value.OrderBy(static v => v, StringComparer.Ordinal))}"));
     public ContentHash SelectionId => ContentHash.Compute(Encoding.UTF8.GetBytes(ToCanonicalString()));
 }
 
@@ -236,6 +239,12 @@ public interface IPackageRepository
 public interface IManifestDigestRepository
 {
     ValueTask<PackageManifest?> GetManifestAsync(PackageId id, PackageVersion version, ContentHash expectedDigest, CancellationToken cancellationToken = default);
+}
+
+/// <summary>Repository implementations that can expose the immutable bytes used for a manifest digest.</summary>
+public interface IExactManifestRepository
+{
+    ValueTask<byte[]?> GetManifestBytesAsync(PackageId id, PackageVersion version, CancellationToken cancellationToken = default);
 }
 
 public interface IFileSetComposer

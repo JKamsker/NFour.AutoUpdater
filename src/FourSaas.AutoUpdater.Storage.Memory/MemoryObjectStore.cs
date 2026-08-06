@@ -17,7 +17,9 @@ public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteS
         if (!_entries.TryGetValue(key.Value, out var entry)) return ValueTask.FromResult<ReadResult?>(null);
         if (ifMatch is not null && !string.Equals(ifMatch.Value, entry.ETag, StringComparison.Ordinal))
             return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = new MemoryStream(entry.Bytes, writable: false), ActualStartOffset = 0, StatusCode = 200, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
-        if (offset < 0 || offset > entry.Bytes.LongLength) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (offset > entry.Bytes.LongLength)
+            return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = Stream.Null, ActualStartOffset = 0, StatusCode = 416, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
         return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = new MemoryStream(entry.Bytes, (int)offset, entry.Bytes.Length - (int)offset, writable: false, publiclyVisible: true), ActualStartOffset = offset, StatusCode = offset == 0 ? 200 : 206, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
     }
     public ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default) => ValueTask.FromResult(_entries.TryGetValue(key.Value, out var entry) ? new ObjectHead(entry.Bytes.LongLength, new(ObjectValidatorKind.ETag, entry.ETag), LastModified: entry.LastModified) : null);

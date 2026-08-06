@@ -1,3 +1,4 @@
+using Amazon.S3;
 using FourSaas.AutoUpdater.Storage;
 using FourSaas.AutoUpdater.Storage.S3;
 using System.Text;
@@ -6,6 +7,22 @@ namespace FourSaas.AutoUpdater.Storage.S3.Tests;
 
 public sealed class S3Tests
 {
+    [Fact]
+    public async Task ProviderProfileDoesNotAssumeBackblazeConditionalWrites()
+    {
+        using var client = new AmazonS3Client(new AmazonS3Config { ServiceURL = "http://localhost:9000", ForcePathStyle = true });
+        await using var store = new S3ObjectStore("bucket", client: client, providerProfile: S3ProviderProfile.B2);
+        Assert.Equal(S3ProviderProfile.B2, store.ProviderProfile);
+        Assert.False(store.Capabilities.HasFlag(StorageCapabilities.ConditionalWrite));
+        Assert.True(StorageCapabilityNegotiation.IsConsistent(store));
+        await Assert.ThrowsAsync<NotSupportedException>(async () => await store.PutIfAbsentAsync(new ObjectKey("object"), new MemoryStream("bytes"u8.ToArray())));
+
+        using var conditionalClient = new AmazonS3Client(new AmazonS3Config { ServiceURL = "http://localhost:9000", ForcePathStyle = true });
+        await using var conditional = new S3ConditionalObjectStore("bucket", client: conditionalClient, providerProfile: S3ProviderProfile.Minio);
+        Assert.True(conditional.Capabilities.HasFlag(StorageCapabilities.ConditionalWrite));
+        Assert.True(StorageCapabilityNegotiation.IsConsistent(conditional));
+    }
+
     [Fact]
     public async Task MinioRoundTripAndRange()
     {

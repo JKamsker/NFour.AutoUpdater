@@ -6,24 +6,20 @@ public sealed class HttpObjectStore : IReadableObjectStore
 {
     private readonly HttpClient _client;
     private readonly Uri _baseUri;
-    private readonly bool _ownsClient;
 
-    public HttpObjectStore(Uri baseUri, HttpClient? client = null)
+    public HttpObjectStore(Uri baseUri, HttpMessageHandler? handler = null)
     {
         _baseUri = new Uri(baseUri.ToString().TrimEnd('/') + "/", UriKind.Absolute);
-        if (client is null)
-        {
-            var handler = new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None };
-            _client = new HttpClient(handler);
-            _ownsClient = true;
-        }
-        else _client = client;
+        if (handler is HttpClientHandler configured)
+            configured.AutomaticDecompression = System.Net.DecompressionMethods.None;
+        _client = new HttpClient(handler ?? new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None });
     }
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range;
     public int RecommendedParallelism => 32;
 
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
+        if (offset > 0 && ifMatch is not { IsStrong: true }) offset = 0;
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_baseUri, key.Value));
         if (offset > 0) request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, null);
         if (ifMatch is { IsStrong: true }) request.Headers.IfRange = new System.Net.Http.Headers.RangeConditionHeaderValue(ifMatch.Value);
@@ -60,9 +56,11 @@ public sealed class HttpObjectStore : IReadableObjectStore
         response.EnsureSuccessStatusCode();
         var encoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
         if (encoding is not null) throw new InvalidDataException($"Blob '{key}' was served with forbidden Content-Encoding '{encoding}'.");
-        return new ObjectHead(response.Content.Headers.ContentLength ?? -1, ReadValidator(response), null, response.Content.Headers.ContentType?.MediaType, response.Headers.AcceptRanges.Contains("bytes"), response.Content.Headers.LastModified?.ToUniversalTime(), response.Headers.CacheControl?.ToString());
+        if (response.Content.Headers.ContentLength is not { } length)
+            throw new InvalidDataException($"HEAD response for blob '{key}' did not include Content-Length.");
+        return new ObjectHead(length, ReadValidator(response), null, response.Content.Headers.ContentType?.MediaType, response.Headers.AcceptRanges.Contains("bytes"), response.Content.Headers.LastModified?.ToUniversalTime(), response.Headers.CacheControl?.ToString());
     }
-    public async ValueTask DisposeAsync() { if (_ownsClient) _client.Dispose(); await ValueTask.CompletedTask; }
+    public ValueTask DisposeAsync() { _client.Dispose(); return ValueTask.CompletedTask; }
     private static ObjectValidator? ReadValidator(HttpResponseMessage response) => response.Headers.ETag is { } etag ? new(ObjectValidatorKind.ETag, etag.Tag, !etag.IsWeak) : response.Content.Headers.LastModified is { } modified ? new(ObjectValidatorKind.LastModified, modified.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture), false) : null;
 
     private sealed class ResponseStream(HttpResponseMessage response) : Stream

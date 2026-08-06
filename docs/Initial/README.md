@@ -4,9 +4,8 @@ Design documents for the 4SaaS AutoUpdater: a content-addressed, multi-backend p
 distribution and installation system for the 4Story client, 4SaaS server artifacts, and
 general-purpose deployment.
 
-**Status:** planning only. No implementation has been written. Every document here is a
-proposal open to revision; [14-open-questions.md](14-open-questions.md) lists the decisions
-that need a human answer before implementation starts.
+**Status:** implementation baseline. The repository is being reconciled against this normative
+document set; deferred features remain explicitly listed in [14-open-questions.md](14-open-questions.md).
 
 ## Reading order
 

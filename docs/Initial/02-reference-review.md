@@ -86,21 +86,15 @@ means the state travels with the artifact through any copy mechanism — robocop
 an FTP mirror. `AddFileAsync` hard-fails outside `Editing`. Kept, with the transition made an
 atomic whole-manifest replace instead of an in-place field flip.
 
-### 1.10 The service/process "ticket" pattern
+### 1.10 The service/process "ticket" pattern (out of scope)
 
-A small object capturing pre-mutation state (`OriginalStartType`, `OriginalStatus`,
-`WasRunning`, `SessionId`) at construction, exposing `Restore*` verbs, combined with
-`RestartBehavior { Never, WhenStarted, Always }`. It makes "leave the machine as you found it"
-the default rather than an afterthought.
-
-Best detail in the whole reference: **setting a Windows service's `StartType` to `Manual`
-before stopping it**, so the SCM cannot auto-restart it mid-patch, then restoring it after.
-Three lines; prevents a real class of corruption. Kept verbatim in spirit.
+The reference captured and restored service or process state around a patch. 4sup does not carry
+this capability: it neither controls Windows services nor stops, restarts, or inspects processes.
 
 ### 1.11 Self-update via versioned directories
 
-Install to `Bin\{version}\`, repoint a `Bin\latest` symlink, rewrite the SCM `BinaryPath`,
-then `Environment.Exit(1)` into the configured SCM failure action. The updater never writes
+Install to `Bin\{version}\`, repoint a `Bin\latest` symlink, then exit into the configured
+host-process failure action. The updater never writes
 over the binary it is executing, and the same mechanism is a ready-made rollback primitive.
 The shape is kept; the fragility is not (see §2.9).
 
@@ -113,8 +107,8 @@ real unit tests. Carried over essentially verbatim.
 
 ### 1.13 Descriptor-in-the-payload
 
-The patch carries its own `.autoupdate.yaml` declaring services to stop, applications to
-restart, file rules and post-install scripts, validated at publish time by an `IFileValidator`.
+The patch carries its own `.autoupdate.yaml` declaring applications to stop or restart, file
+rules and post-install scripts, validated at publish time by an `IFileValidator`.
 The server needs no per-product knowledge. The principle — *policy travels with the artifact* —
 is kept and is where install policy lives in the new design.
 

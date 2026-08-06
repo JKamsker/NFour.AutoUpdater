@@ -3,6 +3,8 @@ using FourSaas.AutoUpdater.Core;
 using FourSaas.AutoUpdater.Repository;
 using FourSaas.AutoUpdater.Storage;
 using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 namespace FourSaas.AutoUpdater.Client.Tests;
 
@@ -28,7 +30,7 @@ public sealed class ClientTests
             var observed = await new LocalTreeScanner().ScanAsync(root, [], [path], HashPolicy.Never);
             var plan = new InstallPlanner().Plan(target, null, observed);
             var installLock = new InstallLock { RepositoryUri = "memory://test", ProductId = "product", Channel = "live", ReleaseId = "r1", ReleaseDigest = ContentHash.Compute("release"u8), Selection = new VariantSelection { Axes = ImmutableSortedDictionary<string, ImmutableSortedSet<string>>.Empty }, SelectionId = ContentHash.Compute([]), FileSetId = target.FileSetId, AppliedAt = DateTimeOffset.UtcNow };
-            await new InstallApplier().ApplyAsync(root, plan, target, installLock, store, layout, new InstallLedger(root));
+            await new InstallApplier().ApplyAsync(root, plan, target, installLock, store, layout, new InstallLedger(root), preconditions: new ApplyPreconditions());
             Assert.Equal("verified-content", await File.ReadAllTextAsync(Path.Combine(root, "bin", "game.exe")));
             var ledgerText = await File.ReadAllTextAsync(Path.Combine(root, ".4sup", "state.jsonl"));
             Assert.Contains("\"k\":\"lock\"", ledgerText, StringComparison.Ordinal);
@@ -78,6 +80,29 @@ public sealed class ClientTests
     }
 
     [Fact]
+    public async Task BlobFetcherResumesAfterAnInjectedReadFailure()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "4sup-fault-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            await using var inner = new FourSaas.AutoUpdater.Storage.Memory.MemoryObjectStore();
+            var bytes = Enumerable.Range(0, 128).Select(x => (byte)x).ToArray();
+            var hash = ContentHash.Compute(bytes);
+            var key = new ObjectKey("blobs/sha256/00/00/" + Convert.ToHexString(hash.Value.Span).ToLowerInvariant());
+            await inner.PutAsync(key, new MemoryStream(bytes, writable: false), bytes.Length);
+            await using var faulty = new FaultyObjectStore(inner) { FailAfterBytes = 17 };
+            var staging = Path.Combine(root, "blob");
+            await Assert.ThrowsAsync<IOException>(() => new BlobFetcher().FetchAsync(faulty, key, hash, staging).AsTask());
+            Assert.InRange(new FileInfo(staging).Length, 17, 85);
+            faulty.FailAfterBytes = null;
+            Assert.Equal(bytes.Length, await new BlobFetcher().FetchAsync(faulty, key, hash, staging));
+            Assert.Equal(bytes, await File.ReadAllBytesAsync(staging));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public async Task LedgerReadDoesNotCreateInstallMetadata()
     {
         var root = Path.Combine(Path.GetTempPath(), "4sup-readonly-" + Guid.NewGuid().ToString("N"));
@@ -109,7 +134,7 @@ public sealed class ClientTests
             var observed = await new LocalTreeScanner().ScanAsync(root, [], [path], HashPolicy.Never);
             var plan = new InstallPlanner().Plan(target, null, observed);
             var installLock = new InstallLock { RepositoryUri = "memory://test", ProductId = "product", Channel = "live", ReleaseId = "r1", ReleaseDigest = ContentHash.Compute("release"u8), Selection = new VariantSelection { Axes = ImmutableSortedDictionary<string, ImmutableSortedSet<string>>.Empty }, SelectionId = ContentHash.Compute([]), FileSetId = target.FileSetId, AppliedAt = DateTimeOffset.UtcNow };
-            await Assert.ThrowsAsync<IOException>(async () => await new InstallApplier().ApplyAsync(root, plan, target, installLock, store, layout, new InstallLedger(root)));
+            await Assert.ThrowsAsync<IOException>(async () => await new InstallApplier().ApplyAsync(root, plan, target, installLock, store, layout, new InstallLedger(root), preconditions: new ApplyPreconditions()));
             Assert.False(File.Exists(Path.Combine(outside, "game.exe")));
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); if (Directory.Exists(outside)) Directory.Delete(outside, true); }
@@ -131,5 +156,100 @@ public sealed class ClientTests
             Assert.False(File.Exists(cache.GetPath(hash)));
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public async Task NamedPipeIpcSupportsAuthenticatedStreamingFrames()
+    {
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsWindows()) return;
+        var pipe = "4sup-test-" + Guid.NewGuid().ToString("N");
+        var router = new IpcRouter().Register("/progress", Stream);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var server = new NamedPipeIpcServer(pipe, router);
+        var serverTask = server.RunAsync(cancellation.Token);
+        try
+        {
+            await using var client = new NamedPipeIpcTransport(pipe);
+            using var payload = JsonDocument.Parse("{\"job\":\"demo\"}");
+            var frames = new List<string>();
+            await foreach (var frame in client.StreamAsync("progress", payload.RootElement.Clone(), cancellation.Token))
+                frames.Add(frame.GetProperty("step").GetString()!);
+            Assert.Equal(["one", "two"], frames);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { await serverTask; } catch (OperationCanceledException) { }
+        }
+
+        static async IAsyncEnumerable<JsonElement> Stream(JsonElement payload, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            yield return JsonSerializer.SerializeToElement(new { step = "one" });
+            yield return JsonSerializer.SerializeToElement(new { step = "two" });
+        }
+    }
+
+    private sealed class FaultyObjectStore(IReadableObjectStore inner) : IReadableObjectStore
+    {
+        public int? FailAfterBytes { get; set; }
+        public bool IgnoreRange { get; init; }
+        public StorageCapabilities Capabilities => inner.Capabilities;
+        public int RecommendedParallelism => inner.RecommendedParallelism;
+
+        public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
+        {
+            var result = await inner.OpenAsync(key, IgnoreRange ? 0 : offset, ifMatch, cancellationToken).ConfigureAwait(false);
+            if (result is null || FailAfterBytes is null) return result;
+            return new ReadResult
+            {
+                Content = new FaultyStream(result.Content, FailAfterBytes.Value),
+                ActualStartOffset = result.ActualStartOffset,
+                StatusCode = result.StatusCode,
+                Validator = result.Validator,
+                ContentEncoding = result.ContentEncoding
+            };
+        }
+
+        public ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default) => inner.HeadAsync(key, cancellationToken);
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private sealed class FaultyStream(Stream inner, int failAfter) : Stream
+        {
+            private int _read;
+            public override bool CanRead => inner.CanRead;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => inner.Length;
+            public override long Position { get => inner.Position; set => throw new NotSupportedException(); }
+            public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+            public override int Read(Span<byte> buffer)
+            {
+                if (_read >= failAfter) throw new IOException("Injected read failure.");
+                var allowed = Math.Min(buffer.Length, failAfter - _read);
+                var read = inner.Read(buffer[..allowed]);
+                _read += read;
+                return read;
+            }
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                if (_read >= failAfter) throw new IOException("Injected read failure.");
+                var allowed = Math.Min(buffer.Length, failAfter - _read);
+                var read = await inner.ReadAsync(buffer[..allowed], cancellationToken).ConfigureAwait(false);
+                _read += read;
+                return read;
+            }
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+            public override void Flush() => throw new NotSupportedException();
+            public override Task FlushAsync(CancellationToken cancellationToken) => Task.FromException(new NotSupportedException());
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+            public override void Write(ReadOnlySpan<byte> buffer) => throw new NotSupportedException();
+            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => Task.FromException(new NotSupportedException());
+            public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) => ValueTask.FromException(new NotSupportedException());
+            protected override void Dispose(bool disposing) { if (disposing) inner.Dispose(); base.Dispose(disposing); }
+            public override ValueTask DisposeAsync() { inner.Dispose(); return ValueTask.CompletedTask; }
+        }
     }
 }

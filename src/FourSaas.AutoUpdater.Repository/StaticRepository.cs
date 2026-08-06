@@ -2,7 +2,7 @@ using System.IO.Hashing;
 
 namespace FourSaas.AutoUpdater.Repository;
 
-public sealed class StaticRepository : IPackageRepository, IManifestDigestRepository, IAsyncDisposable
+public sealed class StaticRepository : IPackageRepository, IManifestDigestRepository, IExactManifestRepository, IAsyncDisposable
 {
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private readonly IReadableObjectStore _store;
@@ -21,6 +21,20 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
     public async ValueTask<PackageManifest?> GetManifestAsync(PackageId id, PackageVersion version, ContentHash expectedDigest, CancellationToken cancellationToken = default)
         => await GetManifestCoreAsync(id, version, expectedDigest, cancellationToken).ConfigureAwait(false);
 
+    public async ValueTask<byte[]?> GetManifestBytesAsync(PackageId id, PackageVersion version, CancellationToken cancellationToken = default)
+    {
+        var result = await _store.OpenAsync(Layout.Package(id, version), cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (result is null) return null;
+        await using (result.ConfigureAwait(false))
+        {
+            var bytes = await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false);
+            var manifest = RepositoryJson.DeserializeManifest(bytes);
+            if (manifest.Id != id || !string.Equals(manifest.Version.Label, version.Label, StringComparison.Ordinal) || manifest.Sequence != version.Sequence)
+                throw new InvalidDataException($"Manifest identity does not match requested package '{id}@{version}'.");
+            return bytes;
+        }
+    }
+
     private async ValueTask<PackageManifest?> GetManifestCoreAsync(PackageId id, PackageVersion version, ContentHash? expectedDigest, CancellationToken cancellationToken)
     {
         var result = await _store.OpenAsync(Layout.Package(id, version), cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -31,7 +45,7 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
             if (expectedDigest is { } digest && ContentHash.Compute(bytes) != digest) throw new CryptographicException($"Manifest '{id}@{version}' failed its digest check.");
             var manifest = RepositoryJson.DeserializeManifest(bytes);
             if (manifest.SchemaVersion != 1) throw new FormatException($"Unsupported package schemaVersion {manifest.SchemaVersion}.");
-            if (manifest.Id != id || !string.Equals(manifest.Version.Label, version.Label, StringComparison.Ordinal) || manifest.Version.Sequence != version.Sequence)
+            if (manifest.Id != id || !string.Equals(manifest.Version.Label, version.Label, StringComparison.Ordinal) || manifest.Sequence != version.Sequence)
                 throw new InvalidDataException($"Manifest identity does not match requested package '{id}@{version}'.");
             return manifest;
         }
@@ -54,22 +68,18 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
             var result = await _store.OpenAsync(Layout.Blob(shard.Digest), cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException($"Missing file-table shard {shard.Digest}.");
             await using (result.ConfigureAwait(false))
             {
-                var bytes = await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false);
-                if (ContentHash.Compute(bytes) != shard.Digest) throw new InvalidDataException($"File-table shard {shard.Digest} failed its digest check.");
-                if (bytes.LongLength != shard.Size) throw new InvalidDataException($"File-table shard {shard.Index} size does not match its declaration.");
+                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                await using var hashing = new HashingReadStream(result.Content, hash);
+                using var reader = new StreamReader(hashing, StrictUtf8, detectEncodingFromByteOrderMarks: false, bufferSize: 64 * 1024, leaveOpen: true);
                 var shardCount = 0;
-                string text;
-                try { text = StrictUtf8.GetString(bytes); }
-                catch (DecoderFallbackException ex) { throw new FormatException($"File-table shard {shard.Index} is not valid UTF-8.", ex); }
-                var lines = text.Split('\n');
                 string? previousPath = null;
-                for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
+                while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
                 {
-                    var line = lines[lineIndex];
-                    if (lineIndex == lines.Length - 1 && line.Length == 0 && text.EndsWith('\n')) continue;
                     if (string.IsNullOrWhiteSpace(line)) throw new FormatException($"File-table shard {shard.Index} contains a blank JSONL line.");
-                    var jsonLine = line.EndsWith('\r') ? line[..^1] : line;
-                    var dto = RepositoryJson.Deserialize<FileEntryDocument>(StrictUtf8.GetBytes(jsonLine));
+                    // File-table rows are derived Class-D data.  Forward-compatible
+                    // readers ignore fields introduced by newer publishers while
+                    // retaining strict validation of the fields used below.
+                    var dto = RepositoryJson.Deserialize<FileEntryDocument>(StrictUtf8.GetBytes(line));
                     if (!VirtualPath.TryCreate(dto.Path, out var path, out var error)) throw new FormatException(error);
                     if (!seenPaths.Add(path)) throw new InvalidDataException($"File table contains duplicate path '{path}'.");
                     if (seenFoldedPaths.TryGetValue(path.FoldedKey, out var folded) && folded != path) throw new InvalidDataException($"File table contains a case-only path collision between '{folded}' and '{path}'.");
@@ -96,6 +106,8 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
                     shardCount++;
                     totalCount++;
                 }
+                if (hashing.BytesRead != shard.Size) throw new InvalidDataException($"File-table shard {shard.Index} size does not match its declaration.");
+                if (new ContentHash(HashAlgorithmId.Sha256, hash.GetHashAndReset()) != shard.Digest) throw new InvalidDataException($"File-table shard {shard.Digest} failed its digest check.");
                 if (shardCount != shard.Count) throw new InvalidDataException($"File-table shard {shard.Index} count does not match its declaration.");
             }
         }
@@ -104,6 +116,19 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
 
     public ValueTask DisposeAsync() => _store.DisposeAsync();
     private static async ValueTask<byte[]> ReadAllAsync(Stream source, CancellationToken cancellationToken) { using var target = new MemoryStream(); await source.CopyToAsync(target, cancellationToken).ConfigureAwait(false); return target.ToArray(); }
+
+    private sealed class HashingReadStream(Stream inner, IncrementalHash hash) : Stream
+    {
+        public long BytesRead { get; private set; }
+        public override int Read(byte[] buffer, int offset, int count) { var read = inner.Read(buffer, offset, count); Append(buffer.AsSpan(offset, read)); return read; }
+        public override int Read(Span<byte> buffer) { var read = inner.Read(buffer); Append(buffer[..read]); return read; }
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) { var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false); Append(buffer.Span[..read]); return read; }
+        private void Append(ReadOnlySpan<byte> bytes) { if (bytes.IsEmpty) return; hash.AppendData(bytes); BytesRead += bytes.Length; }
+        protected override void Dispose(bool disposing) { if (disposing) inner.Dispose(); base.Dispose(disposing); }
+        public override ValueTask DisposeAsync() { inner.Dispose(); return ValueTask.CompletedTask; }
+        public override bool CanRead => inner.CanRead; public override bool CanSeek => false; public override bool CanWrite => false; public override long Length => inner.Length; public override long Position { get => inner.Position; set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException(); public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException(); public override void SetLength(long value) => throw new NotSupportedException(); public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException(); public override void Write(ReadOnlySpan<byte> buffer) => throw new NotSupportedException(); public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => throw new NotSupportedException(); public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
 
     private sealed record FileEntryDocument
     {

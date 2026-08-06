@@ -1,4 +1,7 @@
 using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Runtime.Versioning;
 
 namespace FourSaas.AutoUpdater.Client;
 
@@ -37,10 +40,11 @@ public sealed record ApplyPreconditions
             requiredByVolume = requiredByVolume.SetItem(rootVolume, Math.Max(requiredByVolume.TryGetValue(rootVolume, out var existing) ? existing : 0, minimumFreeSpace));
         }
 
-        if (!OperatingSystem.IsWindows() && IsElevated() && Directory.Exists(root))
+        if (IsElevated() && Directory.Exists(root))
         {
-            var mode = File.GetUnixFileMode(root);
-            if ((mode & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) != 0)
+            if (OperatingSystem.IsWindows() && IsWindowsUserWritable(root))
+                throw new ApplyPreconditionException("An elevated updater will not mutate a user-writable install root.");
+            if (!OperatingSystem.IsWindows() && (File.GetUnixFileMode(root) & (UnixFileMode.GroupWrite | UnixFileMode.OtherWrite)) != 0)
                 throw new ApplyPreconditionException("An elevated updater will not mutate a group- or world-writable install root.");
         }
 
@@ -75,8 +79,44 @@ public sealed record ApplyPreconditions
 
     private static bool IsElevated()
     {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var identity = WindowsIdentity.GetCurrent();
+                return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+            }
+            catch (PlatformNotSupportedException) { return false; }
+        }
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return false;
         try { return GetEffectiveUserId() == 0; } catch (DllNotFoundException) { return false; } catch (EntryPointNotFoundException) { return false; }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool IsWindowsUserWritable(string root)
+    {
+        try
+        {
+            var security = new DirectoryInfo(root).GetAccessControl(AccessControlSections.Access);
+            var broadPrincipals = new HashSet<SecurityIdentifier>
+            {
+                new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null)
+            };
+            const FileSystemRights writeRights = FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.CreateFiles | FileSystemRights.CreateDirectories | FileSystemRights.Modify | FileSystemRights.FullControl;
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                if (rule.AccessControlType == AccessControlType.Allow && broadPrincipals.Contains((SecurityIdentifier)rule.IdentityReference) && (rule.FileSystemRights & writeRights) != 0)
+                    return true;
+            }
+            return false;
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or UnauthorizedAccessException or IOException)
+        {
+            // An elevated install must fail closed if its ACL cannot be inspected.
+            return true;
+        }
     }
 
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "geteuid")]

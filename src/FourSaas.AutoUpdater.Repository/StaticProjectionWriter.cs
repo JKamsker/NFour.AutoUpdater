@@ -9,10 +9,21 @@ namespace FourSaas.AutoUpdater.Repository;
 /// </summary>
 public sealed class StaticProjectionWriter(IWritableObjectStore store, RepositoryLayout layout)
 {
+    private const int ProjectionPageSize = 1000;
     public ValueTask WriteRepositoryDescriptorAsync(RepositoryDescriptor descriptor, CancellationToken cancellationToken = default)
         => WriteDerivedAsync(new ObjectKey("repo.json"), RepositoryJson.Serialize(descriptor), cancellationToken);
 
-    public async ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
+    public ValueTask WriteProductAsync(ProductDescriptor product, CancellationToken cancellationToken = default)
+    {
+        if (!Identifier.IsValid(product.ProductId, 128)) throw new FormatException("Product id must be a valid lowercase ASCII segment.");
+        if (product.SchemaVersion != 1) throw new FormatException($"Unsupported product schemaVersion {product.SchemaVersion}.");
+        return WriteDerivedAsync(layout.Product(product.ProductId), RepositoryJson.Serialize(product), cancellationToken);
+    }
+
+    public ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
+        => WritePackageIndexAsync(packageId, manifests, exactManifestBytes: null, cancellationToken);
+
+    public async ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
     {
         var versions = manifests
             .Where(x => x.Id == packageId)
@@ -23,14 +34,21 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
                 Version = x.Version.Label,
                 Sequence = x.Sequence == 0 ? x.Version.Sequence : x.Sequence,
                 ManifestPath = layout.Package(x.Id, x.Version).Value,
-                ManifestDigest = ContentHash.Compute(RepositoryJson.SerializeManifest(x)),
+                ManifestDigest = exactManifestBytes is not null && exactManifestBytes.TryGetValue(x.Id, out var exactBytes)
+                    ? ContentHash.Compute(exactBytes)
+                    : ContentHash.Compute(RepositoryJson.SerializeManifest(x)),
                 FileCount = x.FileCount,
                 InstallSize = x.InstallSize,
                 DownloadSize = x.DownloadSize
             })
             .ToArray();
-        var document = new PackageIndexDocument { SchemaVersion = 1, PackageId = packageId.Value, Versions = versions };
-        await WriteDerivedAsync(layout.PackageIndex(packageId), RepositoryJson.Serialize(document), cancellationToken).ConfigureAwait(false);
+        var pages = versions.Length == 0 ? [Array.Empty<PackageIndexVersion>()] : versions.Chunk(ProjectionPageSize).Select(page => page.ToArray()).ToArray();
+        for (var page = 0; page < pages.Length; page++)
+        {
+            var bytes = RepositoryJson.Serialize(new PackageIndexDocument { SchemaVersion = 1, PackageId = packageId.Value, Versions = pages[page] });
+            await WriteDerivedAsync(layout.PackageIndex(packageId, page), bytes, cancellationToken).ConfigureAwait(false);
+        }
+        await DeleteStalePagesAsync(page => layout.PackageIndex(packageId, page), pages.Length, cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask WriteReleaseIndexAsync(string productId, IEnumerable<(ReleaseLock Lock, byte[] EnvelopeBytes)> releases, CancellationToken cancellationToken = default)
@@ -49,17 +67,28 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
                 CreatedAt = x.Lock.CreatedAt
             })
             .ToArray();
-        await WriteDerivedAsync(layout.ReleaseIndex(productId), RepositoryJson.Serialize(new ReleaseIndexDocument { SchemaVersion = 1, ProductId = productId, Releases = rows }), cancellationToken).ConfigureAwait(false);
+        var pages = rows.Length == 0 ? [Array.Empty<ReleaseIndexRow>()] : rows.Chunk(ProjectionPageSize).Select(page => page.ToArray()).ToArray();
+        for (var page = 0; page < pages.Length; page++)
+        {
+            var bytes = RepositoryJson.Serialize(new ReleaseIndexDocument { SchemaVersion = 1, ProductId = productId, Releases = pages[page] });
+            await WriteDerivedAsync(layout.ReleaseIndex(productId, page), bytes, cancellationToken).ConfigureAwait(false);
+        }
+        await DeleteStalePagesAsync(page => layout.ReleaseIndex(productId, page), pages.Length, cancellationToken).ConfigureAwait(false);
     }
 
-    public async ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
+    public ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
+        => WriteReleaseBundleAsync(productId, releaseId, lockEnvelopeBytes, manifests, exactManifestBytes: null, cancellationToken);
+
+    public async ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
     {
         var envelope = SignedDocument.DeserializeEnvelope(lockEnvelopeBytes.Span);
         if (!string.Equals(envelope.Type, "release-lock", StringComparison.Ordinal)) throw new InvalidDataException("A release bundle requires a release-lock envelope.");
         var inline = new SortedDictionary<string, JsonElement>(StringComparer.Ordinal);
         foreach (var manifest in manifests.OrderBy(x => x.Id.Value, StringComparer.Ordinal))
         {
-            var bytes = RepositoryJson.SerializeManifest(manifest);
+            var bytes = exactManifestBytes is not null && exactManifestBytes.TryGetValue(manifest.Id, out var exactBytes)
+                ? exactBytes
+                : RepositoryJson.SerializeManifest(manifest);
             using var document = JsonDocument.Parse(bytes);
             inline.Add(manifest.Id.Value, document.RootElement.Clone());
         }
@@ -90,6 +119,17 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
             if (await conditional.CompareAndSwapAsync(key, head.Validator, replacement, bytes.LongLength, cancellationToken).ConfigureAwait(false)) return;
         }
         throw new IOException($"Could not update derived projection '{key}' after concurrent-write retries.");
+    }
+
+    private async ValueTask DeleteStalePagesAsync(Func<int, ObjectKey> keyFactory, int firstStalePage, CancellationToken cancellationToken)
+    {
+        if (store is not IWritableObjectStore writable) return;
+        for (var page = firstStalePage; page < firstStalePage + 4096; page++)
+        {
+            var key = keyFactory(page);
+            if (await store.HeadAsync(key, cancellationToken).ConfigureAwait(false) is null) break;
+            await writable.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private sealed record PackageIndexDocument

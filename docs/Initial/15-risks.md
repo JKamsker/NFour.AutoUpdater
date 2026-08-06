@@ -380,9 +380,8 @@ the plan must not drop it; equally, the reference's unconditional
 `Process.Kill(entireProcessTree: true)` of every handle holder will happily kill `explorer.exe`
 or an antivirus scanner.
 
-**Mitigation** — [07](07-client-engine.md) §4: the ticket pattern, service `StartType → Manual`
-before stop, and an explicit per-file `LockedFilePolicy` ladder. Restart Manager is used to
-*identify* holders for the error message, never to terminate them.
+**Mitigation** — [07](07-client-engine.md) §4: an explicit per-file `LockedFilePolicy` ladder.
+Service and process control, including holder inspection, is outside 4sup's scope.
 
 ---
 

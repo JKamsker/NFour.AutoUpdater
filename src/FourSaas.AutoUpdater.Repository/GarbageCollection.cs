@@ -91,8 +91,8 @@ public sealed class GarbageCollector
             cancellationToken.ThrowIfCancellationRequested();
             marked.Add(pin.ManifestDigest);
             var manifest = repository is IManifestDigestRepository digestRepository
-                ? await digestRepository.GetManifestAsync(pin.Id, pin.Version, pin.ManifestDigest, cancellationToken).ConfigureAwait(false)
-                : await repository.GetManifestAsync(pin.Id, pin.Version, cancellationToken).ConfigureAwait(false);
+                ? await digestRepository.GetManifestAsync(pin.Id, new PackageVersion(pin.Version.Label, pin.Sequence), pin.ManifestDigest, cancellationToken).ConfigureAwait(false)
+                : await repository.GetManifestAsync(pin.Id, new PackageVersion(pin.Version.Label, pin.Sequence), cancellationToken).ConfigureAwait(false);
             if (manifest is null) throw new InvalidDataException($"Missing manifest for live package '{pin.Id}@{pin.Version}'.");
             VerifyManifestPin(pin, manifest);
             marked.Add(manifest.FileTable.Digest);
@@ -106,7 +106,7 @@ public sealed class GarbageCollector
     private static void VerifyManifestPin(LockedPackage pin, PackageManifest manifest)
     {
         if (manifest.SchemaVersion != 1) throw new FormatException($"Unsupported package schemaVersion {manifest.SchemaVersion} for '{pin.Id}@{pin.Version}'.");
-        if (manifest.Id != pin.Id || !string.Equals(manifest.Version.Label, pin.Version.Label, StringComparison.Ordinal) || manifest.Version.Sequence != pin.Version.Sequence)
+            if (manifest.Id != pin.Id || !string.Equals(manifest.Version.Label, pin.Version.Label, StringComparison.Ordinal) || manifest.Sequence != pin.Sequence)
             throw new InvalidDataException($"Manifest identity does not match live package '{pin.Id}@{pin.Version}'.");
         if (ContentHash.Compute(RepositoryJson.SerializeManifest(manifest)) != pin.ManifestDigest)
             throw new CryptographicException($"Manifest '{pin.Id}@{pin.Version}' failed its pinned digest.");
@@ -126,5 +126,18 @@ public sealed class GarbageCollector
         var result = await store.OpenAsync(source, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
         await using (result.ConfigureAwait(false))
             await store.PutAsync(destination, result.Content, length, cancellationToken).ConfigureAwait(false);
+
+        // A streamed quarantine copy is not trusted merely because PUT
+        // succeeded. Verify the CAS identity before the caller removes source.
+        var partsForDigest = source.Value.Split('/');
+        if (partsForDigest.Length > 1 && ContentHash.TryParse(partsForDigest[1] + ":" + Path.GetFileName(source.Value), out var expectedDigest))
+        {
+            var quarantined = await store.OpenAsync(destination, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(destination.Value);
+            await using (quarantined.ConfigureAwait(false))
+            {
+                var actual = await ContentHash.ComputeAsync(quarantined.Content, expectedDigest.Algorithm, cancellationToken).ConfigureAwait(false);
+                if (actual != expectedDigest) throw new CryptographicException($"Quarantined object '{destination}' failed verification.");
+            }
+        }
     }
 }

@@ -1,0 +1,1 @@
+{"schemaVersion":1,"productId":"beta.product","releases":[{"releaseId":"beta-1","sequence":1,"lockPath":"products/beta.product/releases/beta-1/release.lock.json","lockDigest":"sha256:b42684eb91e49ea15f338e33b7dff5f3a35b691ea20e9ed128694839ef79c6c6","coverageDigest":"sha256:a1493db6bba8d021c2c6e0a9f93866fe4e3c58ebdbc0728b34d4f92e0eab1d97","createdAt":"2026-01-01T00:00:00Z"}]}

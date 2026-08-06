@@ -18,6 +18,8 @@ public sealed class ManagementApiClient : IAsyncDisposable
     public ManagementApiClient(Uri apiBase, string? bearerToken = null, HttpClient? client = null)
     {
         if (!apiBase.IsAbsoluteUri || apiBase.Scheme is not ("http" or "https")) throw new ArgumentException("The management API base must be an absolute HTTP(S) URI.", nameof(apiBase));
+        if (apiBase.Scheme == "http" && !string.Equals(Environment.GetEnvironmentVariable("FOURSUP_INSECURE_TRANSPORT"), "1", StringComparison.Ordinal))
+            throw new UnauthorizedAccessException("The management API must use HTTPS; set FOURSUP_INSECURE_TRANSPORT=1 only for local development.");
         _apiRoot = new Uri(apiBase.ToString().TrimEnd('/') + "/api/v1/", UriKind.Absolute);
         _bearer = bearerToken;
         _client = client ?? new HttpClient(new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None });
@@ -70,6 +72,14 @@ public sealed class ManagementApiClient : IAsyncDisposable
             var headers = item.TryGetProperty("requiredHeaders", out var headerElements) && headerElements.ValueKind == JsonValueKind.Array
                 ? headerElements.EnumerateArray().Select(x => new HttpHeaderRequirement(x.GetProperty("name").GetString()!, x.GetProperty("value").GetString()!)).ToImmutableArray()
                 : [];
+            var multipartParts = item.TryGetProperty("parts", out var partElements) && partElements.ValueKind == JsonValueKind.Array
+                ? partElements.EnumerateArray().Select(part => new ApiPresignedPart(
+                    part.GetProperty("number").GetInt32(),
+                    ParseStorageUri(part.GetProperty("uri").GetString()!),
+                    part.TryGetProperty("requiredHeaders", out var partHeaders) && partHeaders.ValueKind == JsonValueKind.Array
+                        ? partHeaders.EnumerateArray().Select(x => new HttpHeaderRequirement(x.GetProperty("name").GetString()!, x.GetProperty("value").GetString()!)).ToImmutableArray()
+                        : [])).ToImmutableArray()
+                : [];
             result.Add(new ApiUploadGrant(
                 item.GetProperty("grantId").GetString()!,
                 new ObjectKey(item.GetProperty("stagingKey").GetString()!),
@@ -78,13 +88,25 @@ public sealed class ManagementApiClient : IAsyncDisposable
                 item.GetProperty("expiresAt").GetDateTimeOffset(),
                 ParseUploadUri(item),
                 item.TryGetProperty("enforcement", out var enforcement) ? enforcement.GetString() ?? "serverVerified" : "serverVerified", headers,
-                item.TryGetProperty("localPath", out var localPath) && localPath.ValueKind == JsonValueKind.String ? localPath.GetString() : null));
+                item.TryGetProperty("localPath", out var localPath) && localPath.ValueKind == JsonValueKind.String ? localPath.GetString() : null,
+                item.TryGetProperty("multipartUploadId", out var uploadId) && uploadId.ValueKind == JsonValueKind.String ? uploadId.GetString() : null,
+                item.TryGetProperty("partSize", out var partSize) && partSize.TryGetInt64(out var size) ? size : null,
+                multipartParts,
+                item.TryGetProperty("completePath", out var completePath) && completePath.ValueKind == JsonValueKind.String ? completePath.GetString() : null,
+                item.TryGetProperty("abortPath", out var abortPath) && abortPath.ValueKind == JsonValueKind.String ? abortPath.GetString() : null));
         }
         return result;
     }
 
     public async ValueTask UploadAsync(ApiUploadGrant grant, Stream content, long length, CancellationToken cancellationToken = default)
     {
+        if (DateTimeOffset.UtcNow >= grant.ExpiresAt) throw new InvalidDataException($"Upload grant '{grant.GrantId}' has expired.");
+        if (length != grant.ExpectedLength) throw new InvalidDataException($"Upload grant '{grant.GrantId}' expects {grant.ExpectedLength} bytes, received {length}.");
+        if (grant.IsMultipart)
+        {
+            await UploadMultipartAsync(grant, content, length, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         if (grant.UploadUri is null)
         {
             if (grant.LocalPath is null) throw new IOException($"Grant '{grant.GrantId}' did not provide a direct storage grant; this client cannot safely send payload bytes through the management API.");
@@ -108,9 +130,58 @@ public sealed class ManagementApiClient : IAsyncDisposable
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Uploads each part directly to its presigned storage URL and sends only the resulting
+    /// ETags to the management API for completion.  The payload never enters the API path.
+    /// </summary>
+    public async ValueTask UploadMultipartAsync(ApiUploadGrant grant, Stream content, long length, CancellationToken cancellationToken = default)
+    {
+        if (!grant.IsMultipart || grant.MultipartPartSize is not { } partSize || grant.MultipartParts.IsDefaultOrEmpty || grant.CompletePath is null)
+            throw new ArgumentException("The grant is not a complete multipart grant.", nameof(grant));
+        if (DateTimeOffset.UtcNow >= grant.ExpiresAt) throw new InvalidDataException($"Upload grant '{grant.GrantId}' has expired.");
+        if (length != grant.ExpectedLength) throw new InvalidDataException($"Upload grant '{grant.GrantId}' expects {grant.ExpectedLength} bytes, received {length}.");
+
+        try
+        {
+            var completed = new List<object>(grant.MultipartParts.Length);
+            long remaining = length;
+            foreach (var part in grant.MultipartParts.OrderBy(x => x.Number))
+            {
+                var expectedPartLength = Math.Min(partSize, remaining);
+                if (expectedPartLength <= 0) throw new InvalidDataException($"Multipart grant '{grant.GrantId}' contains too many parts.");
+                await using var partContent = await ReadExactlyAsync(content, expectedPartLength, cancellationToken).ConfigureAwait(false);
+                var etag = await UploadPartAsync(part, partContent, expectedPartLength, cancellationToken).ConfigureAwait(false);
+                completed.Add(new { number = part.Number, etag });
+                remaining -= expectedPartLength;
+            }
+            if (remaining != 0 || await HasMoreBytesAsync(content, cancellationToken).ConfigureAwait(false))
+                throw new InvalidDataException($"Multipart grant '{grant.GrantId}' did not describe exactly the supplied payload.");
+
+            var payload = JsonSerializer.SerializeToUtf8Bytes(new { parts = completed });
+            using var response = await SendAsync(HttpMethod.Post, grant.CompletePath, new ByteArrayContent(payload) { Headers = { ContentType = new MediaTypeHeaderValue("application/json") } }, cancellationToken).ConfigureAwait(false);
+            await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Keep the multipart upload alive.  S3 part numbers are idempotent,
+            // so a caller can retry the same grant after a transient failure and
+            // overwrite only the affected parts before completing it.  Explicit
+            // abort remains available through AbortMultipartGrantAsync and the
+            // server's incomplete-upload garbage collector.
+            throw;
+        }
+    }
+
     public async ValueTask SealAsync(string repository, string sessionId, CancellationToken cancellationToken = default)
     {
         using var response = await SendAsync(HttpMethod.Post, $"repositories/{Segment(repository)}/publish/sessions/{Segment(sessionId)}/seal", null, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask AbortMultipartAsync(ApiUploadGrant grant, CancellationToken cancellationToken = default)
+    {
+        if (!grant.IsMultipart || grant.AbortPath is null) throw new ArgumentException("The grant does not expose a multipart abort operation.", nameof(grant));
+        using var response = await SendAsync(HttpMethod.Post, grant.AbortPath, null, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -158,6 +229,9 @@ public sealed class ManagementApiClient : IAsyncDisposable
     public async ValueTask PlaceSignedRevocationAsync(string productId, string releaseId, ReadOnlyMemory<byte> envelopeBytes, CancellationToken cancellationToken = default)
         => await PlaceSignedAsync(HttpMethod.Post, $"products/{Segment(productId)}/releases/{Segment(releaseId)}/yank", envelopeBytes, cancellationToken).ConfigureAwait(false);
 
+    public async ValueTask PlaceSignedKeyManifestAsync(string repository, ReadOnlyMemory<byte> envelopeBytes, CancellationToken cancellationToken = default)
+        => await PlaceSignedAsync(HttpMethod.Put, $"repositories/{Segment(repository)}/keys", envelopeBytes, cancellationToken).ConfigureAwait(false);
+
     public async ValueTask DisposeAsync()
     {
         if (_ownsClient) _client.Dispose();
@@ -194,8 +268,51 @@ public sealed class ManagementApiClient : IAsyncDisposable
     private static Uri? ParseUploadUri(JsonElement item)
     {
         if (!item.TryGetProperty("uploadUri", out var value) || value.ValueKind != JsonValueKind.String) return null;
-        return Uri.TryCreate(value.GetString(), UriKind.Absolute, out var uri) ? uri : throw new FormatException("The management API returned an invalid upload URI.");
+        return ParseStorageUri(value.GetString()!);
+    }
+
+    private static Uri ParseStorageUri(string value)
+        => Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" ? uri : throw new FormatException("The management API returned an invalid storage upload URI.");
+
+    private async ValueTask<string> UploadPartAsync(ApiPresignedPart part, Stream content, long length, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put, part.Uri) { Content = new StreamContent(content) };
+        request.Content.Headers.ContentLength = length;
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        foreach (var header in part.RequiredHeaders) request.Headers.TryAddWithoutValidation(header.Name, header.Value);
+        using var response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        if (response.Headers.ETag is { } etag) return etag.Tag;
+        if (response.Headers.TryGetValues("ETag", out var values) && values.FirstOrDefault() is { Length: > 0 } value) return value;
+        throw new InvalidDataException($"Storage did not return an ETag for multipart part {part.Number}.");
+    }
+
+    private static async ValueTask<MemoryStream> ReadExactlyAsync(Stream source, long length, CancellationToken cancellationToken)
+    {
+        if (length > int.MaxValue) throw new NotSupportedException("A brokered multipart part exceeds the client buffer limit.");
+        var result = new MemoryStream((int)length);
+        var buffer = new byte[Math.Min(128 * 1024, (int)Math.Max(1, length))];
+        var remaining = length;
+        while (remaining > 0)
+        {
+            var read = await source.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
+            if (read == 0) throw new EndOfStreamException("The multipart payload ended before the granted length.");
+            await result.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+            remaining -= read;
+        }
+        result.Position = 0;
+        return result;
+    }
+
+    private static async ValueTask<bool> HasMoreBytesAsync(Stream source, CancellationToken cancellationToken)
+    {
+        var one = new byte[1];
+        return await source.ReadAsync(one.AsMemory(), cancellationToken).ConfigureAwait(false) != 0;
     }
 }
 
-public sealed record ApiUploadGrant(string GrantId, ObjectKey StagingKey, ContentHash ExpectedDigest, long ExpectedLength, DateTimeOffset ExpiresAt, Uri? UploadUri, string Enforcement, ImmutableArray<HttpHeaderRequirement> RequiredHeaders, string? LocalPath);
+public sealed record ApiPresignedPart(int Number, Uri Uri, ImmutableArray<HttpHeaderRequirement> RequiredHeaders);
+public sealed record ApiUploadGrant(string GrantId, ObjectKey StagingKey, ContentHash ExpectedDigest, long ExpectedLength, DateTimeOffset ExpiresAt, Uri? UploadUri, string Enforcement, ImmutableArray<HttpHeaderRequirement> RequiredHeaders, string? LocalPath, string? MultipartUploadId = null, long? MultipartPartSize = null, ImmutableArray<ApiPresignedPart> MultipartParts = default, string? CompletePath = null, string? AbortPath = null)
+{
+    public bool IsMultipart => !string.IsNullOrWhiteSpace(MultipartUploadId) || !MultipartParts.IsDefaultOrEmpty;
+}

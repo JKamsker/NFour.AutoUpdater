@@ -1,0 +1,1 @@
+{"envelope":1,"type":"revocation","payload":"eyJzY2hlbWFWZXJzaW9uIjoxLCJwcm9kdWN0SWQiOiJhbHBoYS5wcm9kdWN0IiwicmV2b2NhdGlvblNlcXVlbmNlIjoxLCJ1cGRhdGVkQXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwWiIsImVudHJpZXMiOltdfQ","signatures":[{"keyId":"fixture-root","algorithm":"ed25519","signature":"dn2MsRYbQeNE38-FG4PKr5WsgV5008_MhnNqLs_YXj6hmahTzboneaTqECgvAM5fU_AZAO7KDfHQyBCUpiRSCQ"}]}

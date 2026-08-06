@@ -40,9 +40,9 @@ internal static class WindowsSecureInstallOperations
     private const int StatusObjectNameCollision = unchecked((int)0xC0000035);
     private const int StatusReparsePointEncountered = unchecked((int)0xC000050B);
 
-    public static bool TryEnsureDirectory(string root, VirtualPath path)
+    public static bool TryEnsureDirectory(string root, VirtualPath path, FileIdentity? expectedParent = null)
     {
-        using var current = OpenDirectoryTree(root, path.Value.Split('/'));
+        using var current = OpenDirectoryTree(root, path.Value.Split('/'), expectedParent, path);
         return true;
     }
 
@@ -57,7 +57,7 @@ internal static class WindowsSecureInstallOperations
         return (attributes & FileAttributeDirectory) == 0;
     }
 
-    public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, FileIdentity? expectedParent = null)
+    public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, FileIdentity? expectedParent = null, bool preferHardLink = false)
     {
         using var parent = OpenParentDirectory(root, path, createMissing: true);
         VerifyParent(parent, expectedParent, path);
@@ -100,15 +100,17 @@ internal static class WindowsSecureInstallOperations
         return true;
     }
 
-    private static SafeFileHandle OpenDirectoryTree(string root, IReadOnlyList<string> components)
+    private static SafeFileHandle OpenDirectoryTree(string root, IReadOnlyList<string> components, FileIdentity? expectedParent = null, VirtualPath? requestedPath = null)
     {
         var current = OpenAbsoluteDirectoryRoot(root);
         try
         {
-            foreach (var component in components)
+            for (var index = 0; index < components.Count; index++)
             {
+                var component = components[index];
                 if (string.IsNullOrEmpty(component) || component == ".") continue;
                 if (component is ".." || component.IndexOfAny(['/', '\\']) >= 0) throw new IOException("Invalid managed path component.");
+                if (index == components.Count - 1 && requestedPath is not null) VerifyParent(current, expectedParent, requestedPath.Value);
                 var next = OpenRelative(current, component, GenericRead | GenericWrite | Synchronize, FileDirectoryFile, FileOpen)
                     ?? OpenRelative(current, component, GenericRead | GenericWrite | Synchronize, FileDirectoryFile, FileCreate)
                     ?? throw new IOException($"Unable to create managed directory '{component}'.");

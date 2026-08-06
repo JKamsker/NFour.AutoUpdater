@@ -4,7 +4,7 @@ public sealed class ReleaseBuilder
 {
     public ReleaseLock Build(string productId, string releaseId, long sequence, ImmutableArray<AxisDefinition> axes, ImmutableArray<PackageRequirement> requirements, IReadOnlyDictionary<PackageId, PackageManifest> manifests, RepositoryLayout layout, DateTimeOffset createdAt, long? minimumInstalledRelease = null, ContentHash? coverageDigest = null)
     {
-        if (!Identifier.IsValid(productId) || !Identifier.IsValid(releaseId)) throw new FormatException("Product and release identifiers must be safe path segments.");
+        if (!Identifier.IsValid(productId, 128) || !Identifier.IsValid(releaseId, 64)) throw new FormatException("Product and release identifiers must be safe path segments.");
         if (coverageDigest is null) throw new InvalidDataException("A release cannot be authored without a verified coverage.json digest. Use BuildAsync or supply coverageDigest.");
         var pins = ImmutableArray.CreateBuilder<LockedPackage>();
         foreach (var packageId in requirements.Select(x => x.Package).Distinct())
@@ -88,6 +88,12 @@ public sealed class ReleaseBuilder
 
 public sealed class ReleaseSigner
 {
+    public (SignedEnvelope Envelope, byte[] EnvelopeBytes) SignKeyManifest(KeyManifest manifest, string keyId, ReadOnlySpan<byte> privateKey)
+    {
+        var envelope = SignedDocument.Sign("key-manifest", SignedDocument.SerializePayload(manifest), keyId, privateKey);
+        return (envelope, SignedDocument.SerializeEnvelope(envelope));
+    }
+
     public (SignedEnvelope Envelope, byte[] EnvelopeBytes, ContentHash Digest) SignRelease(ReleaseLock release, string keyId, ReadOnlySpan<byte> privateKey)
     {
         if (release.State != ReleaseState.Published) throw new InvalidDataException("Only a published release lock may be signed for distribution.");
@@ -111,6 +117,6 @@ public sealed class ReleaseSigner
 
 public sealed class ChannelAuthoring
 {
-    public ChannelPointer Promote(string productId, string channel, long channelSequence, long previousChannelSequence, string releaseId, long releaseSequence, ContentHash releaseDigest, DateTimeOffset updatedAt) => new() { SchemaVersion = 1, ProductId = productId, Channel = channel, ChannelSequence = channelSequence, SupersedesChannelSequence = previousChannelSequence, ReleaseId = releaseId, ReleaseSequence = releaseSequence, ReleaseDigest = releaseDigest, UpdatedAt = updatedAt.ToUniversalTime() };
-    public ChannelPointer Rollback(ChannelPointer current, string releaseId, long releaseSequence, ContentHash releaseDigest, DateTimeOffset updatedAt) => Promote(current.ProductId, current.Channel, current.ChannelSequence + 1, current.ChannelSequence, releaseId, releaseSequence, releaseDigest, updatedAt) with { Reason = "rollback" };
+    public ChannelPointer Promote(string productId, string channel, long channelSequence, long previousChannelSequence, string releaseId, long releaseSequence, ContentHash releaseDigest, DateTimeOffset updatedAt, string? minimumClientVersion = null) => new() { SchemaVersion = 1, ProductId = productId, Channel = channel, ChannelSequence = channelSequence, SupersedesChannelSequence = previousChannelSequence, ReleaseId = releaseId, ReleaseSequence = releaseSequence, ReleaseDigest = releaseDigest, MinimumClientVersion = minimumClientVersion, UpdatedAt = updatedAt.ToUniversalTime() };
+    public ChannelPointer Rollback(ChannelPointer current, string releaseId, long releaseSequence, ContentHash releaseDigest, DateTimeOffset updatedAt) => Promote(current.ProductId, current.Channel, current.ChannelSequence + 1, current.ChannelSequence, releaseId, releaseSequence, releaseDigest, updatedAt, current.MinimumClientVersion) with { Reason = "rollback" };
 }
