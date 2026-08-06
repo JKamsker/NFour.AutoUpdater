@@ -8,7 +8,7 @@ namespace FourSaas.AutoUpdater.Storage.Ftp;
 /// negotiated by the library after connect; this adapter refuses to enumerate
 /// a server that does not advertise machine-readable listings.
 /// </summary>
-public sealed class FtpObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IWritableObjectStore, IServerSideTransferStore
+public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore, IServerSideTransferStore
 {
     private readonly Uri _baseUri;
     private readonly NetworkCredential _credentials;
@@ -26,26 +26,44 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IRangeReadableObject
     // FTP has no conditional write or server-side copy primitive.  Rename is
     // used for promotion, but the capability is intentionally not advertised
     // because RNTO cannot provide create-if-absent semantics.
-    public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.Delete;
+    //
+    // Range is likewise not advertised.  REST can splice a transfer, but MDTM+SIZE is the
+    // only validator this protocol offers and it is weak, so OpenAsync refuses every ranged
+    // request a normal caller could construct.  Advertising a capability no caller can
+    // safely exercise would only produce silent restarts.
+    public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.Delete;
     public int RecommendedParallelism => 4;
 
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
-        await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
-        if (!await client.FileExists(RemotePath(key), cancellationToken).ConfigureAwait(false)) return null;
-
-        // MDTM+SIZE is deliberately weak.  Do not splice a partial download
-        // unless a caller supplies an independently obtained strong validator.
-        if (offset > 0 && ifMatch is not { IsStrong: true }) offset = 0;
-        if (offset > 0 && !client.HasFeature(FtpCapability.REST)) offset = 0;
-        var stream = await client.OpenRead(RemotePath(key), FtpDataType.Binary, offset, false, cancellationToken).ConfigureAwait(false);
-        return new ReadResult
+        // Ownership of the client transfers to the returned ClientResponseStream on the
+        // success path; it must not be scoped with `await using` here, or the control
+        // connection would be torn down before the caller reads a byte.
+        var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
+        var transferred = false;
+        try
         {
-            Content = new ClientResponseStream(stream, client),
-            ActualStartOffset = offset,
-            StatusCode = offset == 0 ? 200 : 206,
-            Validator = null
-        };
+            if (!await client.FileExists(RemotePath(key), cancellationToken).ConfigureAwait(false)) return null;
+
+            // MDTM+SIZE is deliberately weak.  Do not splice a partial download
+            // unless a caller supplies an independently obtained strong validator.
+            if (offset > 0 && ifMatch is not { IsStrong: true }) offset = 0;
+            if (offset > 0 && !client.HasFeature(FtpCapability.REST)) offset = 0;
+            var stream = await client.OpenRead(RemotePath(key), FtpDataType.Binary, offset, false, cancellationToken).ConfigureAwait(false);
+            var content = new ClientResponseStream(stream, client);
+            transferred = true;
+            return new ReadResult
+            {
+                Content = content,
+                ActualStartOffset = offset,
+                StatusCode = offset == 0 ? 200 : 206,
+                Validator = null
+            };
+        }
+        finally
+        {
+            if (!transferred) await client.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     public async ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default)
