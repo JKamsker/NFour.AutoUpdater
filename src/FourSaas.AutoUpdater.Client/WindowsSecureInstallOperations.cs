@@ -22,7 +22,12 @@ internal static class WindowsSecureInstallOperations
     private const uint FileDirectoryFile = 0x00000001;
     private const uint FileNonDirectoryFile = 0x00000040;
     private const uint FileSynchronousIoNonalert = 0x00000020;
-    private const uint FileOpenReparsePoint = 0x00000200;
+    // FILE_OPEN_REPARSE_POINT is 0x00200000, not 0x00000200 — the latter is
+    // FILE_NO_EA_KNOWLEDGE. Passing it meant NtCreateFile never requested no-follow
+    // behaviour at all (OBJ_DONT_REPARSE was carrying the guarantee alone), and the flag it
+    // did pass is invalid alongside FILE_DIRECTORY_FILE, so every handle-relative open
+    // failed with STATUS_INVALID_PARAMETER.
+    private const uint FileOpenReparsePoint = 0x00200000;
     private const uint FileOpenForBackupIntent = 0x00004000;
     private const uint Win32OpenReparsePoint = 0x00200000;
     private const uint Win32BackupSemantics = 0x02000000;
@@ -162,14 +167,18 @@ internal static class WindowsSecureInstallOperations
         }
     }
 
+    /// <summary>
+    /// Opens the install root by descending from the volume root one component at a time, so
+    /// that no ancestor of the install root can redirect the walk through a link.
+    /// </summary>
     private static SafeFileHandle OpenAbsoluteDirectoryRoot(string path)
     {
         var absolute = Path.GetFullPath(path);
         var volume = Path.GetPathRoot(absolute) ?? throw new IOException($"Unable to determine the volume for '{path}'.");
         // Ancestors of the install root are only traversed and checked for reparse points;
-        // nothing is ever written to them. Requesting write access here would demand rights a
-        // standard user does not hold on the volume root or on directories like C:\Users, so
-        // an unelevated install under any system-owned ancestor would fail outright.
+        // nothing is ever written through these handles. Requesting write access here would
+        // demand rights a standard user does not hold on the volume root or on directories
+        // like C:\Users, so an unelevated install under any system-owned ancestor would fail.
         using var volumeHandle = OpenAbsolute(volume, DirectoryTraverseAccess, 0);
         var relative = Path.GetRelativePath(volume, absolute);
         var components = relative == "." ? [] : relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
@@ -284,7 +293,7 @@ internal static class WindowsSecureInstallOperations
             Marshal.WriteIntPtr(buffer, rootOffset, parent.DangerousGetHandle());
             Marshal.WriteInt32(buffer, lengthOffset, bytes.Length);
             Marshal.Copy(bytes, 0, IntPtr.Add(buffer, headerSize), bytes.Length);
-            var status = NtSetInformationFileRaw(source, out _, FileRenameInformation, buffer, (uint)(headerSize + bytes.Length));
+            var status = NtSetInformationFileRaw(source, out _, buffer, (uint)(headerSize + bytes.Length), FileRenameInformation);
             if (status != StatusSuccess) ThrowNt("rename verified temporary file", status);
         }
         finally { Marshal.FreeHGlobal(buffer); }
@@ -319,5 +328,9 @@ internal static class WindowsSecureInstallOperations
     [DllImport("ntdll.dll")] private static extern int NtCreateFile(out SafeFileHandle fileHandle, uint desiredAccess, ref ObjectAttributes objectAttributes, out IoStatusBlock ioStatusBlock, IntPtr allocationSize, uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions, IntPtr eaBuffer, uint eaLength);
     [DllImport("ntdll.dll")] private static extern int NtQueryInformationFile(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, out FileAttributeTagInformation fileInformation, uint length, int fileInformationClass);
     [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] private static extern int NtSetInformationFile(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, ref FileDispositionInformationValue fileInformation, uint length, int fileInformationClass);
-    [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] private static extern int NtSetInformationFileRaw(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, int fileInformationClass, IntPtr fileInformation, uint length);
+    // NtSetInformationFile's trailing parameters are (FileInformation, Length,
+    // FileInformationClass). This overload previously declared them as (class, buffer,
+    // length), so the information-class value was passed where the buffer pointer belongs
+    // and every rename failed with STATUS_DATATYPE_MISALIGNMENT.
+    [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] private static extern int NtSetInformationFileRaw(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass);
 }
