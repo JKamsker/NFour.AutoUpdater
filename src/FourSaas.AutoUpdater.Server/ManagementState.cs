@@ -614,7 +614,7 @@ public sealed class ManagementState
             ObjectCount = session.ObjectCount + requested.Count,
             TotalBytes = checked(session.TotalBytes + requested.Sum(x => x.Length))
         };
-        RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "publish.grants.mint", $"{session.Repository}/{sessionId}", "accepted");
+        RecordAudit(AuditActor(request), "publish.grants.mint", $"{session.Repository}/{sessionId}", "accepted");
         Persist();
         await UpsertSessionAsync(PublishSessions[sessionId], request.HttpContext.RequestAborted).ConfigureAwait(false);
 
@@ -720,7 +720,7 @@ public sealed class ManagementState
                         Grants[grantId] = recovered;
                         Persist();
                         await UpsertGrantAsync(recovered, CancellationToken.None).ConfigureAwait(false);
-                        RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "publish.grant.multipart.complete", $"{repository}/{sessionId}/{grantId}", "accepted");
+                        RecordAudit(AuditActor(request), "publish.grant.multipart.complete", $"{repository}/{sessionId}/{grantId}", "accepted");
                         return Results.NoContent();
                     }
                 }
@@ -737,7 +737,7 @@ public sealed class ManagementState
             Grants[grantId] = completed;
             Persist();
             await UpsertGrantAsync(completed, cancellationToken).ConfigureAwait(false);
-            RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "publish.grant.multipart.complete", $"{repository}/{sessionId}/{grantId}", "accepted");
+            RecordAudit(AuditActor(request), "publish.grant.multipart.complete", $"{repository}/{sessionId}/{grantId}", "accepted");
             return Results.NoContent();
         }
         finally { _placementGate.Release(); }
@@ -1147,7 +1147,7 @@ public sealed class ManagementState
             }
             Persist();
             await PersistTrustedKeysAsync(cancellationToken).ConfigureAwait(false);
-            RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "key-manifest.place", repository, "accepted");
+            RecordAudit(AuditActor(request), "key-manifest.place", repository, "accepted");
             return Results.NoContent();
         }
         finally { _placementGate.Release(); }
@@ -1192,7 +1192,7 @@ public sealed class ManagementState
         Persist();
         await UpsertPackageVersionAsync(repository, manifest, bytes, cancellationToken).ConfigureAwait(false);
         await EnsureRepositoryDescriptorAsync(cancellationToken).ConfigureAwait(false);
-        RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "package.register", $"{repository}/{package}/{manifest.Version.Label}", "accepted");
+        RecordAudit(AuditActor(request), "package.register", $"{repository}/{package}/{manifest.Version.Label}", "accepted");
         return Results.Created($"/api/v1/repositories/{repository}/packages/{package}/versions/{manifest.Version.Label}", new { package, version = manifest.Version.Label, immutable = false });
         }
         finally { _packageGate.Release(); }
@@ -1734,7 +1734,7 @@ public sealed class ManagementState
                 if (!target.TryUpdate((product, storageName), bytes, previous)) return Results.Conflict();
             }
             else if (!target.TryAdd((product, storageName), bytes)) return Results.Conflict();
-            RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", expectedType switch { "channel-pointer" => "channel.place", "release-lock" => "release.place", _ => "revocation.place" }, $"{product}/{name}", "accepted");
+            RecordAudit(AuditActor(request), expectedType switch { "channel-pointer" => "channel.place", "release-lock" => "release.place", _ => "revocation.place" }, $"{product}/{name}", "accepted");
             Persist();
             await UpsertPlacementAsync(expectedType, product, name, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
             if (expectedType == "revocation") await UpsertRevocationAsync(product, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
@@ -1881,6 +1881,18 @@ public sealed class ManagementState
                 catch (Exception) { }
             }
     }
+
+    /// <summary>
+    /// Identifies who performed an audited action.
+    ///
+    /// Recording the role alone said what the caller was permitted to do, not who did it,
+    /// which makes the trail useless as soon as more than one principal shares a role. The
+    /// authenticated subject is preferred; the role remains as a fallback.
+    /// </summary>
+    private static string AuditActor(HttpRequest request)
+        => request.HttpContext.Items["4sup-subject"]?.ToString()
+        ?? request.HttpContext.Items["4sup-role"]?.ToString()
+        ?? "unknown";
 
     private static string Scoped(string repository, ContentHash hash) => repository + "\0" + hash;
     private void RecordAudit(string actor, string action, string resource, string outcome)

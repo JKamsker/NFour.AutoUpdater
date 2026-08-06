@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using FourSaas.AutoUpdater.Core;
 using FourSaas.AutoUpdater.Server;
@@ -107,6 +108,25 @@ builder.Services.AddSingleton<ManagementState>(serviceProvider =>
     }
     return state;
 });
+// Static-token authentication is validated once at startup rather than trusted per
+// request. With FOURSUP_ALLOW_STATIC_TOKENS=1 and an unset token variable, the previous
+// per-request comparison built the expected value as "Bearer " + null, so a request whose
+// Authorization header was exactly "Bearer " authenticated as that role. Refusing to start
+// removes the possibility entirely instead of relying on every comparison site to notice.
+if (string.IsNullOrWhiteSpace(oidcAuthority) && string.Equals(Environment.GetEnvironmentVariable("FOURSUP_ALLOW_STATIC_TOKENS"), "1", StringComparison.Ordinal))
+{
+    var configuredTokens = new (string Name, string? Value)[]
+    {
+        ("FOURSUP_PUBLISHER_TOKEN", Environment.GetEnvironmentVariable("FOURSUP_PUBLISHER_TOKEN")),
+        ("FOURSUP_OPERATOR_TOKEN", Environment.GetEnvironmentVariable("FOURSUP_OPERATOR_TOKEN")),
+        ("FOURSUP_API_TOKEN", Environment.GetEnvironmentVariable("FOURSUP_API_TOKEN")),
+    };
+    if (configuredTokens.All(x => string.IsNullOrWhiteSpace(x.Value)))
+        throw new InvalidOperationException("FOURSUP_ALLOW_STATIC_TOKENS=1 requires at least one of FOURSUP_PUBLISHER_TOKEN, FOURSUP_OPERATOR_TOKEN or FOURSUP_API_TOKEN to be set to a non-empty value.");
+    if (!DateTimeOffset.TryParse(Environment.GetEnvironmentVariable("FOURSUP_STATIC_TOKEN_EXPIRES_AT"), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out _))
+        throw new InvalidOperationException("FOURSUP_ALLOW_STATIC_TOKENS=1 requires FOURSUP_STATIC_TOKEN_EXPIRES_AT to be a parsable timestamp.");
+}
+
 var app = builder.Build();
 var telemetryWindows = new ConcurrentDictionary<string, (DateTimeOffset Window, int Count)>(StringComparer.Ordinal);
 app.Use(async (context, next) =>
@@ -148,9 +168,31 @@ app.Use(async (context, next) =>
     var staticExpiry = DateTimeOffset.TryParse(Environment.GetEnvironmentVariable("FOURSUP_STATIC_TOKEN_EXPIRES_AT"), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsedExpiry) ? parsedExpiry : (DateTimeOffset?)null;
     var staticTokensAllowed = string.IsNullOrWhiteSpace(oidcAuthority) && string.Equals(Environment.GetEnvironmentVariable("FOURSUP_ALLOW_STATIC_TOKENS"), "1", StringComparison.Ordinal) && staticExpiry is { } expiry && expiry > DateTimeOffset.UtcNow;
     var supplied = context.Request.Headers.Authorization.ToString();
-    var oidcRole = context.User.Identity?.IsAuthenticated == true ? context.User.Claims.Where(x => x.Type is "role" or "roles" or "scope").SelectMany(x => x.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)).FirstOrDefault(x => x is "operator" or "publisher") : null;
-    var role = oidcRole ?? (staticTokensAllowed && string.Equals(supplied, "Bearer " + operatorToken, StringComparison.Ordinal) ? "operator" : staticTokensAllowed && string.Equals(supplied, "Bearer " + publisherToken, StringComparison.Ordinal) ? "publisher" : staticTokensAllowed && string.Equals(compatibilityRole, "operator", StringComparison.Ordinal) && string.Equals(supplied, "Bearer " + compatibilityToken, StringComparison.Ordinal) ? "operator" : staticTokensAllowed && string.Equals(compatibilityRole, "publisher", StringComparison.Ordinal) && string.Equals(supplied, "Bearer " + compatibilityToken, StringComparison.Ordinal) ? "publisher" : null);
+    // Explicit precedence rather than whichever claim the enumerator happens to yield
+    // first: a principal holding both roles is consistently treated as the higher one.
+    var oidcClaims = context.User.Identity?.IsAuthenticated == true
+        ? context.User.Claims.Where(x => x.Type is "role" or "roles" or "scope").SelectMany(x => x.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)).ToHashSet(StringComparer.Ordinal)
+        : null;
+    var oidcRole = oidcClaims is null ? null : oidcClaims.Contains("operator") ? "operator" : oidcClaims.Contains("publisher") ? "publisher" : null;
+
+    var role = oidcRole ?? (
+        MatchesBearerToken(supplied, operatorToken) ? "operator"
+        : MatchesBearerToken(supplied, publisherToken) ? "publisher"
+        : string.Equals(compatibilityRole, "operator", StringComparison.Ordinal) && MatchesBearerToken(supplied, compatibilityToken) ? "operator"
+        : string.Equals(compatibilityRole, "publisher", StringComparison.Ordinal) && MatchesBearerToken(supplied, compatibilityToken) ? "publisher"
+        : null);
+
+    bool MatchesBearerToken(string presented, string? expected)
+        => staticTokensAllowed && StaticTokenAuthentication.Matches(presented, expected);
+
     context.Items["4sup-role"] = role;
+    // A stable subject for audit. Role alone says what a caller was permitted to do, not who
+    // did it, which makes an audit trail useless the moment more than one principal shares a
+    // role. OIDC supplies a real subject; a static token is identified by a short digest
+    // prefix so the log distinguishes principals without recording the secret.
+    context.Items["4sup-subject"] = context.User.FindFirst("sub")?.Value
+        ?? context.User.Identity?.Name
+        ?? (role is null ? null : StaticTokenAuthentication.SubjectFingerprint(supplied));
     var endpointPolicy = context.GetEndpoint()?.Metadata.GetMetadata<EndpointPolicyMetadata>()?.Policy;
     var requiredRole = endpointPolicy is "anonymous" or null ? RequiredRole(context.Request) : endpointPolicy;
     if (isWrite && requiredRole is not null && role is null)

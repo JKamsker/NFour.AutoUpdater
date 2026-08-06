@@ -18,6 +18,31 @@ namespace FourSaas.AutoUpdater.Server.Tests;
 
 public sealed class ServerTests
 {
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void BlankStaticTokensNeverAuthenticate(string? configured)
+    {
+        // The previous inline check compared against "Bearer " + token. With the token
+        // variable unset that target collapsed to the literal "Bearer ", so a request sending
+        // exactly that header authenticated as the corresponding role.
+        Assert.False(StaticTokenAuthentication.Matches("Bearer ", configured));
+        Assert.False(StaticTokenAuthentication.Matches("Bearer", configured));
+        Assert.False(StaticTokenAuthentication.Matches("Bearer anything", configured));
+    }
+
+    [Fact]
+    public void StaticTokenMatchingRequiresTheExactToken()
+    {
+        Assert.True(StaticTokenAuthentication.Matches("Bearer s3cret", "s3cret"));
+        Assert.False(StaticTokenAuthentication.Matches("Bearer s3cre", "s3cret"));
+        Assert.False(StaticTokenAuthentication.Matches("Bearer s3crett", "s3cret"));
+        Assert.False(StaticTokenAuthentication.Matches("bearer s3cret", "s3cret"));
+        Assert.False(StaticTokenAuthentication.Matches("s3cret", "s3cret"));
+        Assert.False(StaticTokenAuthentication.Matches(null, "s3cret"));
+    }
+
     [Fact]
     public async Task VerifiedPlacementWritesOpaqueBytesToStaticProjection()
     {
