@@ -7,4 +7,5 @@
     <PackageReference Include="System.IO.Hashing" />
     <PackageReference Include="BouncyCastle.Cryptography" />
   </ItemGroup>
+  <Import Project="TrustRoot.targets" />
 </Project>

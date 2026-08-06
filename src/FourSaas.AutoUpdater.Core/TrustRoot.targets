@@ -1,0 +1,55 @@
+<Project>
+
+  <!--
+    Build-time injection of the compiled trust anchor.
+
+    The anchor is generated into a source file rather than hardcoded so that a first-party
+    build can supply its offline-controlled root without editing tracked source, and so that
+    the guard below can tell a real root from the development one.
+  -->
+  <PropertyGroup>
+    <FourSaasDevelopmentTrustRootKeyId>4s-dev-0000</FourSaasDevelopmentTrustRootKeyId>
+    <FourSaasDevelopmentTrustRootPublicKey>A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg</FourSaasDevelopmentTrustRootPublicKey>
+
+    <FourSaasTrustRootKeyId Condition="'$(FourSaasTrustRootKeyId)' == ''">$(FourSaasDevelopmentTrustRootKeyId)</FourSaasTrustRootKeyId>
+    <FourSaasTrustRootPublicKey Condition="'$(FourSaasTrustRootPublicKey)' == ''">$(FourSaasDevelopmentTrustRootPublicKey)</FourSaasTrustRootPublicKey>
+
+    <FourSaasTrustRootIsDevelopment>false</FourSaasTrustRootIsDevelopment>
+    <FourSaasTrustRootIsDevelopment Condition="'$(FourSaasTrustRootKeyId)' == '$(FourSaasDevelopmentTrustRootKeyId)' or '$(FourSaasTrustRootPublicKey)' == '$(FourSaasDevelopmentTrustRootPublicKey)'">true</FourSaasTrustRootIsDevelopment>
+  </PropertyGroup>
+
+  <!--
+    A Release build carrying the development anchor is a shippable artifact that trusts a
+    publicly known key. That is a release blocker, not a warning, so the build fails unless
+    the operator explicitly acknowledges it.
+  -->
+  <Target Name="FourSaasVerifyTrustRoot" BeforeTargets="CoreCompile">
+    <Error Condition="'$(Configuration)' == 'Release' and '$(FourSaasTrustRootIsDevelopment)' == 'true' and '$(FourSaasAllowDevelopmentTrustRoot)' != 'true'"
+           Code="FS4SUP001"
+           Text="Release build still carries the development trust root '$(FourSaasTrustRootKeyId)'. Set FourSaasTrustRootKeyId and FourSaasTrustRootPublicKey to the first-party offline root, or pass -p:FourSaasAllowDevelopmentTrustRoot=true to acknowledge a non-shippable build." />
+  </Target>
+
+  <Target Name="FourSaasGenerateTrustRoot" BeforeTargets="FourSaasVerifyTrustRoot;CoreCompile">
+    <!-- IntermediateOutputPath is only defined once the SDK targets have been imported, so
+         the path is resolved here at execution time rather than during evaluation. -->
+    <PropertyGroup>
+      <FourSaasTrustRootGeneratedFile>$(IntermediateOutputPath)TrustRootBuildConfiguration.g.cs</FourSaasTrustRootGeneratedFile>
+    </PropertyGroup>
+    <ItemGroup>
+      <FourSaasTrustRootLines Include="// &lt;auto-generated /&gt; Produced by TrustRoot.targets. Do not edit." />
+      <FourSaasTrustRootLines Include="namespace FourSaas.AutoUpdater.Core%3B" />
+      <FourSaasTrustRootLines Include="internal static class TrustRootBuildConfiguration" />
+      <FourSaasTrustRootLines Include="{" />
+      <FourSaasTrustRootLines Include="    public const string KeyId = &quot;$(FourSaasTrustRootKeyId)&quot;%3B" />
+      <FourSaasTrustRootLines Include="    public const string PublicKey = &quot;$(FourSaasTrustRootPublicKey)&quot;%3B" />
+      <FourSaasTrustRootLines Include="}" />
+    </ItemGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(FourSaasTrustRootGeneratedFile)" Lines="@(FourSaasTrustRootLines)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <Compile Include="$(FourSaasTrustRootGeneratedFile)" />
+      <FileWrites Include="$(FourSaasTrustRootGeneratedFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>
