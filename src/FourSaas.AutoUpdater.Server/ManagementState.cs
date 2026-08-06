@@ -26,6 +26,13 @@ public sealed class ManagementState
     private const long S3SinglePutLimit = 5L * 1024 * 1024 * 1024;
     private static readonly TimeSpan GrantClaimLease = TimeSpan.FromMinutes(2);
 
+    /// <summary>
+    /// How recently a staging object may have been written before staging collection will
+    /// leave it alone even though its session is unknown. Covers the window between another
+    /// instance creating a session and this instance being able to observe it.
+    /// </summary>
+    private static readonly TimeSpan StagingCollectionGrace = TimeSpan.FromMinutes(30);
+
     private sealed class ExpiredGrantException(string grantId) : Exception($"Grant '{grantId}' has expired.")
     {
         public string GrantId { get; } = grantId;
@@ -1269,6 +1276,13 @@ public sealed class ManagementState
     {
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
         if (_stagingStore is not IListableObjectStore listable || _stagingStore is not IWritableObjectStore writable) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+
+        // The live set must come from durable state, not from this process's dictionary. A
+        // session opened on another instance after this one started is absent from the local
+        // map, and deleting what is missing from it means one node destroying another node's
+        // in-flight uploads.
+        await RefreshPublishStateAsync(cancellationToken).ConfigureAwait(false);
+
         var now = DateTimeOffset.UtcNow;
         // A sealed session is still recoverable until its expiry: sealing is persisted
         // before promotion and a crash immediately afterwards must not lose its uploads.
@@ -1284,6 +1298,15 @@ public sealed class ManagementState
             var parts = key.Value.Split('/');
             if (parts.Length != 4 || !string.Equals(parts[0], "_staging", StringComparison.Ordinal) || !string.Equals(parts[1], repository, StringComparison.Ordinal)) continue;
             if (active.Contains(parts[2])) continue;
+
+            // Refreshing above narrows the window but cannot close it: a session committed on
+            // another instance moments after the refresh is still invisible here. A recently
+            // written staging object whose session is unknown is therefore left alone and
+            // reconsidered on the next run, when its session will either be visible or the
+            // object will be genuinely old.
+            var head = await _stagingStore!.HeadAsync(key, cancellationToken).ConfigureAwait(false);
+            if (head?.LastModified is { } lastModified && now - lastModified < StagingCollectionGrace) continue;
+
             if (!dryRun) await writable.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
             deleted.Add(key.Value);
         }
