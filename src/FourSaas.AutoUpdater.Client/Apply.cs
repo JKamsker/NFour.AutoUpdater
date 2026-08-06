@@ -608,8 +608,16 @@ public sealed class LocalContentCache
     public async ValueTask<bool> TryGetAsync(ContentHash hash, CancellationToken cancellationToken = default)
     {
         var path = GetPath(hash); if (!File.Exists(path)) return false;
-        await using var stream = File.OpenRead(path);
-        if (await ContentHash.ComputeAsync(stream, hash.Algorithm, cancellationToken).ConfigureAwait(false) != hash)
+
+        // The read handle is scoped to the hash computation and closed before the eviction
+        // below. File.OpenRead takes FileShare.Read, which does not permit deletion, so
+        // holding it across File.Delete leaves tampered content in the cache: the mismatch is
+        // detected, the delete quietly fails, and the next caller re-reads the same bad bytes.
+        bool matches;
+        await using (var stream = File.OpenRead(path))
+            matches = await ContentHash.ComputeAsync(stream, hash.Algorithm, cancellationToken).ConfigureAwait(false) == hash;
+
+        if (!matches)
         {
             try { File.SetAttributes(path, FileAttributes.Normal); File.Delete(path); } catch (IOException) { }
             catch (UnauthorizedAccessException) { }
