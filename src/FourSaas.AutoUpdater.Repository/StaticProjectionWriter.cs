@@ -23,7 +23,7 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
     public ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
         => WritePackageIndexAsync(packageId, manifests, exactManifestBytes: null, cancellationToken);
 
-    public async ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
+    public async ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
     {
         var versions = manifests
             .Where(x => x.Id == packageId)
@@ -34,9 +34,7 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
                 Version = x.Version.Label,
                 Sequence = x.Sequence == 0 ? x.Version.Sequence : x.Sequence,
                 ManifestPath = layout.Package(x.Id, x.Version).Value,
-                ManifestDigest = exactManifestBytes is not null && exactManifestBytes.TryGetValue(x.Id, out var exactBytes)
-                    ? ContentHash.Compute(exactBytes)
-                    : ContentHash.Compute(RepositoryJson.SerializeManifest(x)),
+                ManifestDigest = ContentHash.Compute(ManifestBytes(x, exactManifestBytes)),
                 FileCount = x.FileCount,
                 InstallSize = x.InstallSize,
                 DownloadSize = x.DownloadSize
@@ -79,22 +77,28 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
     public ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
         => WriteReleaseBundleAsync(productId, releaseId, lockEnvelopeBytes, manifests, exactManifestBytes: null, cancellationToken);
 
-    public async ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
+    public async ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
     {
         var envelope = SignedDocument.DeserializeEnvelope(lockEnvelopeBytes.Span);
         if (!string.Equals(envelope.Type, "release-lock", StringComparison.Ordinal)) throw new InvalidDataException("A release bundle requires a release-lock envelope.");
-        var inline = new SortedDictionary<string, JsonElement>(StringComparer.Ordinal);
+
+        // Inline manifests are carried as base64url of the *exact* bytes the release pinned,
+        // not as embedded JSON.  Re-encoding through JsonElement would let whitespace,
+        // escaping or property order drift, and the reader hashes what it finds here against
+        // the pinned digest - a byte-preserving container is the only encoding that survives
+        // that check for a manifest this writer did not itself serialize.
+        var inline = new SortedDictionary<string, string>(StringComparer.Ordinal);
         foreach (var manifest in manifests.OrderBy(x => x.Id.Value, StringComparer.Ordinal))
-        {
-            var bytes = exactManifestBytes is not null && exactManifestBytes.TryGetValue(manifest.Id, out var exactBytes)
-                ? exactBytes
-                : RepositoryJson.SerializeManifest(manifest);
-            using var document = JsonDocument.Parse(bytes);
-            inline.Add(manifest.Id.Value, document.RootElement.Clone());
-        }
+            inline.Add(manifest.Id.Value, Base64Url.Encode(ManifestBytes(manifest, exactManifestBytes)));
+
         var bundle = new BundleDocument { SchemaVersion = 1, LockEnvelope = Base64Url.Encode(lockEnvelopeBytes.Span), Inline = inline };
         await WriteDerivedAsync(layout.ReleaseBundle(productId, releaseId), RepositoryJson.Serialize(bundle), cancellationToken).ConfigureAwait(false);
     }
+
+    private static byte[] ManifestBytes(PackageManifest manifest, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes)
+        => exactManifestBytes is not null && exactManifestBytes.TryGetValue(ManifestKey.For(manifest), out var exact)
+            ? exact
+            : RepositoryJson.SerializeManifest(manifest);
 
     private async ValueTask WriteDerivedAsync(ObjectKey key, byte[] bytes, CancellationToken cancellationToken)
     {
@@ -171,6 +175,6 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
     {
         public required int SchemaVersion { get; init; }
         public required string LockEnvelope { get; init; }
-        public required IReadOnlyDictionary<string, JsonElement> Inline { get; init; }
+        public required IReadOnlyDictionary<string, string> Inline { get; init; }
     }
 }

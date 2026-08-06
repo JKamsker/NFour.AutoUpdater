@@ -63,7 +63,7 @@ public sealed class GarbageCollector
         return new GarbageCollectionResult(marked.ToImmutableArray(), quarantined.ToImmutable(), deleted.ToImmutable(), diagnostics.ToImmutable());
     }
 
-    public static ImmutableHashSet<ContentHash> MarkRelease(ReleaseLock release, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, IEnumerable<PackageFileEntry>>? fileEntries = null)
+    public static ImmutableHashSet<ContentHash> MarkRelease(ReleaseLock release, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, IEnumerable<PackageFileEntry>>? fileEntries = null, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes = null)
     {
         var marked = ImmutableHashSet.CreateBuilder<ContentHash>();
         marked.Add(release.CoverageDigest);
@@ -72,7 +72,9 @@ public sealed class GarbageCollector
             marked.Add(pin.ManifestDigest);
             var manifest = manifests.FirstOrDefault(x => x.Id == pin.Id && x.Version.Label == pin.Version.Label);
             if (manifest is null) throw new InvalidDataException($"Missing manifest for live package '{pin.Id}@{pin.Version}'.");
-            VerifyManifestPin(pin, manifest);
+            VerifyManifestIdentity(pin, manifest);
+            if (exactManifestBytes is not null && exactManifestBytes.TryGetValue(ManifestKey.For(manifest), out var exact))
+                VerifyManifestDigest(pin, exact);
             marked.Add(manifest.FileTable.Digest);
             foreach (var shard in manifest.FileTable.Shards) marked.Add(shard.Digest);
             if (fileEntries is not null && fileEntries.TryGetValue(pin.Id, out var entries))
@@ -90,11 +92,29 @@ public sealed class GarbageCollector
         {
             cancellationToken.ThrowIfCancellationRequested();
             marked.Add(pin.ManifestDigest);
-            var manifest = repository is IManifestDigestRepository digestRepository
-                ? await digestRepository.GetManifestAsync(pin.Id, new PackageVersion(pin.Version.Label, pin.Sequence), pin.ManifestDigest, cancellationToken).ConfigureAwait(false)
-                : await repository.GetManifestAsync(pin.Id, new PackageVersion(pin.Version.Label, pin.Sequence), cancellationToken).ConfigureAwait(false);
+            var version = new PackageVersion(pin.Version.Label, pin.Sequence);
+            PackageManifest? manifest;
+            if (repository is IExactManifestRepository exactRepository)
+            {
+                // Preferred path: hash the stored bytes themselves.  Re-serializing a parsed
+                // manifest and hashing that cannot prove the pin, because the encoding the
+                // publisher signed is not guaranteed to be the encoding this writer produces.
+                var bytes = await exactRepository.GetManifestBytesAsync(pin.Id, version, cancellationToken).ConfigureAwait(false)
+                            ?? throw new InvalidDataException($"Missing manifest for live package '{pin.Id}@{pin.Version}'.");
+                VerifyManifestDigest(pin, bytes);
+                manifest = RepositoryJson.DeserializeManifest(bytes);
+            }
+            else if (repository is IManifestDigestRepository digestRepository)
+            {
+                // This overload verifies the stored bytes against the expected digest itself.
+                manifest = await digestRepository.GetManifestAsync(pin.Id, version, pin.ManifestDigest, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                throw new NotSupportedException($"Garbage collection requires a repository that can verify pinned manifest bytes; '{repository.GetType().Name}' cannot.");
+            }
             if (manifest is null) throw new InvalidDataException($"Missing manifest for live package '{pin.Id}@{pin.Version}'.");
-            VerifyManifestPin(pin, manifest);
+            VerifyManifestIdentity(pin, manifest);
             marked.Add(manifest.FileTable.Digest);
             foreach (var shard in manifest.FileTable.Shards) marked.Add(shard.Digest);
             await foreach (var entry in repository.ReadFileTableAsync(manifest, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
@@ -103,12 +123,16 @@ public sealed class GarbageCollector
         return marked.ToImmutable();
     }
 
-    private static void VerifyManifestPin(LockedPackage pin, PackageManifest manifest)
+    private static void VerifyManifestIdentity(LockedPackage pin, PackageManifest manifest)
     {
         if (manifest.SchemaVersion != 1) throw new FormatException($"Unsupported package schemaVersion {manifest.SchemaVersion} for '{pin.Id}@{pin.Version}'.");
-            if (manifest.Id != pin.Id || !string.Equals(manifest.Version.Label, pin.Version.Label, StringComparison.Ordinal) || manifest.Sequence != pin.Sequence)
+        if (manifest.Id != pin.Id || !string.Equals(manifest.Version.Label, pin.Version.Label, StringComparison.Ordinal) || manifest.Sequence != pin.Sequence)
             throw new InvalidDataException($"Manifest identity does not match live package '{pin.Id}@{pin.Version}'.");
-        if (ContentHash.Compute(RepositoryJson.SerializeManifest(manifest)) != pin.ManifestDigest)
+    }
+
+    private static void VerifyManifestDigest(LockedPackage pin, ReadOnlySpan<byte> exactManifestBytes)
+    {
+        if (ContentHash.Compute(exactManifestBytes) != pin.ManifestDigest)
             throw new CryptographicException($"Manifest '{pin.Id}@{pin.Version}' failed its pinned digest.");
     }
 

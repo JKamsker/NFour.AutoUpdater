@@ -127,7 +127,12 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
                         foreach (var item in bundleDocument.Inline)
                         {
                             if (!PackageId.TryCreate(item.Key, out var inlineId)) throw new FormatException($"Bundle contains an invalid inline package id '{item.Key}'.");
-                            var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(item.Value, RepositoryJson.Options);
+                            // Exact pinned bytes, base64url-encoded by the projection writer.  These
+                            // are hashed as-is; nothing may re-serialize them before the digest check.
+                            byte[] manifestBytes;
+                            try { manifestBytes = Base64Url.Decode(item.Value); }
+                            catch (FormatException) { throw new InvalidDataException($"Bundle inline manifest '{item.Key}' is not valid base64url."); }
+                            if (manifestBytes.Length > MaximumInlineManifestBytes) throw new InvalidDataException($"Bundle inline manifest '{item.Key}' exceeds the {MaximumInlineManifestBytes} byte limit.");
                             var pin = release.Packages.FirstOrDefault(x => x.Id.Value == item.Key) ?? throw new InvalidDataException($"Bundle contains unpinned manifest '{item.Key}'.");
                             if (ContentHash.Compute(manifestBytes) != pin.ManifestDigest) throw new CryptographicException($"Inline manifest '{item.Key}' failed its pinned digest.");
                             var storedManifestBytes = await ReadRequiredAsync(_layout.Package(pin.Id, pin.Version), cancellationToken).ConfigureAwait(false);
@@ -172,5 +177,6 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
         if (!SignedDocument.VerifyCryptographically(envelope, descriptorKeys, out _, out _, out var error, signer => SignedDocument.IsKeyValidAt(descriptorKeys, signer, documentTime, out _, skew)))
             throw new CryptographicException(error);
     }
-    private sealed record BundleDocument { public required int SchemaVersion { get; init; } public required string LockEnvelope { get; init; } public required Dictionary<string, JsonElement> Inline { get; init; } }
+    private const int MaximumInlineManifestBytes = 4 * 1024 * 1024;
+    private sealed record BundleDocument { public required int SchemaVersion { get; init; } public required string LockEnvelope { get; init; } public required Dictionary<string, string> Inline { get; init; } }
 }
