@@ -294,15 +294,29 @@ public sealed class RepositoryLayout
         foreach (var (name, value) in values)
         {
             ValidateSegmentValue(value, name);
-            result = result.Replace("{" + name + "}", value, StringComparison.Ordinal).Replace("{" + name + ":2}", value, StringComparison.Ordinal).Replace("{" + name + ":4}", value, StringComparison.Ordinal);
+            // Only the substituted identifier is case-normalised. Lowercasing the whole
+            // formatted path afterwards also rewrote the template's own literal segments, so a
+            // custom layout containing any uppercase literal silently addressed a different
+            // object on a case-sensitive backend than the one its author wrote down.
+            var normalised = value.ToLowerInvariant();
+            result = result.Replace("{" + name + "}", normalised, StringComparison.Ordinal).Replace("{" + name + ":2}", normalised, StringComparison.Ordinal).Replace("{" + name + ":4}", normalised, StringComparison.Ordinal);
         }
         ValidateRelativePath(result, "Repository layout result");
-        return result.ToLowerInvariant();
+        return result;
     }
 
     private static void ValidateTemplate(string template, params string[] allowedNames)
     {
         ValidateRelativePath(template, "Repository layout template", allowPlaceholders: true, allowedNames);
+
+        // Formatted keys are no longer lowercased wholesale, so an uppercase literal in a
+        // custom template would now survive into the object key. Rejecting it here keeps
+        // every repository addressable identically on case-sensitive and case-insensitive
+        // backends, and reports the problem when the descriptor is validated rather than
+        // when a lookup mysteriously misses.
+        var literal = RemovePlaceholders(template);
+        if (literal.Any(char.IsUpper))
+            throw new FormatException("Repository layout template literals must be lowercase.");
     }
 
     private static void ValidateRelativePath(string? path, string description, bool allowPlaceholders = false, IReadOnlyCollection<string>? allowedNames = null)
