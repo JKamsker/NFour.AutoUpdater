@@ -21,6 +21,7 @@ public sealed class ManagementDbContext(DbContextOptions<ManagementDbContext> op
     public DbSet<PublishGrantRow> PublishGrants => Set<PublishGrantRow>();
     public DbSet<TelemetryRow> Telemetry => Set<TelemetryRow>();
     public DbSet<SequenceReservationRow> SequenceReservations => Set<SequenceReservationRow>();
+    public DbSet<SequenceClaimRow> SequenceClaims => Set<SequenceClaimRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -52,6 +53,10 @@ public sealed class ManagementDbContext(DbContextOptions<ManagementDbContext> op
         modelBuilder.Entity<TelemetryRow>().HasKey(x => new { x.Id, x.At });
         modelBuilder.Entity<TelemetryRow>().HasIndex(x => x.At);
         modelBuilder.Entity<SequenceReservationRow>().HasKey(x => new { x.RepositoryId, x.Scope, x.Name });
+        // One row per allocated sequence. The composite primary key is the uniqueness
+        // constraint: a duplicate allocation fails on insert rather than being merged into a
+        // rewritten array, and membership is a key lookup instead of a scan.
+        modelBuilder.Entity<SequenceClaimRow>().HasKey(x => new { x.RepositoryId, x.Scope, x.Name, x.Value });
     }
 }
 
@@ -116,3 +121,12 @@ public sealed class PublishGrantRow
 }
 public sealed class TelemetryRow { public long Id { get; set; } public DateTimeOffset At { get; set; } public string? ProductId { get; set; } public string? ReleaseId { get; set; } public string? PayloadJson { get; set; } }
 public sealed class SequenceReservationRow { public required string RepositoryId { get; set; } public required string Scope { get; set; } public required string Name { get; set; } public long NextValue { get; set; } public string? AllocatedSequencesJson { get; set; } }
+
+/// <summary>
+/// A single allocated sequence value.
+///
+/// Replaces the AllocatedSequencesJson array, which was deserialized, appended to, sorted and
+/// rewritten on every allocation and linearly scanned on every placement — quadratic work and
+/// an unboundedly growing row.
+/// </summary>
+public sealed class SequenceClaimRow { public required string RepositoryId { get; set; } public required string Scope { get; set; } public required string Name { get; set; } public long Value { get; set; } public DateTimeOffset AllocatedAt { get; set; } }

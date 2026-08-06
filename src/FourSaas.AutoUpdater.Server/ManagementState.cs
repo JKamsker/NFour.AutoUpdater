@@ -354,36 +354,14 @@ public sealed class ManagementState
             var key = repository + "\0" + scope + "\0" + name;
             if (_databaseFactory is not null)
             {
-                await using var database = await _databaseFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-                await using var transaction = await database.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
-                var row = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
-                if (row is null)
-                {
-                    var current = scope switch
-                    {
-                        "package" => await database.PackageVersions.Where(x => x.RepositoryId == repository && x.PackageId == name).Select(x => (long?)x.Sequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
-                        "release" => await database.Releases.Where(x => x.RepositoryId == repository && x.ProductId == name).Select(x => (long?)x.Sequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
-                        "channel" => await database.Channels.Where(x => x.RepositoryId == repository && x.ProductId + ":" + x.Channel == name).Select(x => (long?)x.ChannelSequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
-                        "revocation" => 0,
-                        _ => 0
-                    };
-                    allocated = checked(current + 1);
-                    database.SequenceReservations.Add(new SequenceReservationRow { RepositoryId = repository, Scope = scope, Name = name, NextValue = checked(allocated + 1), AllocatedSequencesJson = JsonSerializer.Serialize(new[] { allocated }) });
-                }
-                else
-                {
-                    allocated = row.NextValue;
-                    row.NextValue = checked(allocated + 1);
-                    var allocatedValues = string.IsNullOrWhiteSpace(row.AllocatedSequencesJson) ? Array.Empty<long>() : JsonSerializer.Deserialize<long[]>(row.AllocatedSequencesJson) ?? Array.Empty<long>();
-                    row.AllocatedSequencesJson = JsonSerializer.Serialize(allocatedValues.Append(allocated).Distinct().OrderBy(x => x).ToArray());
-                }
-                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                allocated = await AllocateSequenceFromDatabaseAsync(repository, scope, name, cancellationToken).ConfigureAwait(false);
             }
             else
             {
+                // AddOrUpdate already returns the value it stored. Assigning allocated + 1
+                // afterwards advanced the counter a second time, so allocations ran 1, 3, 5, …
+                // and every intervening value was permanently unusable.
                 allocated = _sequenceCounters.AddOrUpdate(key, _ => NextInMemorySequence(repository, scope, name), (_, value) => checked(value + 1));
-                _sequenceCounters[key] = checked(allocated + 1);
                 _allocatedSequences.GetOrAdd(key, _ => new ConcurrentDictionary<long, byte>())[allocated] = 0;
             }
         }
@@ -405,21 +383,89 @@ public sealed class ManagementState
         return checked(maximum + 1);
     }
 
+    /// <summary>
+    /// Allocates the next sequence for a scope inside a serializable transaction.
+    ///
+    /// Serializable isolation means a concurrent allocator can legitimately abort this
+    /// transaction; without a retry that surfaces to the publisher as a hard failure the
+    /// moment two instances allocate at once, which is precisely the deployment the isolation
+    /// level exists to support. Conflicts are therefore retried a bounded number of times.
+    /// </summary>
+    private async Task<long> AllocateSequenceFromDatabaseAsync(string repository, string scope, string name, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await using var database = await _databaseFactory!.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+                await using var transaction = await database.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
+                var row = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
+                long allocated;
+                if (row is null)
+                {
+                    var current = scope switch
+                    {
+                        "package" => await database.PackageVersions.Where(x => x.RepositoryId == repository && x.PackageId == name).Select(x => (long?)x.Sequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
+                        "release" => await database.Releases.Where(x => x.RepositoryId == repository && x.ProductId == name).Select(x => (long?)x.Sequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
+                        "channel" => await database.Channels.Where(x => x.RepositoryId == repository && x.ProductId + ":" + x.Channel == name).Select(x => (long?)x.ChannelSequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
+                        "revocation" => 0,
+                        _ => 0
+                    };
+                    allocated = checked(current + 1);
+                    database.SequenceReservations.Add(new SequenceReservationRow { RepositoryId = repository, Scope = scope, Name = name, NextValue = checked(allocated + 1) });
+                }
+                else
+                {
+                    allocated = row.NextValue;
+                    row.NextValue = checked(allocated + 1);
+                }
+
+                // One row per claim. The composite key rejects a duplicate on insert instead of
+                // silently absorbing it into a rewritten array.
+                database.SequenceClaims.Add(new SequenceClaimRow { RepositoryId = repository, Scope = scope, Name = name, Value = allocated, AllocatedAt = DateTimeOffset.UtcNow });
+                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return allocated;
+            }
+            catch (Exception ex) when (attempt < SequenceAllocationRetries && IsTransientConcurrencyFailure(ex))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(20 * (attempt + 1)), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private const int SequenceAllocationRetries = 5;
+
+    /// <summary>
+    /// True for a database failure that a retry can plausibly resolve: PostgreSQL
+    /// serialization failure (40001) and deadlock detected (40P01).
+    /// </summary>
+    private static bool IsTransientConcurrencyFailure(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            var sqlState = current.GetType().GetProperty("SqlState")?.GetValue(current) as string;
+            if (sqlState is "40001" or "40P01") return true;
+        }
+        return false;
+    }
+
     private async ValueTask<bool> WasSequenceAllocatedAsync(string repository, string scope, string name, long sequence, CancellationToken cancellationToken)
     {
         if (sequence < 1) return false;
         if (_databaseFactory is not null)
         {
             await using var database = await _databaseFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            // Primary-key lookup rather than deserializing and scanning an array that grew
+            // with every allocation ever made for this scope.
+            if (await database.SequenceClaims.AnyAsync(x => x.RepositoryId == repository && x.Scope == scope && x.Name == name && x.Value == sequence, cancellationToken).ConfigureAwait(false))
+                return true;
+
+            // Reservations created before claims were tracked have no claim rows. Their
+            // monotonic counter is the only durable evidence, so already-issued values stay
+            // valid while every new value must come from an explicit claim.
             var reservation = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
-            // Rows created before sequence claims were introduced have no claim
-            // ledger. Their monotonic counter is the only durable evidence, so
-            // preserve already-issued values while requiring all new values to
-            // come from the explicit claim array.
-            if (reservation?.AllocatedSequencesJson is null)
-                return reservation is not null && sequence < reservation.NextValue;
-            var allocated = JsonSerializer.Deserialize<long[]>(reservation.AllocatedSequencesJson) ?? [];
-            return allocated.Contains(sequence);
+            return reservation is not null && reservation.AllocatedSequencesJson is null && sequence < reservation.NextValue;
         }
         return _allocatedSequences.TryGetValue(repository + "\0" + scope + "\0" + name, out var allocatedSequences) && allocatedSequences.ContainsKey(sequence);
     }
