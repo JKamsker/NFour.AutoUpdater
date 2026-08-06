@@ -13,7 +13,8 @@ public sealed class MirrorService
         var sourceKeys = deleteOrphans ? new HashSet<ObjectKey>() : null;
         var copied = 0;
         var deleted = 0;
-        var selectedKeys = channel is null ? null : await BuildChannelClosureAsync(source, channel, cancellationToken).ConfigureAwait(false);
+        var closure = channel is null ? null : await BuildChannelClosureAsync(source, channel, cancellationToken).ConfigureAwait(false);
+        var selectedKeys = closure?.Keys;
 
         await foreach (var key in source.ListAsync(cancellationToken: cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -48,7 +49,13 @@ public sealed class MirrorService
                 else if (immutable)
                 {
                     if (!await PutImmutableStreamingAsync(source, destination, key, expected, cancellationToken).ConfigureAwait(false))
+                    {
+                        // The destination holds different bytes under an immutable key. That is
+                        // a reported failure, not a copy, and counting it inflated the result
+                        // the operator uses to judge whether the mirror succeeded.
                         diagnostics.Add(new("MIRROR003", DiagnosticSeverity.Error, $"Destination already contains different bytes for immutable object '{key}'."));
+                        continue;
+                    }
                 }
                 else
                 {
@@ -71,7 +78,20 @@ public sealed class MirrorService
 
         if (deleteOrphans && sourceKeys is not null && destination is IListableObjectStore destinationList)
             await foreach (var key in destinationList.ListAsync(cancellationToken: cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
-                if (!sourceKeys.Contains(key)) { await destination.DeleteAsync(key, cancellationToken).ConfigureAwait(false); deleted++; }
+            {
+                if (sourceKeys.Contains(key)) continue;
+                // A channel-filtered mirror only ever saw one channel's closure, so "not in the
+                // source set" does not mean "not in the source" — it mostly means "belongs to a
+                // product or channel this run did not look at". Comparing a partial view against
+                // the whole destination previously deleted every unrelated product.
+                //
+                // Deletion is therefore confined to the products this run actually mirrored,
+                // and never touches content-addressed blobs: those are shared, so a blob still
+                // referenced by another channel would otherwise be removed.
+                if (closure is not null && !closure.CoversForDeletion(key)) continue;
+                await destination.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
+                deleted++;
+            }
         return new MirrorResult(copied, deleted, diagnostics.ToImmutable());
     }
 
@@ -84,9 +104,11 @@ public sealed class MirrorService
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             await using var body = new HashingReadStream(sourceObject.Content, hash);
             bool placed;
-            if (expected is { } digest && destination is IContentAddressedWriteStore addressed && body.CanSeek && key.Value.StartsWith("blobs/", StringComparison.Ordinal))
-                placed = await addressed.PutIfAbsentAsync(key, digest, body, null, cancellationToken).ConfigureAwait(false);
-            else if (destination is IConditionalWriteStore conditional)
+            // The content-addressed overload needs a seekable body so it can hash before
+            // writing, but `body` is a HashingReadStream whose CanSeek is always false. The
+            // branch guarded on it was therefore unreachable, and the digest it would have
+            // enforced is instead checked against sourceHash below.
+            if (destination is IConditionalWriteStore conditional)
                 placed = await conditional.PutIfAbsentAsync(key, body, null, cancellationToken).ConfigureAwait(false);
             else
             {
@@ -134,9 +156,31 @@ public sealed class MirrorService
         return parts.Length == 4 && parts[0] == "products" && parts[2] == "channels" && string.Equals(Path.GetFileNameWithoutExtension(parts[3]), channel, StringComparison.Ordinal);
     }
 
-    private static async ValueTask<HashSet<ObjectKey>> BuildChannelClosureAsync(IReadableObjectStore source, string channel, CancellationToken cancellationToken)
+    /// <summary>
+    /// The set of objects a channel-scoped mirror copies, plus the products it covers.
+    /// </summary>
+    private sealed record ChannelClosure(HashSet<ObjectKey> Keys, HashSet<string> Products)
+    {
+        /// <summary>
+        /// Whether an orphan under this key may be deleted by a channel-scoped mirror.
+        ///
+        /// Only objects belonging to a product this run mirrored are eligible. Blobs are
+        /// always excluded: they are content-addressed and shared, so one channel's mirror
+        /// cannot know whether another channel still references them.
+        /// </summary>
+        public bool CoversForDeletion(ObjectKey key)
+        {
+            if (key.Value.StartsWith("blobs/", StringComparison.Ordinal)) return false;
+            return Products.Any(product =>
+                key.Value.StartsWith($"products/{product}/", StringComparison.Ordinal)
+                || key.Value.StartsWith($"products/{product}.", StringComparison.Ordinal));
+        }
+    }
+
+    private static async ValueTask<ChannelClosure> BuildChannelClosureAsync(IReadableObjectStore source, string channel, CancellationToken cancellationToken)
     {
         var selected = new HashSet<ObjectKey> { new("repo.json") };
+        var products = new HashSet<string>(StringComparer.Ordinal);
         var descriptorResult = await source.OpenAsync(new ObjectKey("repo.json"), cancellationToken: cancellationToken).ConfigureAwait(false);
         if (descriptorResult is null) throw new FileNotFoundException("repo.json");
         RepositoryDescriptor descriptor;
@@ -163,6 +207,8 @@ public sealed class MirrorService
             {
                 var pointerEnvelope = SignedDocument.DeserializeEnvelope(await ReadAllAsync(pointerResult.Content, cancellationToken).ConfigureAwait(false));
                 var pointer = SignedDocument.DeserializePayload<ChannelPointer>(Base64Url.Decode(pointerEnvelope.Payload));
+                if (!Identifier.IsValid(pointer.ProductId, "productId", out var productError)) throw new FormatException(productError);
+                products.Add(pointer.ProductId);
                 var productKey = layout.Product(pointer.ProductId);
                 if (await source.HeadAsync(productKey, cancellationToken).ConfigureAwait(false) is not null)
                     selected.Add(productKey);
@@ -193,7 +239,7 @@ public sealed class MirrorService
                 }
             }
         }
-        return selected;
+        return new ChannelClosure(selected, products);
     }
 
     private static bool IsChannelKey(ObjectKey key, string channel)
