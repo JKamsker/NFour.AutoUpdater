@@ -9,19 +9,18 @@ namespace FourSaas.AutoUpdater.Client;
 /// rename/disposition operations, so validation and mutation share an opened handle.
 internal static class SecureInstallOperations
 {
-    private const int O_RDONLY = 0;
-    private const int O_WRONLY = 1;
-    private const int O_CREAT = 64;
-    private const int O_EXCL = 128;
-    private const int O_DIRECTORY = 0x10000;
-    private const int O_NOFOLLOW = 0x20000;
-    private const int O_CLOEXEC = 0x80000;
-    private const int AT_REMOVEDIR = 0x200;
+    // Open flags and AT_* values differ between Linux and Darwin; see PosixPlatform.
+    // errno values and permission bits agree, so they stay local.
     private const int ENOENT = 2;
     private const int ENOTDIR = 20;
     private const int EEXIST = 17;
-    private const int AT_FDCWD = -100;
+    private const uint Mode0644 = 0x1A4;
+    private const uint Mode0755 = 0x1ED;
     private const ulong FICLONE = 0x40049409;
+
+    private static int DirectoryOpenFlags => PosixPlatform.DirectoryOpenFlags;
+    private static int FileReadFlags => PosixPlatform.FileReadFlags;
+    private static int FileCreateFlags => PosixPlatform.FileCreateFlags;
 
     public static bool Supported => OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() || OperatingSystem.IsWindows();
 
@@ -44,7 +43,7 @@ internal static class SecureInstallOperations
         if (parent is null) return false;
         VerifyParent(parent, expectedParent, path);
 
-        var directoryDescriptor = OpenAt(parent, components[^1], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+        var directoryDescriptor = OpenAt(parent, components[^1], DirectoryOpenFlags, 0);
         if (directoryDescriptor >= 0)
         {
             using var directory = new SafeFileHandle((IntPtr)directoryDescriptor, ownsHandle: true);
@@ -55,7 +54,7 @@ internal static class SecureInstallOperations
         if (directoryError != ENOTDIR && directoryError != ENOENT)
             ThrowLastError($"inspect managed path '{path}'");
 
-        var fileDescriptor = OpenAt(parent, components[^1], O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0);
+        var fileDescriptor = OpenAt(parent, components[^1], FileReadFlags, 0);
         if (fileDescriptor >= 0)
         {
             using var file = new SafeFileHandle((IntPtr)fileDescriptor, ownsHandle: true);
@@ -78,7 +77,7 @@ internal static class SecureInstallOperations
         VerifyParent(parent, expectedParent, path);
         var name = components[^1];
         var temporaryName = ".4sup-new-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
-        if (preferHardLink && !executable && LinkAt(AT_FDCWD, stagedPath, parent, temporaryName, 0) == 0)
+        if (preferHardLink && !executable && LinkAt(PosixPlatform.AT_FDCWD, stagedPath, parent, temporaryName, 0) == 0)
         {
             try
             {
@@ -87,14 +86,14 @@ internal static class SecureInstallOperations
             }
             finally { _ = UnlinkAt(parent, temporaryName, 0); }
         }
-        var descriptor = OpenAt(parent, temporaryName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0x1A4);
+        var descriptor = OpenAt(parent, temporaryName, FileCreateFlags, Mode0644);
         if (descriptor < 0) ThrowLastError($"create temporary file '{path}'");
         try
         {
             using (var destination = new FileStream(new SafeFileHandle((IntPtr)descriptor, ownsHandle: true), FileAccess.Write, 128 * 1024, isAsync: false))
             {
                 var cloned = OperatingSystem.IsLinux() && TryReflink(descriptor, stagedPath);
-                if (executable && Fchmod(descriptor, 0x1ED) != 0)
+                if (executable && Fchmod(descriptor, Mode0755) != 0)
                     ThrowLastError($"set executable mode for '{path}'");
                 if (!cloned) awaitCopy(stagedPath, destination);
             }
@@ -124,7 +123,7 @@ internal static class SecureInstallOperations
 
     private static SafeFileHandle OpenDirectory(string path)
     {
-        var descriptor = Open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+        var descriptor = Open(path, DirectoryOpenFlags, 0);
         if (descriptor < 0) ThrowLastError($"open install root '{path}'");
         return new SafeFileHandle((IntPtr)descriptor, ownsHandle: true);
     }
@@ -144,9 +143,9 @@ internal static class SecureInstallOperations
             var component = components[index];
             if (string.IsNullOrEmpty(component)) continue;
             if (index == components.Count - 1 && path is not null) VerifyParent(current, expectedParent, path.Value);
-            var made = MkdirAt(current, component, 0x1ED);
+            var made = MkdirAt(current, component, Mode0755);
             if (made != 0 && Marshal.GetLastWin32Error() != EEXIST) ThrowLastError($"create managed directory '{component}'");
-            var next = OpenAtHandle(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            var next = OpenAtHandle(current, component, DirectoryOpenFlags);
             current.Dispose();
             current = next;
         }
@@ -159,7 +158,7 @@ internal static class SecureInstallOperations
         foreach (var component in components)
         {
             if (string.IsNullOrEmpty(component)) continue;
-            var nextDescriptor = OpenAt(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+            var nextDescriptor = OpenAt(current, component, DirectoryOpenFlags, 0);
             if (nextDescriptor < 0)
             {
                 current.Dispose();
@@ -189,7 +188,7 @@ internal static class SecureInstallOperations
 
     private static bool TryReflink(int destinationDescriptor, string sourcePath)
     {
-        var sourceDescriptor = Open(sourcePath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0);
+        var sourceDescriptor = Open(sourcePath, FileReadFlags, 0);
         if (sourceDescriptor < 0) return false;
         using var source = new SafeFileHandle((IntPtr)sourceDescriptor, ownsHandle: true);
         return Ioctl(destinationDescriptor, FICLONE, sourceDescriptor) == 0;

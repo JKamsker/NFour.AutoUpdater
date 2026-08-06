@@ -144,7 +144,7 @@ public sealed class InstallLedger
         if (OperatingSystem.IsWindows()) return;
         var directory = Path.GetDirectoryName(_path);
         if (string.IsNullOrEmpty(directory)) return;
-        var descriptor = OpenDirectory(directory, ReadOnly | DirectoryFlag);
+        var descriptor = OpenDirectory(directory, PosixPlatform.O_RDONLY | PosixPlatform.O_DIRECTORY | PosixPlatform.O_CLOEXEC);
         if (descriptor < 0) return;
         try { _ = FlushFile(descriptor); } finally { CloseFile(descriptor); }
     }
@@ -152,8 +152,6 @@ public sealed class InstallLedger
     [DllImport("libc", EntryPoint = "open", SetLastError = true)] private static extern int OpenDirectory(string path, int flags);
     [DllImport("libc", EntryPoint = "fsync", SetLastError = true)] private static extern int FlushFile(int descriptor);
     [DllImport("libc", EntryPoint = "close", SetLastError = true)] private static extern int CloseFile(int descriptor);
-    private const int ReadOnly = 0;
-    private const int DirectoryFlag = 0x10000;
     private sealed record InstallLockRecord(
         [property: JsonPropertyName("k")] string Kind,
         [property: JsonPropertyName("schemaVersion")] int SchemaVersion,
