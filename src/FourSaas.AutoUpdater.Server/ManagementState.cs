@@ -799,11 +799,21 @@ public sealed class ManagementState
                     await PersistPromotionAsync(consumedGrant, session.Repository, verifiedAt, cancellationToken).ConfigureAwait(false);
                     verified.Add(grant.Digest.ToString());
                 }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    if (createdDestination && promotedDestination is { } failedDestination) { try { await _store.DeleteAsync(failedDestination, CancellationToken.None).ConfigureAwait(false); } catch (Exception) { } }
-                    await InvalidateGrantAsync(grant).ConfigureAwait(false);
-                    await QuarantineStagedObjectAsync(grant).ConfigureAwait(false);
+                    // The caller went away — a client disconnect, a shutdown, a timeout. That
+                    // says nothing about the staged bytes, which were uploaded successfully and
+                    // may represent a very large transfer. Invalidating the grant and
+                    // quarantining staging here (as the generic handler below does, and as this
+                    // path used to do because its filter was inverted) discards valid content
+                    // that the publisher would have to upload again.
+                    //
+                    // Only this request's own progress is undone: the partially promoted
+                    // destination is removed because its verification barrier never ran, and
+                    // the claim is released so a retry can pick the grant up. Staging is left
+                    // exactly as it was.
+                    if (createdDestination && promotedDestination is { } cancelledDestination) { try { await _store.DeleteAsync(cancelledDestination, CancellationToken.None).ConfigureAwait(false); } catch (Exception) { } }
+                    await ReleaseGrantClaimAsync(grant).ConfigureAwait(false);
                     throw;
                 }
                 catch
@@ -833,6 +843,25 @@ public sealed class ManagementState
         RecordAudit("publisher", "publish.session.seal", $"{session.Repository}/{sessionId}", "accepted");
         Persist();
         return Results.Ok(new { sealedSession = true, verified = verified.ToArray(), promoted = verified.ToArray() });
+    }
+
+    /// <summary>
+    /// Returns a claimed grant to the issued state so a later seal can retry it.
+    ///
+    /// Used when a seal is abandoned for a reason that says nothing about the staged content,
+    /// principally caller cancellation. The grant stays usable and its staged object is left
+    /// untouched; only this attempt's exclusive claim is given up. Uses CancellationToken.None
+    /// deliberately — the token that triggered this path is already cancelled, and failing to
+    /// release the claim would strand the grant until its lease expires.
+    /// </summary>
+    private async Task ReleaseGrantClaimAsync(GrantState grant)
+    {
+        if (!Grants.TryGetValue(grant.Id, out var current) || current.Status != GrantClaimed || current.Used) return;
+        var released = current with { Status = GrantIssued, ClaimedAt = null };
+        Grants[grant.Id] = released;
+        Persist();
+        try { await UpsertGrantAsync(released, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception) { /* The claim lease expires on its own if this cannot be recorded. */ }
     }
 
     private async Task<bool> TryClaimGrantAsync(GrantState grant, CancellationToken cancellationToken)
