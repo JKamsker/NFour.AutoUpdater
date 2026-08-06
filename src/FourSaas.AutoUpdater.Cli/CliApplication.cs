@@ -555,7 +555,7 @@ public static class CliApplication
             throw new CryptographicException($"Repository release '{verified.Lock.ReleaseId}' does not reproduce the historical file set recorded for local rollback.");
         var current = previous?.Files;
         var observedPaths = (current?.Keys ?? Enumerable.Empty<VirtualPath>()).Concat(composed.Files.Keys);
-        var observed = await new LocalTreeScanner().ScanAsync(installRoot, observedPaths, composed.Files.Keys, HashPolicy.Changed).ConfigureAwait(false);
+        var observed = await new LocalTreeScanner().ScanAsync(installRoot, observedPaths, composed.Files.Keys, HashPolicy.Changed, current).ConfigureAwait(false);
         var plan = new InstallPlanner().Plan(composed, current, observed);
         if (!apply || args.Contains("--dry-run", StringComparer.Ordinal))
         {

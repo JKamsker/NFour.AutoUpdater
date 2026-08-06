@@ -141,6 +141,41 @@ public sealed class ClientTests
     }
 
     [Fact]
+    public async Task LocallyModifiedFilesAreRewrittenEvenWhenNoHashWasObserved()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "4sup-nohash-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "bin"));
+        try
+        {
+            var path = new VirtualPath("bin/game.exe");
+            var wanted = "wanted"u8.ToArray();
+            var hash = ContentHash.Compute(wanted);
+            var file = new ComposedFile(path, hash, wanted.Length, new PackageId("core"), FileInstallPolicy.Replace);
+            var files = new Dictionary<VirtualPath, ComposedFile> { [path] = file }.ToImmutableSortedDictionary();
+            var target = new ComposedFileSet { Files = files, Shadowed = [], FileSetId = FileSetIdentity.Compute(files) };
+
+            // The file on disk has been modified locally since it was installed, so its size
+            // and mtime no longer match what the ledger recorded.
+            var full = Path.Combine(root, "bin", "game.exe");
+            await File.WriteAllBytesAsync(full, "locally-tampered"u8.ToArray());
+
+            var ledger = new Dictionary<VirtualPath, InstalledFile>
+            {
+                [path] = new(path, hash, wanted.Length, new PackageId("core"), FileInstallPolicy.Replace, wanted.Length, 0)
+            };
+
+            // HashPolicy.Never observes no content hash at all. The planner must not read that
+            // absence as "unchanged" just because the ledger hash still matches the target.
+            var observed = await new LocalTreeScanner().ScanAsync(root, ledger.Keys, [path], HashPolicy.Never);
+            var plan = new InstallPlanner().Plan(target, ledger, observed);
+
+            Assert.Contains(plan.Operations, op => op is FileOperation.Write write && write.Path == path);
+            Assert.DoesNotContain(plan.Operations, op => op is FileOperation.Keep);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public async Task CacheMutationIsRejectedBeforeMaterialisation()
     {
         var root = Path.Combine(Path.GetTempPath(), "4sup-cache-" + Guid.NewGuid().ToString("N"));

@@ -36,7 +36,11 @@ public sealed record InstallPlan
 
 public interface ITreeScanner
 {
-    ValueTask<ObservedTreeSnapshot> ScanAsync(string installRoot, IEnumerable<VirtualPath> ledgerPaths, IEnumerable<VirtualPath> targetPaths, HashPolicy hashPolicy, CancellationToken cancellationToken = default);
+    /// <param name="ledger">
+    /// Previously recorded observations, used by <see cref="HashPolicy.Changed"/> to decide
+    /// which files actually need re-hashing. Without it, Changed degrades to Always.
+    /// </param>
+    ValueTask<ObservedTreeSnapshot> ScanAsync(string installRoot, IEnumerable<VirtualPath> ledgerPaths, IEnumerable<VirtualPath> targetPaths, HashPolicy hashPolicy, IReadOnlyDictionary<VirtualPath, InstalledFile>? ledger = null, CancellationToken cancellationToken = default);
 }
 public interface IInstallPlanner
 {
@@ -60,7 +64,16 @@ public sealed class InstallPlanner : IInstallPlanner
                 else { operations.Add(new FileOperation.Write(path, want.Content, want.Size, want.Owner, want.Policy, want.Mode)); AddBlob(want.Content, want.Size); }
                 continue;
             }
-            var observedMatches = observation is { Exists: true, Kind: ObservedKind.File } && (observation.Hash is null || observation.Hash == want.Content);
+            // A missing observed hash is absence of evidence, not evidence of a match. Under
+            // HashPolicy.Never (and for files Changed skipped) nothing was hashed at all, so
+            // treating null as "matches" meant a locally modified file was kept purely because
+            // the *ledger's* hash still matched the target. The explicit policy is to trust the
+            // ledger's own record of what was written, and to detect local modification by
+            // comparing the file's current size and mtime against that record.
+            var observedMatches = observation is { Exists: true, Kind: ObservedKind.File }
+                && (observation.Hash is { } observedHash
+                    ? observedHash == want.Content
+                    : have.ObservedSize == observation.Size && have.ObservedMtimeUnix == observation.MtimeUnixSeconds);
             if (want.Kind == FileEntryKind.Directory)
             {
                 if (observation is { Exists: true, Kind: ObservedKind.Directory }) operations.Add(new FileOperation.Keep(path));
@@ -104,7 +117,7 @@ public sealed class InstallPlanner : IInstallPlanner
 
 public sealed class LocalTreeScanner : ITreeScanner
 {
-    public async ValueTask<ObservedTreeSnapshot> ScanAsync(string installRoot, IEnumerable<VirtualPath> ledgerPaths, IEnumerable<VirtualPath> targetPaths, HashPolicy hashPolicy, CancellationToken cancellationToken = default)
+    public async ValueTask<ObservedTreeSnapshot> ScanAsync(string installRoot, IEnumerable<VirtualPath> ledgerPaths, IEnumerable<VirtualPath> targetPaths, HashPolicy hashPolicy, IReadOnlyDictionary<VirtualPath, InstalledFile>? ledger = null, CancellationToken cancellationToken = default)
     {
         var entries = ImmutableDictionary.CreateBuilder<VirtualPath, ObservedEntry>();
         var requested = new HashSet<VirtualPath>(ledgerPaths.Concat(targetPaths));
@@ -126,8 +139,24 @@ public sealed class LocalTreeScanner : ITreeScanner
             }
             else if (info.Exists)
             {
+                // Changed means "hash only what the ledger says might have moved". Hashing
+                // every file the way Always does defeats the point of the policy on a large
+                // install; a file whose size and mtime still match what was recorded when it
+                // was written is left unhashed, and the planner falls back to that same
+                // ledger evidence to decide whether it still matches.
+                var unchangedSinceLedger = ledger is not null
+                    && ledger.TryGetValue(path, out var recorded)
+                    && recorded.ObservedSize == info.Length
+                    && recorded.ObservedMtimeUnix == new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeSeconds();
+                var needsHash = hashPolicy switch
+                {
+                    HashPolicy.Always => true,
+                    HashPolicy.Changed => !unchangedSinceLedger,
+                    _ => false
+                };
+
                 ContentHash? hash = null;
-                if (hashPolicy != HashPolicy.Never) await using (var stream = info.OpenRead()) hash = await ContentHash.ComputeAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+                if (needsHash) await using (var stream = info.OpenRead()) hash = await ContentHash.ComputeAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
                 entries[path] = new(path, true, info.Attributes.HasFlag(FileAttributes.ReparsePoint) ? ObservedKind.Reparse : ObservedKind.File, info.Length, new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeSeconds(), FileIdentityProvider.TryGet(full, out var fileIdentity) ? fileIdentity : new FileIdentity($"{info.Length}:{info.LastWriteTimeUtc.Ticks}"), hash);
             }
             else entries[path] = new(path, false, ObservedKind.Other, 0, 0, null, null);
