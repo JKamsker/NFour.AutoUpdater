@@ -61,7 +61,19 @@ public sealed class ManagementState
     private readonly IWritableObjectStore? _stagingStore;
     private readonly RepositoryLayout _layout = new(new RepositoryLayoutTemplates());
     private readonly object _sealGate = new();
+    // Separate lock domains. A single global gate previously serialised sequence
+    // allocation, grant minting, multipart operations, package registration, signed-document
+    // placement and the entire seal — including multi-gigabyte copies. One slow upload could
+    // therefore block essentially every control-plane mutation in the process, which is
+    // trivial availability degradation rather than a concurrency control.
+    //
+    // These protect short, in-memory critical sections over unrelated state. Bulk I/O is not
+    // performed while holding any of them; per-grant exclusion during promotion comes from
+    // the durable claim in TryClaimGrantAsync, not from a process lock.
     private readonly SemaphoreSlim _placementGate = new(1, 1);
+    private readonly SemaphoreSlim _sequenceGate = new(1, 1);
+    private readonly SemaphoreSlim _packageGate = new(1, 1);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly string? _persistencePath;
     private readonly IDbContextFactory<ManagementDbContext>? _databaseFactory;
     private readonly string? _repositoryId;
@@ -336,7 +348,7 @@ public sealed class ManagementState
         if (!IsConfiguredRepository(repository) || !Identifier.IsValid(repository, "repository", out var repositoryError)) return Results.NotFound();
         if (scope is not ("package" or "release" or "channel" or "revocation") || string.IsNullOrWhiteSpace(name) || name.Any(char.IsControl)) return Results.BadRequest(new { error = "invalid_sequence_scope" });
         long allocated;
-        await _placementGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _sequenceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var key = repository + "\0" + scope + "\0" + name;
@@ -375,7 +387,7 @@ public sealed class ManagementState
                 _allocatedSequences.GetOrAdd(key, _ => new ConcurrentDictionary<long, byte>())[allocated] = 0;
             }
         }
-        finally { _placementGate.Release(); }
+        finally { _sequenceGate.Release(); }
         RecordAudit("publisher", "sequence.allocate", $"{repository}/{scope}/{name}", "accepted");
         return Results.Ok(new { repository, scope, name, sequence = allocated });
     }
@@ -693,11 +705,31 @@ public sealed class ManagementState
         return Math.Min(partSize, totalLength - firstByte);
     }
 
+    /// <summary>
+    /// Seals a publish session and promotes its staged objects.
+    ///
+    /// Scoped to a per-session gate rather than the global placement gate: promotion copies
+    /// and rehashes every staged object, which for a large session is minutes of I/O. Holding
+    /// a process-wide lock across that made one slow upload block sequence allocation, grant
+    /// minting and document placement for every other repository in the process.
+    ///
+    /// Correctness of concurrent promotion does not depend on this gate. Each grant is claimed
+    /// through a conditional durable state transition (see TryClaimGrantAsync), so two seals
+    /// racing the same grant — in this process or another instance — cannot both promote it.
+    /// The gate only keeps a single session's own concurrent seals from duplicating work.
+    /// </summary>
     public async Task<IResult> SealSessionAsync(string repository, string sessionId, CancellationToken cancellationToken = default)
     {
-        await _placementGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var gate = _sessionGates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try { await RefreshPublishStateAsync(cancellationToken).ConfigureAwait(false); return await SealSessionCoreAsync(repository, sessionId, cancellationToken).ConfigureAwait(false); }
-        finally { _placementGate.Release(); }
+        finally
+        {
+            gate.Release();
+            // Sessions are finite and short-lived; drop the gate once the session is gone so
+            // the map does not grow for the lifetime of the process.
+            if (!PublishSessions.ContainsKey(sessionId) && _sessionGates.TryRemove(sessionId, out var removed)) removed.Dispose();
+        }
     }
 
     private async Task<IResult> SealSessionCoreAsync(string repository, string sessionId, CancellationToken cancellationToken = default)
@@ -1059,7 +1091,7 @@ public sealed class ManagementState
         try { manifest = RepositoryJson.DeserializeManifest(bytes); }
         catch (Exception ex) when (ex is FormatException or JsonException) { return Results.BadRequest(new { error = "invalid_manifest", detail = ex.Message }); }
         if (manifest.Id != packageId) return Results.BadRequest(new { error = "package_identity_mismatch" });
-        await _placementGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _packageGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
         var key = (repository, package, manifest.Version.Label);
@@ -1090,7 +1122,7 @@ public sealed class ManagementState
         RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "package.register", $"{repository}/{package}/{manifest.Version.Label}", "accepted");
         return Results.Created($"/api/v1/repositories/{repository}/packages/{package}/versions/{manifest.Version.Label}", new { package, version = manifest.Version.Label, immutable = false });
         }
-        finally { _placementGate.Release(); }
+        finally { _packageGate.Release(); }
     }
 
     public async Task<IResult> RegisterFileTableAsync(string repository, string package, string version, HttpRequest request, CancellationToken cancellationToken = default)
