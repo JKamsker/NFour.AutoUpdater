@@ -1785,6 +1785,9 @@ public sealed class ManagementState
         Dictionary<string, long[]>? AllocatedSequences = null,
         bool RepositoryUnavailable = false);
 
+    /// <summary>Audit tail included in the ephemeral state snapshot.</summary>
+    private const int PersistedAuditEvents = 512;
+
     private void Persist()
     {
         if (_persistencePath is null) return;
@@ -1793,7 +1796,11 @@ public sealed class ManagementState
             var state = new StoredState(
                 Channels.ToDictionary(x => x.Key.Product + "\0" + x.Key.Channel, x => x.Value, StringComparer.Ordinal),
                 Releases.ToDictionary(x => x.Key.Product + "\0" + x.Key.Release, x => x.Value, StringComparer.Ordinal),
-                Products.Keys.ToArray(), PublishSessions.ToDictionary(), Grants.ToDictionary(), VerifiedBlobs.ToDictionary(), TrustedKeys.ToDictionary(), AuditEvents.ToArray(),
+                Products.Keys.ToArray(), PublishSessions.ToDictionary(), Grants.ToDictionary(), VerifiedBlobs.ToDictionary(), TrustedKeys.ToDictionary(),
+                // Only the recent tail of the audit trail is snapshotted. The ephemeral state
+                // file is a crash-recovery aid, not the audit system of record, and writing
+                // the full history on every mutation made each mutation cost O(history).
+                AuditEvents.TakeLast(PersistedAuditEvents).ToArray(),
                 PackageVersions.ToDictionary(x => x.Key.Repository + "\0" + x.Key.Package + "\0" + x.Key.Version, x => x.Value, StringComparer.Ordinal),
                 PackageFileTableRegistrations.ToDictionary(x => x.Key.Repository + "\0" + x.Key.Package + "\0" + x.Key.Version, x => x.Value, StringComparer.Ordinal),
                 PublishedPackageVersions.ToDictionary(x => x.Key.Repository + "\0" + x.Key.Package + "\0" + x.Key.Version, x => x.Value, StringComparer.Ordinal),
@@ -1895,12 +1902,62 @@ public sealed class ManagementState
         ?? "unknown";
 
     private static string Scoped(string repository, ContentHash hash) => repository + "\0" + hash;
+    /// <summary>Audit events retained in memory. Older entries are dropped past this bound.</summary>
+    private const int MaximumRetainedAuditEvents = 10_000;
+
+    /// <summary>
+    /// Records an audit event.
+    ///
+    /// The database write used to be performed as UpsertAuditAsync(...).GetAwaiter().GetResult()
+    /// from inside request handling. Blocking a thread-pool thread on an async database call
+    /// while under load is how a server deadlocks itself: every thread ends up waiting for a
+    /// continuation that needs a thread to run. The write is queued instead and drained by a
+    /// single background writer, so audit never blocks the request path.
+    ///
+    /// The in-memory queue is bounded. It previously grew for the lifetime of the process and
+    /// was serialised in full by every Persist() call, so each mutation rewrote the entire
+    /// audit history — cost per mutation grew with the number of mutations already made.
+    /// </summary>
     private void RecordAudit(string actor, string action, string resource, string outcome)
     {
         var item = new AuditEvent(DateTimeOffset.UtcNow, actor, action, resource, outcome);
         AuditEvents.Enqueue(item);
+        while (AuditEvents.Count > MaximumRetainedAuditEvents && AuditEvents.TryDequeue(out _)) { }
         Persist();
-        UpsertAuditAsync(item).GetAwaiter().GetResult();
+        QueueAuditWrite(item);
+    }
+
+    private readonly System.Threading.Channels.Channel<AuditEvent> _auditWrites =
+        System.Threading.Channels.Channel.CreateBounded<AuditEvent>(new System.Threading.Channels.BoundedChannelOptions(MaximumRetainedAuditEvents)
+        {
+            SingleReader = true,
+            // Audit is evidence, not control flow: shedding the oldest pending write under
+            // extreme pressure is preferable to blocking a request or growing without bound.
+            FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
+        });
+    private Task? _auditWriter;
+    private readonly object _auditWriterGate = new();
+
+    private void QueueAuditWrite(AuditEvent item)
+    {
+        if (_databaseFactory is null) return;
+        _auditWrites.Writer.TryWrite(item);
+        if (_auditWriter is not null) return;
+        lock (_auditWriterGate)
+        {
+            _auditWriter ??= Task.Run(DrainAuditWritesAsync);
+        }
+    }
+
+    private async Task DrainAuditWritesAsync()
+    {
+        await foreach (var item in _auditWrites.Reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            // A failed audit write must not take down the writer loop; the next event still
+            // needs to be attempted.
+            try { await UpsertAuditAsync(item).ConfigureAwait(false); }
+            catch (Exception) { }
+        }
     }
     private static async ValueTask<byte[]> ReadAllAsync(Stream stream, CancellationToken cancellationToken)
     {
