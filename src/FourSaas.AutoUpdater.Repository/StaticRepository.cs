@@ -170,7 +170,7 @@ public static class FileTableSharding
     public static ContentHash ComputeTableDigest(IEnumerable<FileTableShardRef> shards)
     {
         using var stream = new MemoryStream();
-        foreach (var shard in shards.OrderBy(static x => x.Index)) stream.Write(shard.Digest.Value.Span);
+        foreach (var shard in shards.OrderBy(static x => x.Index)) stream.Write(shard.Digest.Span);
         return ContentHash.Compute(stream.ToArray());
     }
 }

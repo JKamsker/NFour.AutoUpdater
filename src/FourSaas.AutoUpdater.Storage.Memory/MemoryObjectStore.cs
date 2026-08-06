@@ -71,7 +71,7 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
     }
     public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
-        if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Value.Span).ToLowerInvariant(), StringComparison.Ordinal))
+        if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Span).ToLowerInvariant(), StringComparison.Ordinal))
             throw new FormatException("Content-addressed writes require a sha256 digest encoded in the final object-key segment.");
         var entry = await CreateEntryAsync(content, cancellationToken).ConfigureAwait(false);
         if (ContentHash.Compute(entry.Bytes, HashAlgorithmId.Sha256) != expectedDigest) throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");

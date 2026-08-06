@@ -48,7 +48,7 @@ public sealed class StorageTests
         await using var store = factory(root);
         var addressed = Assert.IsAssignableFrom<IContentAddressedWriteStore>(store);
         var bytes = Encoding.UTF8.GetBytes("cas"); var hash = ContentHash.Compute(bytes);
-        var key = new ObjectKey("blobs/sha256/ca/s/" + Convert.ToHexString(hash.Value.Span).ToLowerInvariant());
+        var key = new ObjectKey("blobs/sha256/ca/s/" + Convert.ToHexString(hash.Span).ToLowerInvariant());
         await Assert.ThrowsAsync<CryptographicException>(async () => await addressed.PutIfAbsentAsync(key, hash, new MemoryStream("bad"u8.ToArray()), 3));
         Assert.True(await addressed.PutIfAbsentAsync(key, hash, new MemoryStream(bytes), bytes.Length));
         Assert.False(await addressed.PutIfAbsentAsync(key, hash, new MemoryStream(bytes), bytes.Length));

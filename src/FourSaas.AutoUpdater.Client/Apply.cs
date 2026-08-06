@@ -326,7 +326,7 @@ public sealed class InstallApplier
         await Parallel.ForEachAsync(plan.BlobsToFetch, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = cancellationToken }, async (blob, token) =>
         {
             token.ThrowIfCancellationRequested();
-            var key = layout.Blob(blob.Content); var path = Path.Combine(staging, Convert.ToHexString(blob.Content.Value.Span).ToLowerInvariant());
+            var key = layout.Blob(blob.Content); var path = Path.Combine(staging, Convert.ToHexString(blob.Content.Span).ToLowerInvariant());
             long fetchedLength;
             if (cache is not null && await cache.TryGetAsync(blob.Content, token).ConfigureAwait(false))
             {
@@ -398,7 +398,7 @@ public sealed class InstallApplier
                     }
                     if (shouldWrite)
                     {
-                        var staged = Path.Combine(staging, Convert.ToHexString(write.Content.Value.Span).ToLowerInvariant());
+                        var staged = Path.Combine(staging, Convert.ToHexString(write.Content.Span).ToLowerInvariant());
                         if (!File.Exists(staged)) throw new InvalidDataException($"Verified staging blob for '{write.Path}' is missing.");
                         await VerifyStagedBlobAsync(staged, write.Content, cancellationToken).ConfigureAwait(false);
                         if (new FileInfo(staged).Length != write.Size) throw new InvalidDataException($"Verified blob size for '{write.Path}' does not match the manifest.");

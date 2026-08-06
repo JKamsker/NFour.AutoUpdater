@@ -68,7 +68,7 @@ public sealed class ClientTests
         {
             await using var bad = new FourSaas.AutoUpdater.Storage.Memory.MemoryObjectStore();
             await using var good = new FourSaas.AutoUpdater.Storage.Memory.MemoryObjectStore();
-            var expectedBytes = "correct"u8.ToArray(); var expected = ContentHash.Compute(expectedBytes); var key = new ObjectKey("blobs/sha256/00/00/" + Convert.ToHexString(expected.Value.Span).ToLowerInvariant());
+            var expectedBytes = "correct"u8.ToArray(); var expected = ContentHash.Compute(expectedBytes); var key = new ObjectKey("blobs/sha256/00/00/" + Convert.ToHexString(expected.Span).ToLowerInvariant());
             await bad.PutAsync(key, new MemoryStream("poisoned"u8.ToArray()));
             await good.PutAsync(key, new MemoryStream(expectedBytes));
             var staging = Path.Combine(root, "staging");
@@ -89,7 +89,7 @@ public sealed class ClientTests
             await using var inner = new FourSaas.AutoUpdater.Storage.Memory.MemoryObjectStore();
             var bytes = Enumerable.Range(0, 128).Select(x => (byte)x).ToArray();
             var hash = ContentHash.Compute(bytes);
-            var key = new ObjectKey("blobs/sha256/00/00/" + Convert.ToHexString(hash.Value.Span).ToLowerInvariant());
+            var key = new ObjectKey("blobs/sha256/00/00/" + Convert.ToHexString(hash.Span).ToLowerInvariant());
             await inner.PutAsync(key, new MemoryStream(bytes, writable: false), bytes.Length);
             await using var faulty = new FaultyObjectStore(inner) { FailAfterBytes = 17 };
             var staging = Path.Combine(root, "blob");

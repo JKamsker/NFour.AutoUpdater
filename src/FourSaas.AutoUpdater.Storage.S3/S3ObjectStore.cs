@@ -141,7 +141,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
     {
         EnsureConditionalWrites();
         if (expectedDigest.Algorithm != HashAlgorithmId.Sha256) throw new NotSupportedException("S3 storage-enforced CAS requires sha256.");
-        var expectedHex = Convert.ToHexString(expectedDigest.Value.Span).ToLowerInvariant();
+        var expectedHex = Convert.ToHexString(expectedDigest.Span).ToLowerInvariant();
         if (!string.Equals(key.Value.Split('/').Last(), expectedHex, StringComparison.Ordinal)) throw new ArgumentException("CAS key must end in the expected sha256 digest.", nameof(key));
         if (!content.CanSeek)
         {

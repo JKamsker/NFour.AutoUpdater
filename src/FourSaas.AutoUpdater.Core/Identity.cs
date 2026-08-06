@@ -24,7 +24,30 @@ public readonly struct ContentHash : IEquatable<ContentHash>, IComparable<Conten
         : this(algorithm, value.Span) { }
 
     public HashAlgorithmId Algorithm { get; }
-    public ReadOnlyMemory<byte> Value => _bytes ?? ReadOnlyMemory<byte>.Empty;
+
+    /// <summary>
+    /// The digest bytes, as a span that cannot be written through and cannot be unwrapped to
+    /// the backing array. Prefer this over <see cref="Value"/> everywhere inside the solution.
+    /// </summary>
+    /// <remarks>
+    /// JsonIgnore is required, not cosmetic: System.Text.Json reflects over public properties
+    /// and throws for a ref struct, so without it any type containing a ContentHash fails to
+    /// serialize.
+    /// </remarks>
+    [JsonIgnore]
+    public ReadOnlySpan<byte> Span => _bytes ?? [];
+
+    /// <summary>
+    /// The digest bytes as a defensive copy.
+    /// </summary>
+    /// <remarks>
+    /// This used to wrap the internal array directly. ReadOnlyMemory can be unwrapped with
+    /// MemoryMarshal.TryGetArray, so a caller could reach the backing store and mutate a value
+    /// that had already been used as a dictionary key or had already passed verification —
+    /// changing what a "verified" hash means after the fact. The copy makes that impossible;
+    /// callers that only need to read should use <see cref="Span"/> and pay nothing.
+    /// </remarks>
+    public ReadOnlyMemory<byte> Value => _bytes is null ? ReadOnlyMemory<byte>.Empty : _bytes.AsSpan().ToArray();
 
     public bool IsValid => _bytes is not null && IsValidLength(Algorithm, _bytes.Length);
 
@@ -125,23 +148,23 @@ public readonly struct ContentHash : IEquatable<ContentHash>, IComparable<Conten
     }
 
     public override string ToString() => IsValid
-        ? $"{AlgorithmName(Algorithm)}:{Convert.ToHexString(Value.Span).ToLowerInvariant()}"
+        ? $"{AlgorithmName(Algorithm)}:{Convert.ToHexString(Span).ToLowerInvariant()}"
         : throw new InvalidOperationException("The default ContentHash is invalid.");
 
-    public bool Equals(ContentHash other) => Algorithm == other.Algorithm && Value.Span.SequenceEqual(other.Value.Span);
+    public bool Equals(ContentHash other) => Algorithm == other.Algorithm && Span.SequenceEqual(other.Span);
     public override bool Equals(object? obj) => obj is ContentHash other && Equals(other);
     public override int GetHashCode()
     {
         var hash = new HashCode();
         hash.Add(Algorithm);
-        foreach (var b in Value.Span) hash.Add(b);
+        foreach (var b in Span) hash.Add(b);
         return hash.ToHashCode();
     }
 
     public int CompareTo(ContentHash other)
     {
         var algorithm = Algorithm.CompareTo(other.Algorithm);
-        return algorithm != 0 ? algorithm : Value.Span.SequenceCompareTo(other.Value.Span);
+        return algorithm != 0 ? algorithm : Span.SequenceCompareTo(other.Span);
     }
 
     public static bool operator ==(ContentHash left, ContentHash right) => left.Equals(right);

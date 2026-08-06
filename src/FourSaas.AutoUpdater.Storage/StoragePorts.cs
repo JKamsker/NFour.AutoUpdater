@@ -376,6 +376,6 @@ public sealed class RepositoryLayout
             throw new FormatException($"Repository layout value '{name}' is not a valid lowercase identifier.");
     }
 
-    private static string Hex(ContentHash hash) => Convert.ToHexString(hash.Value.Span).ToLowerInvariant();
+    private static string Hex(ContentHash hash) => Convert.ToHexString(hash.Span).ToLowerInvariant();
     private static string Algorithm(HashAlgorithmId algorithm) => algorithm switch { HashAlgorithmId.Sha256 => "sha256", HashAlgorithmId.Sha512 => "sha512", HashAlgorithmId.Md5 => "md5", HashAlgorithmId.Blake3 => "blake3", _ => throw new ArgumentOutOfRangeException(nameof(algorithm)) };
 }

@@ -230,7 +230,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
 
     private static void ValidateCasKey(ObjectKey key, ContentHash expectedDigest)
     {
-        if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Value.Span).ToLowerInvariant(), StringComparison.Ordinal))
+        if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Span).ToLowerInvariant(), StringComparison.Ordinal))
             throw new FormatException("Content-addressed writes require a sha256 digest encoded in the final object-key segment.");
     }
 
