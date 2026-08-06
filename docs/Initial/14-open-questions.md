@@ -12,13 +12,13 @@ its authoritative record, not a discussion.
 
 | # | Topic | Status |
 |---|---|---|
-| Q1 | Engine globs `ui/**` at startup? | **OPEN — blocking** |
+| Q1 | Engine globs `ui/**` at startup? | **ASSUMED — globbing.** Unconfirmed, but the client is ours to change if not; see Q1 |
 | Q2 | Build-tree partitioning / `slice.yaml` ownership | **OPEN — blocking** |
-| Q3 | UI packages: full subtree or thin overlay | **OPEN — blocking** |
+| Q3 | UI packages: full subtree or thin overlay | **DECIDED — full subtree.** The two UIs do not share bulk paths today; see Q3 |
 | Q4 | Which axes are post-install switchable | **OPEN** |
 | Q5 | Ed25519 signing in v1 | **DECIDED — yes.** Architecturally mandatory; the envelope is normative in [17](17-signed-documents.md) and is a Phase 0 exit criterion |
 | Q6 | Deployment topology and GC ownership | **OPEN** |
-| Q7 | Small-file bundling in v1 | **OPEN — blocking, format decision** |
+| Q7 | Small-file bundling in v1 | **DEFERRED — backlog.** Out of scope for v1; see Q7 |
 | Q8 | Sub-file delta / CDC | **DEFERRED.** Reserve the `d` field; revisit in Phase 8 |
 | Q9 | Symlinks, exec bits, empty directories | **DECIDED.** Symlinks rejected at publish; `pol:"executable"` + `mode`; empty dirs via `k:"dir"` ([05](05-repository-format.md) §8) |
 | Q10 | Naming (`FourSaas.*` vs `NFour.*`) | **OPEN — cheap now, annoying later** |
@@ -46,6 +46,21 @@ would load a mix of classic and modern atlases if both were present.
 **Needs:** someone with TClient engine knowledge.
 **Recommendation:** assume globbing until proven otherwise; it is the safe assumption and the
 cost of being wrong is one extra health check.
+
+### Answer — assume globbing (2026-08-06)
+
+The engine's actual behaviour is not known, but the client is ours to modify
+(the 4SaaS / NFourServer tree), so if it turns out to load by explicit manifest path
+we can keep it that way, and if it globs we can leave it globbing. Either way the safe
+assumption is the one that costs least when wrong.
+
+**Consequence to implement:** `verify --rebuild-state` is wired into the launcher's startup
+health check rather than left as a manual command. On a lost ledger a globbing engine would
+otherwise load a mix of classic and modern assets and present as a visibly broken game; with
+the health check the worst case is a slightly larger install.
+
+This is a cheap insurance policy, not a blocker. It stays valid whichever way the engine
+actually behaves, so nothing further needs confirming before Phase 1 ends.
 
 ---
 
@@ -80,6 +95,21 @@ cost a player experiences:
 **Needs:** whoever built the second UI.
 **Recommendation:** full-subtree packages unless the shared base is genuinely large. The
 override surface is where mistakes hide.
+
+### Answer — full-subtree packages (2026-08-06)
+
+The two UIs do not currently occupy the same virtual paths. Shared-path UI switching is a
+future use case, not a present one; comparable projects achieve it by patching binaries
+instead.
+
+So `ui.classic` and `ui.modern` are full-subtree packages that replace their own trees. No
+`overrides` declarations are needed between them, and the `PKG002` shadowing surface stays
+empty for this axis — which is the outcome worth having, because that surface is where
+packaging mistakes hide.
+
+**If shared bulk paths arrive later**, this becomes the thin-overlay row of the table above:
+the format already supports it (`overrides` plus layer ordering), so it is a repackaging job
+rather than a redesign. Nothing here forecloses it.
 
 ---
 
@@ -125,7 +155,21 @@ age ≥ the maximum publish duration.
 
 ---
 
-## Q7 — Small-file bundling: v1 or deferred? **BLOCKING — format decision**
+## Q7 — Small-file bundling: v1 or deferred? **DEFERRED — backlog**
+
+### Answer — deferred (2026-08-06)
+
+Out of scope for v1; tracked in the backlog.
+
+Recording the consequence honestly, because this one is hard to retrofit: v1 ships one object
+per file. A package with many small files therefore costs one request each on first install,
+which is the case that makes FTP and other per-request-expensive backends slow. The
+`fileTable` row format already reserves room for a bundle reference, so adding bundling later
+is an additive format change rather than a breaking one — but every client that shipped before
+it will not understand bundles, so the rollout needs a `minimumClientVersion` bump.
+
+**Backlog entry:** small-file bundling — pack sub-N-KB files into shared bundle objects,
+addressed by (bundle digest, offset, length).
 
 Without bundling, 50k changed files is 50k GETs:
 
