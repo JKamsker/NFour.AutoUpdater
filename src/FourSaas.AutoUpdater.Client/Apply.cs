@@ -311,6 +311,11 @@ public sealed class InstallApplier
             }
         }
         else await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
+
+        // An apply that was interrupted between moving a file aside and completing its
+        // replacement leaves a backup behind. Recovery is the point at which those become
+        // unreachable, so they are swept here rather than left to accumulate.
+        RemoveStaleBackups(installRoot, plan);
         var total = plan.BytesToDownload; var downloaded = 0L; var fetchNumber = 0;
         await progress.ReportAsync(new ApplyProgress { Phase = ApplyPhase.Fetching, DownloadedBytes = 0, TotalDownloadBytes = total, WrittenBytes = 0, TotalWriteBytes = plan.BytesToWrite, FilesDone = 0, FilesTotal = plan.Operations.Length }, cancellationToken).ConfigureAwait(false);
         var configuredParallelism = int.TryParse(Environment.GetEnvironmentVariable("FOURSUP_PARALLELISM"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var configured) ? configured : source.RecommendedParallelism;
@@ -409,7 +414,7 @@ public sealed class InstallApplier
                                 if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) TryApplyMode(temporary, PosixFileMode.Resolve(write.Mode, write.Policy));
                                 if (File.Exists(destination!))
                                 {
-                                    var aside = destination + ".old-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+                                    var aside = destination + AsideSuffix + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
                                     File.Move(destination!, aside, overwrite: false);
                                     try { File.Move(temporary, destination!, overwrite: false); }
                                     catch
@@ -417,6 +422,11 @@ public sealed class InstallApplier
                                         if (!File.Exists(destination!) && File.Exists(aside)) File.Move(aside, destination!, overwrite: false);
                                         throw;
                                     }
+                                    // The aside copy exists only to roll the replacement back if the
+                                    // move above fails. Once the new file is in place it is dead
+                                    // weight, and leaving it behind accumulates superseded
+                                    // executables, configuration and secrets on every update.
+                                    TryDelete(aside);
                                 }
                                 else File.Move(temporary, destination!, overwrite: false);
                             }
@@ -455,6 +465,36 @@ public sealed class InstallApplier
         await ledger.CommitAsync(installLock, nextFiles, cancellationToken).ConfigureAwait(false);
         foreach (var file in Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories)) File.Delete(file);
         File.Delete(planPath);
+    }
+
+    /// <summary>Suffix marking a superseded file kept only to roll a replacement back.</summary>
+    private const string AsideSuffix = ".old-";
+
+    private static void TryDelete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    /// <summary>
+    /// Removes rollback copies left by a previous, interrupted apply for paths this plan is
+    /// about to rewrite. Scoped to the plan's own write targets so unrelated files that merely
+    /// happen to end in the suffix are never touched.
+    /// </summary>
+    private static void RemoveStaleBackups(string installRoot, InstallPlan plan)
+    {
+        foreach (var write in plan.Operations.OfType<FileOperation.Write>())
+        {
+            string destination;
+            try { destination = ResolveManaged(installRoot, write.Path); }
+            catch (IOException) { continue; }
+            var directory = Path.GetDirectoryName(destination);
+            if (directory is null || !Directory.Exists(directory)) continue;
+            var prefix = Path.GetFileName(destination) + AsideSuffix;
+            foreach (var candidate in Directory.EnumerateFiles(directory, prefix + "*"))
+                if (Path.GetFileName(candidate).StartsWith(prefix, StringComparison.Ordinal)) TryDelete(candidate);
+        }
     }
 
     private static async ValueTask<long> VerifyStagedBlobAsync(string path, ContentHash expected, CancellationToken cancellationToken)
