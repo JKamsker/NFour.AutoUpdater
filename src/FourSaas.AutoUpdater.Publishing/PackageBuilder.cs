@@ -9,7 +9,14 @@ public sealed class PackageBuilder
         timeProvider ??= TimeProvider.System;
         options ??= new PackageBuildOptions();
         PublishHashCache? hashCache = options.HashCachePath is null ? null : await PublishHashCache.LoadAsync(options.HashCachePath, cancellationToken).ConfigureAwait(false);
-        var files = new List<PackageFileEntry>(package.Files.Length);
+        // Running aggregates rather than a retained row list. The manifest needs only counts,
+        // sizes, the distinct content set and the prefix set, so keeping every PackageFileEntry
+        // made peak memory proportional to the file count of the package being built.
+        var fileCount = 0;
+        var installSize = 0L;
+        var downloadSize = 0L;
+        var countedContent = new HashSet<ContentHash>();
+        var prefixes = new HashSet<string>(StringComparer.Ordinal);
         var blobs = ImmutableDictionary.CreateBuilder<VirtualPath, ContentHash>();
         var shardCount = NextPowerOfTwo(Math.Max(1, (package.Files.Length + 4095) / 4096));
         var shardRoot = Path.Combine(Path.GetTempPath(), "4sup-file-table-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
@@ -49,7 +56,11 @@ public sealed class PackageBuilder
                 var shard = FileTableSharding.GetShardIndex(entry.Path, shardCount);
                 await shardStreams[shard]!.WriteAsync(row.AsMemory(), cancellationToken).ConfigureAwait(false);
                 shardCounts[shard]++;
-                files.Add(entry);
+                fileCount++;
+                installSize += entry.Size;
+                prefixes.Add(Prefix(entry.Path.Value));
+                // Download size counts each distinct blob once, however many paths share it.
+                if (entry.Kind == FileEntryKind.File && countedContent.Add(entry.Content)) downloadSize += entry.Size;
             }
 
             foreach (var stream in shardStreams) { await stream!.FlushAsync(cancellationToken).ConfigureAwait(false); stream.Dispose(); }
@@ -64,8 +75,7 @@ public sealed class PackageBuilder
                 shardRefs.Add(new FileTableShardRef { Index = index, Digest = digest, Count = shardCounts[index], Size = size });
             }
             var table = new FileTableRef { Format = "jsonl/v1", ShardCount = shardCount, Shards = shardRefs.ToImmutable(), Digest = FileTableSharding.ComputeTableDigest(shardRefs) };
-            var downloadSize = files.Where(x => x.Kind == FileEntryKind.File).GroupBy(x => x.Content).Sum(x => x.First().Size);
-            var manifest = new PackageManifest { SchemaVersion = 1, Id = package.Id, Version = version, Sequence = version.Sequence, Kind = PackageKind.Content, CreatedAt = timeProvider.GetUtcNow(), Requires = package.Requires, PathPrefixes = files.Select(x => Prefix(x.Path.Value)).Distinct(StringComparer.Ordinal).ToImmutableArray(), FileTable = table, FileCount = files.Count, InstallSize = files.Sum(x => x.Size), DownloadSize = downloadSize };
+            var manifest = new PackageManifest { SchemaVersion = 1, Id = package.Id, Version = version, Sequence = version.Sequence, Kind = PackageKind.Content, CreatedAt = timeProvider.GetUtcNow(), Requires = package.Requires, PathPrefixes = prefixes.ToImmutableArray(), FileTable = table, FileCount = fileCount, InstallSize = installSize, DownloadSize = downloadSize };
             var manifestBytes = RepositoryJson.SerializeManifest(manifest);
             await using var manifestStream = new MemoryStream(manifestBytes, writable: false);
             await PutOnceAsync(destination, layout.Package(package.Id, version), manifestStream, ContentHash.Compute(manifestBytes), manifestBytes.LongLength, cancellationToken).ConfigureAwait(false);
@@ -94,35 +104,50 @@ public sealed class PackageBuilder
         if (key.Value.StartsWith("blobs/", StringComparison.Ordinal) && destination is IContentAddressedWriteStore addressed)
         {
             if (await addressed.PutIfAbsentAsync(key, expected, content, length, cancellationToken).ConfigureAwait(false)) return;
-            var existingAddressed = await destination.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"CAS object '{expected}' disappeared after an existence race.");
-            await using (existingAddressed.ConfigureAwait(false))
-            {
-                await using var bytes = new MemoryStream();
-                await existingAddressed.Content.CopyToAsync(bytes, cancellationToken).ConfigureAwait(false);
-                if (ContentHash.Compute(bytes.ToArray(), expected.Algorithm) != expected) throw new CryptographicException($"Existing CAS object '{key}' failed verification.");
-            }
+            await VerifyExistingAsync(destination, key, expected, cancellationToken).ConfigureAwait(false);
             return;
         }
         if (destination is IConditionalWriteStore conditional)
         {
             if (await conditional.PutIfAbsentAsync(key, content, length, cancellationToken).ConfigureAwait(false)) return;
-            var existing = await destination.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"CAS object '{expected}' disappeared after an existence race.");
-            await using (existing.ConfigureAwait(false)) { await using var bytes = new MemoryStream(); await existing.Content.CopyToAsync(bytes, cancellationToken).ConfigureAwait(false); if (ContentHash.Compute(bytes.ToArray(), expected.Algorithm) != expected) throw new CryptographicException($"Existing CAS object '{key}' failed verification."); }
+            await VerifyExistingAsync(destination, key, expected, cancellationToken).ConfigureAwait(false);
             return;
         }
         var existingHead = await destination.HeadAsync(key, cancellationToken).ConfigureAwait(false);
         if (existingHead is not null)
         {
-            var existing = await destination.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new InvalidDataException($"Immutable object '{key}' disappeared during verification.");
-            await using (existing.ConfigureAwait(false))
-            {
-                await using var bytes = new MemoryStream();
-                await existing.Content.CopyToAsync(bytes, cancellationToken).ConfigureAwait(false);
-                if (ContentHash.Compute(bytes.ToArray(), expected.Algorithm) != expected) throw new CryptographicException($"Existing immutable object '{key}' failed verification.");
-            }
+            await VerifyExistingAsync(destination, key, expected, cancellationToken).ConfigureAwait(false);
             return;
         }
+
+        // Last-resort path for a backend with no conditional-write primitive (FTP has none).
+        // HEAD-then-PUT is not create-if-absent: a concurrent publisher can write between the
+        // two. The write is therefore followed by a read-back, so a lost race is detected as a
+        // digest mismatch rather than silently accepted.
         await destination.PutAsync(key, content, length, cancellationToken).ConfigureAwait(false);
+        await VerifyExistingAsync(destination, key, expected, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Confirms a stored object matches its expected digest, hashing it as a stream.
+    ///
+    /// Every call site previously copied the whole object into a MemoryStream and then again
+    /// through ToArray, so verifying a large blob cost twice its size in memory for a check
+    /// that needs none.
+    /// </summary>
+    private static async ValueTask VerifyExistingAsync(IWritableObjectStore destination, ObjectKey key, ContentHash expected, CancellationToken cancellationToken)
+    {
+        if (destination is IServerSideVerifier verifier)
+        {
+            if (!await verifier.VerifyAsync(key, expected, cancellationToken).ConfigureAwait(false))
+                throw new CryptographicException($"Existing immutable object '{key}' failed verification.");
+            return;
+        }
+        var existing = await destination.OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException($"Immutable object '{key}' disappeared during verification.");
+        await using (existing.ConfigureAwait(false))
+            if (await ContentHash.ComputeAsync(existing.Content, expected.Algorithm, cancellationToken).ConfigureAwait(false) != expected)
+                throw new CryptographicException($"Existing immutable object '{key}' failed verification.");
     }
     private sealed record FileRow([property: JsonPropertyName("p")] string Path, [property: JsonPropertyName("h")] string? Hash, [property: JsonPropertyName("s")] long Size, [property: JsonPropertyName("m")] string? Md5, [property: JsonPropertyName("pol")] FileInstallPolicy? Policy, [property: JsonPropertyName("k")] FileEntryKind? Kind, [property: JsonPropertyName("mode")] string? Mode);
 }
