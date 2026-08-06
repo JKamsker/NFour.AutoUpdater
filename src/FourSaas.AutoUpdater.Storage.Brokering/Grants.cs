@@ -38,8 +38,10 @@ public sealed class StagedObjectVerifier(IReadableObjectStore store) : IStagedOb
         if (read is null) return false;
         await using (read.ConfigureAwait(false))
         {
-            await using var copy = new MemoryStream(); await read.Content.CopyToAsync(copy, cancellationToken).ConfigureAwait(false);
-            return ContentHash.Compute(copy.ToArray(), expectedDigest.Algorithm) == expectedDigest;
+            // Hashed as a stream. Buffering the whole staged object first - and then copying
+            // it again via ToArray - makes peak memory proportional to the largest object a
+            // publisher can upload, which is exactly the quantity this service cannot bound.
+            return await ContentHash.ComputeAsync(read.Content, expectedDigest.Algorithm, cancellationToken).ConfigureAwait(false) == expectedDigest;
         }
     }
 }
@@ -61,7 +63,12 @@ public sealed class PromotionService(IReadableObjectStore source, IWritableObjec
             }
             throw new IOException($"Immutable destination '{destinationKey}' already contains different bytes.");
         }
-        if (source is IServerSideCopyStore sameStore && ReferenceEquals(source, destination)) { await sameStore.CopyAsync(staged, destinationKey, overwrite: false, cancellationToken).ConfigureAwait(false); return; }
+        if (source is IServerSideCopyStore sameStore && ReferenceEquals(source, destination))
+        {
+            await sameStore.CopyAsync(staged, destinationKey, overwrite: false, cancellationToken).ConfigureAwait(false);
+            await VerifyDestinationAsync(destinationKey, digest, length, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         var read = await source.OpenAsync(staged, cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(staged.Value);
         await using (read.ConfigureAwait(false))
         {
@@ -74,6 +81,39 @@ public sealed class PromotionService(IReadableObjectStore source, IWritableObjec
                 if (!await conditional.PutIfAbsentAsync(destinationKey, read.Content, length, cancellationToken).ConfigureAwait(false)) throw new IOException($"Promotion lost the immutable destination race for '{destinationKey}'.");
             }
             else throw new IOException("Promotion requires an immutable conditional-write destination.");
+        }
+        await VerifyDestinationAsync(destinationKey, digest, length, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Re-reads the destination and confirms it holds the promised bytes.
+    ///
+    /// A successful server-side copy or conditional write reports that the backend accepted
+    /// the request, not that the destination now contains the expected content; truncation,
+    /// a silently-substituted body or a backend bug would all still report success. Promotion
+    /// creates an immutable object that later releases are pinned to, so it ends with a read
+    /// barrier rather than the write's own return value.
+    /// </summary>
+    private async ValueTask VerifyDestinationAsync(ObjectKey destinationKey, ContentHash digest, long length, CancellationToken cancellationToken)
+    {
+        var head = await destination.HeadAsync(destinationKey, cancellationToken).ConfigureAwait(false)
+                   ?? throw new IOException($"Promoted object '{destinationKey}' is not readable after promotion.");
+        if (head.Length != length)
+            throw new InvalidDataException($"Promoted object '{destinationKey}' is {head.Length} bytes, expected {length}.");
+
+        if (destination is IServerSideVerifier serverSide)
+        {
+            if (!await serverSide.VerifyAsync(destinationKey, digest, cancellationToken).ConfigureAwait(false))
+                throw new CryptographicException($"Promoted object '{destinationKey}' failed its post-promotion digest check.");
+            return;
+        }
+
+        var read = await destination.OpenAsync(destinationKey, cancellationToken: cancellationToken).ConfigureAwait(false)
+                   ?? throw new IOException($"Promoted object '{destinationKey}' is not readable after promotion.");
+        await using (read.ConfigureAwait(false))
+        {
+            if (await ContentHash.ComputeAsync(read.Content, digest.Algorithm, cancellationToken).ConfigureAwait(false) != digest)
+                throw new CryptographicException($"Promoted object '{destinationKey}' failed its post-promotion digest check.");
         }
     }
 }

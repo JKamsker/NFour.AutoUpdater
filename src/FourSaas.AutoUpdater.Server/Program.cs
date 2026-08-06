@@ -254,7 +254,23 @@ static S3ObjectStore CreateS3Store(string bucket, string prefix)
 
 static async ValueTask<string[]> ReadStringsAsync(HttpRequest request)
 {
-    using var document = await JsonDocument.ParseAsync(request.Body);
+    // Bounded like every other management request body. Parsing an unbounded stream lets a
+    // single request allocate until the process dies, regardless of what validation would
+    // have rejected afterwards.
+    const int MaximumBytes = 4 * 1024 * 1024;
+    using var bounded = new MemoryStream();
+    var buffer = new byte[64 * 1024];
+    long total = 0;
+    while (true)
+    {
+        var read = await request.Body.ReadAsync(buffer, request.HttpContext.RequestAborted);
+        if (read == 0) break;
+        total += read;
+        if (total > MaximumBytes) throw new InvalidDataException($"Request body exceeds the {MaximumBytes} byte limit.");
+        await bounded.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted);
+    }
+    bounded.Position = 0;
+    using var document = await JsonDocument.ParseAsync(bounded);
     return document.RootElement.TryGetProperty("sha256", out var values) ? values.EnumerateArray().Select(x => x.GetString() ?? string.Empty).ToArray() : [];
 }
 

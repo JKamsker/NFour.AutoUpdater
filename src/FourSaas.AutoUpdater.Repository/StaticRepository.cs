@@ -71,9 +71,10 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
                 using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                 await using var hashing = new HashingReadStream(result.Content, hash);
                 using var reader = new StreamReader(hashing, StrictUtf8, detectEncodingFromByteOrderMarks: false, bufferSize: 64 * 1024, leaveOpen: true);
+                var lines = new BoundedLineReader(reader, MaximumFileTableLineChars);
                 var shardCount = 0;
                 string? previousPath = null;
-                while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+                while (await lines.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
                 {
                     if (string.IsNullOrWhiteSpace(line)) throw new FormatException($"File-table shard {shard.Index} contains a blank JSONL line.");
                     // File-table rows are derived Class-D data.  Forward-compatible
@@ -115,6 +116,9 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
     }
 
     public ValueTask DisposeAsync() => _store.DisposeAsync();
+
+    /// <summary>Largest single file-table row this reader will materialise.</summary>
+    private const int MaximumFileTableLineChars = 64 * 1024;
     private static async ValueTask<byte[]> ReadAllAsync(Stream source, CancellationToken cancellationToken) { using var target = new MemoryStream(); await source.CopyToAsync(target, cancellationToken).ConfigureAwait(false); return target.ToArray(); }
 
     private sealed class HashingReadStream(Stream inner, IncrementalHash hash) : Stream
