@@ -1328,18 +1328,46 @@ public sealed class ManagementState
         if (!ContentHash.TryParse(hash, out var digest) || digest.Algorithm != HashAlgorithmId.Sha256) return Results.BadRequest(new { error = "invalid_hash" });
         if (_store is not IWritableObjectStore writable) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
         var source = _layout.Blob(digest);
-        var existing = await writable.OpenAsync(source, cancellationToken: cancellationToken).ConfigureAwait(false);
-        if (existing is null) return Results.NotFound();
-        await using (existing.ConfigureAwait(false))
+        var head = await writable.HeadAsync(source, cancellationToken).ConfigureAwait(false);
+        if (head is null) return Results.NotFound();
+        var trash = new ObjectKey($"_trash/{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}/{digest.ToString().Replace(':', '-')}");
+
+        // Server-side copy where the backend offers it, otherwise a streamed relay. The whole
+        // object was previously read into a MemoryStream and copied again via ToArray, so
+        // quarantining a large blob cost twice its size in memory for no benefit.
+        var copied = false;
+        if (writable is IServerSideCopyStore serverSideCopy)
         {
-            await using var copy = new MemoryStream();
-            await existing.Content.CopyToAsync(copy, cancellationToken).ConfigureAwait(false);
-            var bytes = copy.ToArray();
-            var trash = new ObjectKey($"_trash/{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}/{digest.ToString().Replace(':', '-')}");
-            copy.Position = 0;
-            await writable.PutAsync(trash, copy, bytes.LongLength, cancellationToken).ConfigureAwait(false);
-            await writable.DeleteAsync(source, cancellationToken).ConfigureAwait(false);
+            try { await serverSideCopy.CopyAsync(source, trash, overwrite: false, cancellationToken).ConfigureAwait(false); copied = true; }
+            catch (IOException) { }
         }
+        if (!copied)
+        {
+            var existing = await writable.OpenAsync(source, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (existing is null) return Results.NotFound();
+            await using (existing.ConfigureAwait(false))
+                await writable.PutAsync(trash, existing.Content, head.Length, cancellationToken).ConfigureAwait(false);
+        }
+
+        // The source is only removed once the quarantine copy is proven to hold the same
+        // bytes. Deleting after an unverified copy makes a crash or a silently short write
+        // indistinguishable from success, and the object being discarded is precisely the one
+        // under suspicion — losing it destroys the evidence quarantine exists to preserve.
+        if (writable is IServerSideVerifier verifier)
+        {
+            if (!await verifier.VerifyAsync(trash, digest, cancellationToken).ConfigureAwait(false))
+                return Results.Json(new { error = "quarantine_verification_failed", trash = trash.Value }, statusCode: StatusCodes.Status500InternalServerError);
+        }
+        else
+        {
+            var quarantined = await writable.OpenAsync(trash, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (quarantined is null) return Results.Json(new { error = "quarantine_copy_missing", trash = trash.Value }, statusCode: StatusCodes.Status500InternalServerError);
+            await using (quarantined.ConfigureAwait(false))
+                if (await ContentHash.ComputeAsync(quarantined.Content, digest.Algorithm, cancellationToken).ConfigureAwait(false) != digest)
+                    return Results.Json(new { error = "quarantine_verification_failed", trash = trash.Value }, statusCode: StatusCodes.Status500InternalServerError);
+        }
+
+        await writable.DeleteAsync(source, cancellationToken).ConfigureAwait(false);
         foreach (var placement in VerifiedBlobs.Keys.Where(x => x.EndsWith("\0" + digest, StringComparison.Ordinal)).ToArray()) VerifiedBlobs.TryRemove(placement, out _);
         if (_databaseFactory is not null)
         {
