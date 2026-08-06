@@ -23,7 +23,19 @@ public sealed class PublishGate
             }
         }
         ValidateRelease(release, manifests, diagnostics, exactManifestDigests);
-        var axes = release.Axes.ToDictionary(x => x.Name, StringComparer.Ordinal);
+
+        // Duplicate axis names are reported, not thrown. ToDictionary raises on the second
+        // occurrence, so a release declaring the same axis twice aborted the gate with an
+        // exception instead of producing the diagnostic the publisher needs to fix it — and
+        // every other problem in the release stayed hidden behind it.
+        var duplicateAxes = release.Axes.GroupBy(x => x.Name, StringComparer.Ordinal).Where(x => x.Count() > 1).Select(x => x.Key).ToArray();
+        foreach (var duplicate in duplicateAxes)
+            diagnostics.Add(new("PKG016", DiagnosticSeverity.Error, $"Axis '{duplicate}' is declared more than once.", duplicate));
+        foreach (var blank in release.Axes.Where(x => string.IsNullOrWhiteSpace(x.Name)))
+            diagnostics.Add(new("PKG016", DiagnosticSeverity.Error, "An axis is declared with an empty name.", blank.Name ?? string.Empty));
+
+        var axes = new Dictionary<string, AxisDefinition>(StringComparer.Ordinal);
+        foreach (var axis in release.Axes) axes.TryAdd(axis.Name, axis);
         var mentionedValues = release.Requirements
             .SelectMany(x => x.When.Constraints)
             .GroupBy(x => x.Key, StringComparer.Ordinal)
@@ -262,7 +274,23 @@ public static class SelectionEnumerator
     {
         if (maximum < 1) throw new ArgumentOutOfRangeException(nameof(maximum));
         var wasTruncated = false;
-        var choices = axes.ToDictionary(x => x.Name, PairwiseChoices, StringComparer.Ordinal);
+
+        // An axis with no values contributes no choices, and an axis name repeated in the
+        // input would make ToDictionary throw. Sampling is a diagnostic aid, so it degrades to
+        // ignoring a malformed axis rather than taking the whole publish gate down with an
+        // exception; the axis itself is reported separately by CheckCoreAsync.
+        axes = [.. axes.Where(x => !string.IsNullOrWhiteSpace(x.Name) && !x.Values.IsDefaultOrEmpty)
+                       .GroupBy(x => x.Name, StringComparer.Ordinal)
+                       .Select(x => x.First())];
+
+        var choices = new Dictionary<string, ImmutableArray<ImmutableSortedSet<string>>>(StringComparer.Ordinal);
+        foreach (var axis in axes)
+        {
+            var axisChoices = PairwiseChoices(axis);
+            if (!axisChoices.IsDefaultOrEmpty) choices[axis.Name] = axisChoices;
+        }
+        axes = [.. axes.Where(x => choices.ContainsKey(x.Name))];
+
         var results = new List<VariantSelection>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var baseline = axes.ToDictionary(x => x.Name, x => choices[x.Name][0], StringComparer.Ordinal);
