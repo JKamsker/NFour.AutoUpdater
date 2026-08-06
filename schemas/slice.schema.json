@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://4sup.invalid/schemas/slice.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "source", "packages", "unmatched"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "source": {"type": "string", "minLength": 1},
+    "unmatched": {"enum": ["error", "ignore"]},
+    "packages": {"type": "array", "items": {"$ref": "#/$defs/package"}}
+  },
+  "$defs": {
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "include"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$"},
+        "include": {"type": "array", "items": {"type": "string"}},
+        "exclude": {"type": "array", "items": {"type": "string"}},
+        "rewrite": {"type": "object", "additionalProperties": {"type": "string"}},
+        "policy": {"type": "object", "additionalProperties": {"enum": ["replace", "preserve", "executable"]}},
+        "requires": {"type": "array", "items": {"$ref": "#/$defs/dependency"}}
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {"id": {"type": "string"}, "minSequence": {"type": "integer", "minimum": 0}, "maxSequence": {"type": "integer", "minimum": 0}}
+    }
+  }
+}

@@ -21,6 +21,7 @@ internal static class SecureInstallOperations
     private const int ENOTDIR = 20;
     private const int EEXIST = 17;
     private const int AT_FDCWD = -100;
+    private const ulong FICLONE = 0x40049409;
 
     public static bool Supported => OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() || OperatingSystem.IsWindows();
 
@@ -92,9 +93,10 @@ internal static class SecureInstallOperations
         {
             using (var destination = new FileStream(new SafeFileHandle((IntPtr)descriptor, ownsHandle: true), FileAccess.Write, 128 * 1024, isAsync: false))
             {
+                var cloned = OperatingSystem.IsLinux() && TryReflink(descriptor, stagedPath);
                 if (executable && Fchmod(descriptor, 0x1ED) != 0)
                     ThrowLastError($"set executable mode for '{path}'");
-                awaitCopy(stagedPath, destination);
+                if (!cloned) awaitCopy(stagedPath, destination);
             }
             if (RenameAt(parent, temporaryName, parent, name) != 0)
                 ThrowLastError($"replace '{path}'");
@@ -185,11 +187,20 @@ internal static class SecureInstallOperations
 
     private static void ThrowLastError(string operation) => throw new IOException($"Unable to {operation}: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
 
+    private static bool TryReflink(int destinationDescriptor, string sourcePath)
+    {
+        var sourceDescriptor = Open(sourcePath, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0);
+        if (sourceDescriptor < 0) return false;
+        using var source = new SafeFileHandle((IntPtr)sourceDescriptor, ownsHandle: true);
+        return Ioctl(destinationDescriptor, FICLONE, sourceDescriptor) == 0;
+    }
+
     [DllImport("libc", SetLastError = true, EntryPoint = "open")] private static extern int Open(string pathname, int flags, uint mode);
     [DllImport("libc", SetLastError = true, EntryPoint = "openat")] private static extern int OpenAt(SafeFileHandle dirfd, string pathname, int flags, uint mode);
     [DllImport("libc", SetLastError = true, EntryPoint = "mkdirat")] private static extern int MkdirAt(SafeFileHandle dirfd, string pathname, uint mode);
     [DllImport("libc", SetLastError = true, EntryPoint = "fchmod")] private static extern int Fchmod(int fd, uint mode);
     [DllImport("libc", SetLastError = true, EntryPoint = "renameat")] private static extern int RenameAt(SafeFileHandle olddirfd, string oldpath, SafeFileHandle newdirfd, string newpath);
     [DllImport("libc", SetLastError = true, EntryPoint = "linkat")] private static extern int LinkAt(int olddirfd, string oldpath, SafeFileHandle newdirfd, string newpath, int flags);
+    [DllImport("libc", SetLastError = true, EntryPoint = "ioctl")] private static extern int Ioctl(int fileDescriptor, ulong request, int argument);
     [DllImport("libc", SetLastError = true, EntryPoint = "unlinkat")] private static extern int UnlinkAt(SafeFileHandle dirfd, string pathname, int flags);
 }

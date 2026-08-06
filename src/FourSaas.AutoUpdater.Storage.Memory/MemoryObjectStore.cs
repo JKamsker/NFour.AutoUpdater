@@ -3,7 +3,7 @@ using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Memory;
 
-public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideVerifier
+public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideVerifier
 {
     private sealed record Entry(byte[] Bytes, DateTimeOffset LastModified, string ETag);
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
@@ -29,6 +29,22 @@ public sealed class MemoryObjectStore : IListableObjectStore, IConditionalWriteS
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (prefix is null || key.StartsWith(prefix, StringComparison.Ordinal)) yield return new ObjectKey(key);
+            await Task.Yield();
+        }
+    }
+    public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
+        var root = prefix ?? string.Empty;
+        var prefixes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var key in _entries.Keys.OrderBy(static x => x, Comparer))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!key.StartsWith(root, StringComparison.Ordinal)) continue;
+            var remainder = key[root.Length..];
+            var separator = remainder.IndexOf(delimiter, StringComparison.Ordinal);
+            if (separator < 0) yield return new ObjectListing(new ObjectKey(key), null);
+            else if (prefixes.Add(key[..(root.Length + separator + delimiter.Length)])) yield return new ObjectListing(null, key[..(root.Length + separator + delimiter.Length)]);
             await Task.Yield();
         }
     }

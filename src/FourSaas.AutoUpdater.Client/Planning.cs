@@ -3,7 +3,7 @@ namespace FourSaas.AutoUpdater.Client;
 public enum ObservedKind { File, Directory, Reparse, Other }
 public enum HashPolicy { Never, Changed, Always }
 public readonly record struct FileIdentity(string Value);
-public sealed record InstalledFile(VirtualPath Path, ContentHash? Content, long Size, PackageId Owner, FileInstallPolicy Policy, long ObservedSize, long ObservedMtimeUnix, string State = "managed", ContentHash? ObservedContent = null);
+public sealed record InstalledFile(VirtualPath Path, ContentHash? Content, long Size, PackageId Owner, FileInstallPolicy Policy, long ObservedSize, long ObservedMtimeUnix, string State = "managed", ContentHash? ObservedContent = null, ImmutableDictionary<string, JsonElement>? UnknownFields = null);
 public sealed record ObservedEntry(VirtualPath Path, bool Exists, ObservedKind Kind, long Size, long MtimeUnixSeconds, FileIdentity? Identity, ContentHash? Hash);
 public sealed record ObservedTreeSnapshot(string InstallRoot, ImmutableDictionary<VirtualPath, ObservedEntry> Entries);
 

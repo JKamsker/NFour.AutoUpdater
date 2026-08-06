@@ -12,6 +12,7 @@ namespace FourSaas.AutoUpdater.Server.Migrations;
 /// without scanning the control-plane tables.
 /// </summary>
 [Migration("20260805200000_TelemetryPartitioning")]
+[DbContext(typeof(ManagementDbContext))]
 public partial class TelemetryPartitioning : Migration
 {
     protected override void Up(MigrationBuilder migrationBuilder)
@@ -27,7 +28,9 @@ public partial class TelemetryPartitioning : Migration
                         "ProductId" text NULL,
                         "ReleaseId" text NULL,
                         "PayloadJson" text NULL,
-                        CONSTRAINT "PK_Telemetry" PRIMARY KEY ("Id", "At")
+                        -- The legacy table retains PK_Telemetry when it is renamed;
+                        -- use a temporary distinct name until that table is dropped.
+                        CONSTRAINT "PK_Telemetry_partitioned" PRIMARY KEY ("Id", "At")
                     ) PARTITION BY RANGE ("At");
                     CREATE TABLE "Telemetry_default" PARTITION OF "Telemetry" DEFAULT;
                     INSERT INTO "Telemetry" ("Id", "At", "ProductId", "ReleaseId", "PayloadJson")

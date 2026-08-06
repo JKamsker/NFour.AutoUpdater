@@ -37,7 +37,7 @@ the format.
 
 | # | Finding | Disposition |
 |---|---|---|
-| H1 | Format illustrative, not normative | **Fixed** — [18](18-normative-contract.md); schemas generated from the C# models and used as test fixtures |
+| H1 | Format illustrative, not normative | **Fixed** — [18](18-normative-contract.md); checked-in schemas and valid/invalid fixtures are used by the golden-repository tests |
 | H2 | Identifier grammar missing | **Fixed** — [18](18-normative-contract.md) §1; version labels constrained because they are path-bearing |
 | H3 | `ContentHash` not guaranteed immutable/valid | **Fixed** — fixed 32-byte inline buffer, not `ReadOnlyMemory`; parse-only construction ([03](03-architecture.md) §4.1) |
 | H4 | Override metadata has competing authorities | **Fixed** — `PackageRequirement.Overrides` is sole authority; `PackageManifest.Overrides` removed; `PKG016` catches denormalisation drift ([04](04-variant-model.md) §4.2) |
@@ -77,11 +77,11 @@ The review's twelve "implementation-ready" criteria:
 
 | # | Criterion | Status |
 |---|---|---|
-| 1 | One signed-envelope format with cross-language golden vectors | **Specified**; vectors are a Phase 0 deliverable |
-| 2 | Compression and S3 upload integrity reconciled, proven by negative tests | **Specified** — resolved by removal; negative test is a Phase 3 exit gate |
+| 1 | One signed-envelope format with cross-language golden vectors | **Implemented** — checked-in envelope, duplicate-key, rotation, rollback, revocation, and exact-payload vectors are exercised |
+| 2 | Compression and S3 upload integrity reconciled, proven by negative tests | **Implemented** — identity encoding and Content-Encoding rejection are covered by storage tests |
 | 3 | Rollback/yank/rotation use new monotonic signed control documents | **Specified** |
 | 4 | Composition defines every case; `FileSetId` covers all apply semantics | **Specified** |
-| 5 | Every document versioned-schema'd; every digest has a byte domain | **Specified**; schemas are a Phase 0 deliverable |
+| 5 | Every document versioned-schema'd; every digest has a byte domain | **Implemented** — schemas, negative fixtures, schema-bump rejection, and digest-domain tests are checked in |
 | 6 | All path-bearing identifiers have a canonical safe grammar | **Specified** |
 | 7 | Planner receives explicit observations; preserve adoption truthful | **Specified** |
 | 8 | Compressed resume executable as written | **N/A** — no compressed representation exists |
@@ -90,10 +90,10 @@ The review's twelve "implementation-ready" criteria:
 | 11 | GC marks exact live representations; retention policy | **Specified** |
 | 12 | Capability-conditioned backend tests; roadmap starts with signed fixtures | **Specified** |
 
-All twelve are addressed **in specification**. Four (1, 2, 5, 9) carry deliverables — golden
-vectors, JSON Schemas, the negative integrity test, and the adversarial path suite — that are
-scheduled but not yet written, and none of them can be declared satisfied until they exist and
-pass.
+The repository contains the signed vectors, schemas, negative integrity tests, and filesystem
+reparse-point checks required by the implementation-ready criteria. Live third-party backend
+characterization and the broader adversarial matrix remain opt-in integration work; they do not
+change the cross-platform core contract.
 
 ## Findings not accepted as defects
 

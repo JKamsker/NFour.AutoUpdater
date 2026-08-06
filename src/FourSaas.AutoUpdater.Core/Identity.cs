@@ -1,5 +1,6 @@
 namespace FourSaas.AutoUpdater.Core;
 
+
 public enum HashAlgorithmId
 {
     Sha256 = 1,
@@ -53,6 +54,25 @@ public readonly struct ContentHash : IEquatable<ContentHash>, IComparable<Conten
         while ((read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
             hash.AppendData(buffer, 0, read);
         return new ContentHash(algorithm, hash.GetHashAndReset());
+    }
+
+    /// <summary>Hashes a source stream once while producing the two publish-time digests.</summary>
+    public static async ValueTask<(ContentHash Sha256, ContentHash Md5)> ComputeSha256AndMd5Async(Stream source, CancellationToken cancellationToken = default)
+    {
+        using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+        var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+        try
+        {
+            int read;
+            while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false)) > 0)
+            {
+                sha256.AppendData(buffer, 0, read);
+                md5.AppendData(buffer, 0, read);
+            }
+            return (new ContentHash(HashAlgorithmId.Sha256, sha256.GetHashAndReset()), new ContentHash(HashAlgorithmId.Md5, md5.GetHashAndReset()));
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
     }
 
     public static ContentHash Parse(string value)

@@ -12,14 +12,23 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Start MinIO
-        run: docker compose up -d minio minio-init
+      - name: Start integration services
+        run: docker compose up -d postgres minio minio-init nginx vsftpd
+      - name: Wait for PostgreSQL
+        run: |
+          for attempt in $(seq 1 30); do
+            if docker compose exec -T postgres pg_isready -U 4sup -d 4sup; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
       - name: Restore
         run: dotnet restore AutoUpdater.sln
       - name: Build
         run: dotnet build AutoUpdater.sln --no-restore --configuration Release
       - name: Test (all backends enabled)
-        run: FOURSUP_MINIO=1 dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
+        run: FOURSUP_MINIO=1 FOURSUP_HTTP=1 FOURSUP_FTP=1 FOURSUP_POSTGRES=1 FOURSUP_DATABASE='Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password' dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
       - name: Secret scan
         run: bash scripts/secret-scan.sh
       - name: Diff hygiene

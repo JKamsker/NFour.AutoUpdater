@@ -2,7 +2,7 @@ using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Http;
 
-public sealed class HttpObjectStore : IReadableObjectStore
+public sealed class HttpObjectStore : IRangeReadableObjectStore
 {
     private readonly HttpClient _client;
     private readonly Uri _baseUri;

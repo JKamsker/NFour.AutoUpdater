@@ -26,6 +26,7 @@ public static class StorageCapabilityNegotiation
     {
         var capabilities = transport.Capabilities;
         if (!capabilities.HasFlag(StorageCapabilities.Read)) return false;
+        if (transport is IRangeReadableObjectStore != capabilities.HasFlag(StorageCapabilities.Range)) return false;
         if (transport is IListableObjectStore != capabilities.HasFlag(StorageCapabilities.List)) return false;
         if (transport is IWritableObjectStore != capabilities.HasFlag(StorageCapabilities.Write)) return false;
         if (transport is IWritableObjectStore != capabilities.HasFlag(StorageCapabilities.Delete)) return false;
@@ -71,9 +72,26 @@ public interface IReadableObjectStore : IAsyncDisposable
     ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default);
 }
 
+/// Marker for transports whose OpenAsync implementation honors validated byte ranges.
+public interface IRangeReadableObjectStore : IReadableObjectStore { }
+
 public interface IListableObjectStore : IReadableObjectStore
 {
     IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Optional hierarchical listing.  Object stores that cannot represent common
+/// prefixes continue to implement <see cref="IListableObjectStore"/> only.
+/// </summary>
+public interface IDelimitedObjectStore : IListableObjectStore
+{
+    IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, CancellationToken cancellationToken = default);
+}
+
+public sealed record ObjectListing(ObjectKey? Object, string? CommonPrefix)
+{
+    public bool IsPrefix => CommonPrefix is not null;
 }
 
 public interface IWritableObjectStore : IReadableObjectStore
@@ -155,6 +173,12 @@ public interface IPresigningStore
 public interface IUploadHeaderProvider
 {
     IReadOnlyDictionary<string, string> GetRequiredUploadHeaders(UploadGrantDescriptor descriptor);
+}
+
+/// <summary>Describes whether a presigned upload binds the grant digest at the storage boundary.</summary>
+public interface IUploadIntegrityEnforcement
+{
+    bool UploadDigestIsStorageEnforced { get; }
 }
 
 public interface IServerSideVerifier

@@ -4,9 +4,13 @@ using FourSaas.AutoUpdater.Storage;
 using FourSaas.AutoUpdater.Storage.Memory;
 using FourSaas.AutoUpdater.Publishing;
 using FourSaas.AutoUpdater.Repository;
+using FourSaas.AutoUpdater.Storage.Brokering;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using System.Globalization;
+using System.Net;
+using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -88,6 +92,7 @@ public sealed class ServerTests
         using var response = await JsonDocument.ParseAsync(responseContext.Response.Body);
         var stagingKey = response.RootElement.GetProperty("items")[0].GetProperty("stagingKey").GetString();
         Assert.StartsWith("_staging/repo-a/", stagingKey, StringComparison.Ordinal);
+        Assert.Equal("serverVerified", response.RootElement.GetProperty("items")[0].GetProperty("enforcement").GetString());
 
         var wrongRepositorySeal = await state.SealSessionAsync("repo-b", sessionId);
         var status = Assert.IsAssignableFrom<IStatusCodeHttpResult>(wrongRepositorySeal);
@@ -123,6 +128,27 @@ public sealed class ServerTests
             nameof(ChannelRow.ProductId),
             nameof(ChannelRow.Channel),
             nameof(ChannelRow.ChannelSequence)]));
+    }
+
+    [Fact]
+    public async Task LivePostgresMigrationAndSequenceReservationSurviveStateRestart()
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("FOURSUP_POSTGRES"), "1", StringComparison.Ordinal)) return;
+        var connection = Environment.GetEnvironmentVariable("FOURSUP_DATABASE")
+            ?? "Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password";
+        var options = new DbContextOptionsBuilder<ManagementDbContext>().UseNpgsql(connection).Options;
+        await using (var database = new ManagementDbContext(options)) await database.Database.MigrateAsync();
+        var factory = new TestDbContextFactory(options);
+        await using var store = new MemoryObjectStore();
+        var repository = "ci" + Guid.NewGuid().ToString("N")[..12];
+        var first = new ManagementState(store, databaseFactory: factory, repositoryId: repository);
+        var firstResult = await first.AllocateSequenceAsync(repository, "release", "demo");
+        Assert.Equal(200, Assert.IsAssignableFrom<IStatusCodeHttpResult>(firstResult).StatusCode);
+        Assert.Equal(1, (long)Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value!.GetType().GetProperty("sequence")!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value)!);
+
+        var second = new ManagementState(store, databaseFactory: factory, repositoryId: repository);
+        var secondResult = await second.AllocateSequenceAsync(repository, "release", "demo");
+        Assert.Equal(2, (long)Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value!.GetType().GetProperty("sequence")!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value)!);
     }
 
     [Fact]
@@ -244,6 +270,89 @@ public sealed class ServerTests
         Assert.True((bool)value.GetType().GetProperty("valid")!.GetValue(value)!);
     }
 
+    [Fact]
+    public async Task BrokeredMultipartRetryReusesPartsAlreadyUploaded()
+    {
+        var payload = "abcd"u8.ToArray();
+        var handler = new MultipartResumeHandler(ContentHash.Compute(payload));
+        using var http = new HttpClient(handler);
+        await using var client = new ManagementApiClient(new Uri("https://localhost"), client: http);
+        var grant = (await client.CreateGrantsAsync("repo", "session", [(ContentHash.Compute(payload), payload.Length)])).Single();
+
+        await Assert.ThrowsAsync<IOException>(() => client.UploadMultipartAsync(grant, new MemoryStream(payload), payload.Length).AsTask());
+        await client.UploadMultipartAsync(grant, new MemoryStream(payload), payload.Length);
+
+        Assert.Equal(1, handler.UploadsByPart[1]);
+        Assert.Equal(2, handler.UploadsByPart[2]);
+        Assert.True(handler.Completed);
+    }
+
+    private sealed class MultipartResumeHandler(ContentHash digest) : HttpMessageHandler
+    {
+        private readonly Dictionary<int, (string ETag, int Length)> _parts = [];
+        public Dictionary<int, int> UploadsByPart { get; } = new() { [1] = 0, [2] = 0 };
+        public bool Completed { get; private set; }
+        private bool _failSecondPartOnce = true;
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Post && path.EndsWith("/grants", StringComparison.Ordinal))
+            {
+                var expires = DateTimeOffset.UtcNow.AddMinutes(10).ToString("O");
+                var body = JsonSerializer.Serialize(new
+                {
+                    items = new[]
+                    {
+                        new
+                        {
+                            grantId = "g",
+                            stagingKey = "_staging/x",
+                            expectedDigest = digest.ToString(),
+                            expectedLength = 4,
+                            expiresAt = expires,
+                            enforcement = "serverVerified",
+                            multipartUploadId = "upload",
+                            partSize = 2,
+                            parts = new[]
+                            {
+                                new { number = 1, uri = "https://storage/part/1", requiredHeaders = Array.Empty<object>() },
+                                new { number = 2, uri = "https://storage/part/2", requiredHeaders = Array.Empty<object>() }
+                            },
+                            completePath = "repositories/repo/publish/sessions/session/grants/g/complete",
+                            abortPath = "repositories/repo/publish/sessions/session/grants/g/abort",
+                            partsPath = "repositories/repo/publish/sessions/session/grants/g/parts"
+                        }
+                    }
+                });
+                return Json(HttpStatusCode.OK, body);
+            }
+            if (request.Method == HttpMethod.Get && path.EndsWith("/parts", StringComparison.Ordinal))
+                return Json(HttpStatusCode.OK, JsonSerializer.Serialize(new { parts = _parts.OrderBy(x => x.Key).Select(x => new { number = x.Key, etag = x.Value.ETag, length = x.Value.Length }) }));
+            if (request.Method == HttpMethod.Put && path.StartsWith("/part/", StringComparison.Ordinal))
+            {
+                var number = int.Parse(path[(path.LastIndexOf('/') + 1)..], CultureInfo.InvariantCulture);
+                var bytes = await request.Content!.ReadAsByteArrayAsync(cancellationToken);
+                UploadsByPart[number]++;
+                if (number == 2 && _failSecondPartOnce) { _failSecondPartOnce = false; return Json(HttpStatusCode.ServiceUnavailable, "retry"); }
+                var etag = $"p{number}";
+                _parts[number] = (etag, bytes.Length);
+                var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([]) };
+                response.Headers.ETag = new System.Net.Http.Headers.EntityTagHeaderValue('"' + etag + '"');
+                return response;
+            }
+            if (request.Method == HttpMethod.Post && path.EndsWith("/complete", StringComparison.Ordinal))
+            {
+                Completed = true;
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            }
+            return Json(HttpStatusCode.NotFound, "not found");
+        }
+
+        private static HttpResponseMessage Json(HttpStatusCode status, string body)
+            => new(status) { Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json") };
+    }
+
     private static async Task<JsonDocument> ExecuteJsonAsync(IResult result)
     {
         var context = new DefaultHttpContext();
@@ -289,4 +398,9 @@ public sealed class ServerTests
         InstallSize = manifest.InstallSize,
         DownloadSize = manifest.DownloadSize
     };
+
+    private sealed class TestDbContextFactory(DbContextOptions<ManagementDbContext> options) : IDbContextFactory<ManagementDbContext>
+    {
+        public ManagementDbContext CreateDbContext() => new(options);
+    }
 }

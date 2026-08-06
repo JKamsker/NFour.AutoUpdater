@@ -255,10 +255,11 @@ release.
 
 ## 8. Other backend consequences
 
-**Hardlink, do not copy.** Materialising a 40 GB install by copying from the local CAS doubles
-disk and write time. Hardlink on the same volume, reflink where supported, **copy fallback for
-`Preserve` files** — the game mutates those in place and a hardlink would corrupt the shared CAS
-entry ([07](07-client-engine.md) §5).
+**Copy by default, with a reflink fast path.** Materialising a 40 GB install should use a
+copy-on-write clone where the filesystem supports it and otherwise copy from the local CAS.
+Hardlinks are only valid under the explicit `immutable-install` profile described in
+[07](07-client-engine.md) §5; exposing a writable install through a hardlink would corrupt the
+shared CAS entry.
 
 **Peak space is per-volume.** Bucket `PeakFreeSpaceRequired` by resolved volume root, as the
 reference's `SpaceRequirementCalculator` correctly did. Assert that `.4sup/staging` is on the

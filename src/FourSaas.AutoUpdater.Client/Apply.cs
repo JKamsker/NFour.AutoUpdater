@@ -3,6 +3,13 @@ using System.Security.Cryptography;
 namespace FourSaas.AutoUpdater.Client;
 
 public enum ApplyPhase { Planning, Fetching, Materialising, Deleting, Committing }
+public enum InstallMaterializationProfile
+{
+    /// Reflink where available, otherwise a private copy. This is the safe default.
+    CopyDefault,
+    /// Permit hardlinks for callers that also enforce immutable installed files.
+    ImmutableInstall
+}
 public sealed record ApplyProgress
 {
     public required ApplyPhase Phase { get; init; }
@@ -231,7 +238,8 @@ public sealed class InstallApplier
         IInstallLockProvider? lockProvider = null,
         ApplyPreconditions? preconditions = null,
         IReadOnlyList<IReadableObjectStore>? mirrors = null,
-        IReadOnlySet<ContentHash>? protectedCacheEntries = null)
+        IReadOnlySet<ContentHash>? protectedCacheEntries = null,
+        InstallMaterializationProfile materializationProfile = InstallMaterializationProfile.CopyDefault)
     {
         progress ??= new NullApplyProgressSink();
         ValidateRoot(installRoot);
@@ -350,7 +358,10 @@ public sealed class InstallApplier
                         if (!File.Exists(staged)) throw new InvalidDataException($"Verified staging blob for '{write.Path}' is missing.");
                         await VerifyStagedBlobAsync(staged, write.Content, cancellationToken).ConfigureAwait(false);
                         if (new FileInfo(staged).Length != write.Size) throw new InvalidDataException($"Verified blob size for '{write.Path}' does not match the manifest.");
-                        if (!SecureInstallOperations.TryReplaceFile(installRoot, write.Path, staged, write.Policy == FileInstallPolicy.Executable, expectedParent, preferHardLink: write.Policy != FileInstallPolicy.Preserve))
+                        // The local CAS is shared and must never be exposed through a
+                        // writable hardlink by default. Hardlinks are reserved for
+                        // callers that explicitly enforce an immutable install profile.
+                        if (!SecureInstallOperations.TryReplaceFile(installRoot, write.Path, staged, write.Policy == FileInstallPolicy.Executable, expectedParent, preferHardLink: materializationProfile == InstallMaterializationProfile.ImmutableInstall))
                         {
                             var temporary = destination! + ".4sup-new-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
                             try

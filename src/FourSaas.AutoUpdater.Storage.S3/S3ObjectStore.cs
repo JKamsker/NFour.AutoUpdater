@@ -16,7 +16,7 @@ public enum S3ProviderProfile
     Generic
 }
 
-public class S3ObjectStore : IListableObjectStore, IServerSideCopyStore, IServerSideTransferStore, IMultipartUploadStore, IMultipartGrantStore, IMultipartGarbageCollector, IPresigningStore, IUploadHeaderProvider, IServerSideVerifier
+public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IServerSideCopyStore, IServerSideTransferStore, IMultipartUploadStore, IMultipartGrantStore, IMultipartGarbageCollector, IPresigningStore, IUploadHeaderProvider, IUploadIntegrityEnforcement, IServerSideVerifier
 {
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
@@ -45,6 +45,7 @@ public class S3ObjectStore : IListableObjectStore, IServerSideCopyStore, IServer
     }
     public S3ProviderProfile ProviderProfile => _providerProfile;
     protected bool SupportsConditionalWrites => _providerProfile is S3ProviderProfile.Aws or S3ProviderProfile.Minio or S3ProviderProfile.R2;
+    public bool UploadDigestIsStorageEnforced => SupportsConditionalWrites;
     public virtual StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ServerSideCopy | StorageCapabilities.Presigning | StorageCapabilities.Multipart | StorageCapabilities.Delete;
     public int RecommendedParallelism => 32;
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
@@ -87,6 +88,21 @@ public class S3ObjectStore : IListableObjectStore, IServerSideCopyStore, IServer
             var listPrefix = string.IsNullOrEmpty(_prefix) ? prefix ?? string.Empty : _prefix + "/" + (prefix ?? string.Empty);
             var response = await _client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = _bucket, Prefix = listPrefix, ContinuationToken = token }, cancellationToken).ConfigureAwait(false);
             foreach (var item in response.S3Objects) yield return new ObjectKey(item.Key[_prefix.Length..].TrimStart('/'));
+            token = response.IsTruncated ? response.NextContinuationToken : null;
+        } while (token is not null);
+    }
+    public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
+        string? token = null;
+        do
+        {
+            var listPrefix = string.IsNullOrEmpty(_prefix) ? prefix ?? string.Empty : _prefix + "/" + (prefix ?? string.Empty);
+            var response = await _client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = _bucket, Prefix = listPrefix, Delimiter = delimiter, ContinuationToken = token }, cancellationToken).ConfigureAwait(false);
+            foreach (var common in response.CommonPrefixes.OrderBy(static x => x, StringComparer.Ordinal))
+                yield return new ObjectListing(null, common[_prefix.Length..].TrimStart('/'));
+            foreach (var item in response.S3Objects.OrderBy(static x => x.Key, StringComparer.Ordinal))
+                yield return new ObjectListing(new ObjectKey(item.Key[_prefix.Length..].TrimStart('/')), null);
             token = response.IsTruncated ? response.NextContinuationToken : null;
         } while (token is not null);
     }
@@ -171,13 +187,27 @@ public class S3ObjectStore : IListableObjectStore, IServerSideCopyStore, IServer
             Verb = HttpVerb.PUT,
             Expires = descriptor.ExpiresAt.UtcDateTime
         };
-        request.Headers["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray());
-        request.Headers["If-None-Match"] = "*";
+        if (UploadDigestIsStorageEnforced)
+        {
+            request.Headers["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray());
+            request.Headers["If-None-Match"] = "*";
+        }
         request.Headers["Content-Length"] = descriptor.ExpectedLength.ToString(CultureInfo.InvariantCulture);
         return ValueTask.FromResult(new Uri(_client.GetPreSignedURL(request), UriKind.Absolute));
     }
     public IReadOnlyDictionary<string, string> GetRequiredUploadHeaders(UploadGrantDescriptor descriptor)
-        => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray()), ["If-None-Match"] = "*", ["Content-Length"] = descriptor.ExpectedLength.ToString(CultureInfo.InvariantCulture) };
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Content-Length"] = descriptor.ExpectedLength.ToString(CultureInfo.InvariantCulture)
+        };
+        if (UploadDigestIsStorageEnforced)
+        {
+            headers["x-amz-checksum-sha256"] = Convert.ToBase64String(descriptor.ExpectedDigest.Value.ToArray());
+            headers["If-None-Match"] = "*";
+        }
+        return headers;
+    }
     public async ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default) => await _client.DeleteObjectAsync(new DeleteObjectRequest { BucketName = _bucket, Key = FullKey(key) }, cancellationToken).ConfigureAwait(false);
     public async ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {

@@ -52,6 +52,18 @@ public sealed record AxisDefinition
         }
         return true;
     }
+
+    public AxisDefinition NormalizeRetiredMappings()
+    {
+        var normalized = ImmutableDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
+        foreach (var oldValue in Retired.Keys.OrderBy(static value => value, StringComparer.Ordinal))
+        {
+            if (!TryResolveRetired(oldValue, out var replacement, out _, out var error))
+                throw new FormatException($"Axis '{Name}' has an invalid retirement mapping for '{oldValue}': {error}");
+            normalized[oldValue] = replacement;
+        }
+        return this with { Retired = normalized.ToImmutable() };
+    }
 }
 
 public sealed record VariantSelection

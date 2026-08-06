@@ -26,7 +26,8 @@ public sealed class ReleaseBuilder
                 Overrides = requirements.Where(x => x.Package == packageId).SelectMany(x => x.Overrides).Distinct().ToImmutableArray()
             });
         }
-        return new ReleaseLock { SchemaVersion = 1, ProductId = productId, ReleaseId = releaseId, Sequence = sequence, State = ReleaseState.Draft, CreatedAt = createdAt.ToUniversalTime(), Axes = axes, Requirements = requirements, Packages = pins.ToImmutable(), MinimumInstalledRelease = minimumInstalledRelease, CoverageDigest = coverageDigest.Value };
+        var normalizedAxes = axes.Select(static axis => axis.NormalizeRetiredMappings()).ToImmutableArray();
+        return new ReleaseLock { SchemaVersion = 1, ProductId = productId, ReleaseId = releaseId, Sequence = sequence, State = ReleaseState.Draft, CreatedAt = createdAt.ToUniversalTime(), Axes = normalizedAxes, Requirements = requirements, Packages = pins.ToImmutable(), MinimumInstalledRelease = minimumInstalledRelease, CoverageDigest = coverageDigest.Value };
     }
 
     public async ValueTask<(ReleaseLock Release, CoverageDocument Coverage, ContentHash CoverageDigest)> BuildAsync(string productId, string releaseId, long sequence, ImmutableArray<AxisDefinition> axes, ImmutableArray<PackageRequirement> requirements, IReadOnlyDictionary<PackageId, PackageManifest> manifests, RepositoryLayout layout, DateTimeOffset createdAt, IPackageRepository repository, long? minimumInstalledRelease = null, CancellationToken cancellationToken = default)
@@ -80,7 +81,7 @@ public sealed class ReleaseBuilder
     {
         if (draft.State != ReleaseState.Draft) throw new InvalidDataException("Only draft releases can be published.");
         if (!draft.CoverageDigest.IsValid || draft.CoverageDigest == ContentHash.Compute([])) throw new InvalidDataException("A release must carry a non-empty coverage digest before publication.");
-        return draft with { State = ReleaseState.Published };
+        return draft with { State = ReleaseState.Published, Axes = draft.Axes.Select(static axis => axis.NormalizeRetiredMappings()).ToImmutableArray() };
     }
 
     public ReleaseBundle Bundle(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests) => new() { Lock = release, Inline = manifests.Where(x => release.Packages.Any(p => p.Id == x.Key)).ToImmutableDictionary(x => x.Key, x => x.Value) };

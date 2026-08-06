@@ -121,7 +121,7 @@ test in this phase.
 
 - Fetch with dedup, per-blob verification, mirror failover.
 - The staging barrier — nothing touches the tree until every blob is verified.
-- Hardlink-first materialisation; the local CAS as a specified subsystem.
+- Reflink-first, copy-default materialisation; the local CAS as a specified subsystem.
 - Single durable commit; the crash-recovery table executed as tests.
 - Delete + directory pruning; `Preserve`/`Orphan` handling.
 - Locked-file handling remains an explicit caller concern; Windows service/process control is out of scope.

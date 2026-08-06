@@ -190,6 +190,41 @@ public sealed class ClientTests
         }
     }
 
+    [Fact]
+    public async Task LedgerRoundTripPreservesUnknownStateFields()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "4sup-ledger-fields-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var installLock = new InstallLock
+            {
+                RepositoryUri = "memory://test",
+                ProductId = "product",
+                ReleaseId = "r1",
+                ReleaseDigest = ContentHash.Compute("release"u8),
+                Selection = new VariantSelection { Axes = ImmutableSortedDictionary<string, ImmutableSortedSet<string>>.Empty },
+                SelectionId = ContentHash.Compute([]),
+                FileSetId = ContentHash.Compute([]),
+                AppliedAt = DateTimeOffset.UtcNow
+            };
+            var ledger = new InstallLedger(root);
+            await ledger.CommitAsync(installLock, ImmutableDictionary<VirtualPath, InstalledFile>.Empty);
+            var path = Path.Combine(root, ".4sup", "state.jsonl");
+            var line = await File.ReadAllTextAsync(path);
+            await File.WriteAllTextAsync(path, line.TrimEnd() is { } trimmed && trimmed.EndsWith('}')
+                ? trimmed[..^1] + ",\"futureField\":{\"value\":7}}\n"
+                : line);
+
+            var loaded = await ledger.ReadAsync();
+            Assert.NotNull(loaded);
+            Assert.Equal(7, loaded!.Lock.UnknownFields["futureField"].GetProperty("value").GetInt32());
+            await ledger.CommitAsync(loaded.Lock, loaded.Files);
+            Assert.Contains("futureField", await File.ReadAllTextAsync(path), StringComparison.Ordinal);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
     private sealed class FaultyObjectStore(IReadableObjectStore inner) : IReadableObjectStore
     {
         public int? FailAfterBytes { get; set; }

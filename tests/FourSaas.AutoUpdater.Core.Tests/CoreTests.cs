@@ -50,6 +50,7 @@ public sealed class CoreTests
     {
         var path = new VirtualPath("data/file.bin"); var file = new ComposedFile(path, ContentHash.Compute("x"u8), 1, Id("core"), FileInstallPolicy.Replace);
         var target = new ComposedFileSet { Files = new Dictionary<VirtualPath, ComposedFile> { [path] = file }.ToImmutableSortedDictionary(), Shadowed = [], FileSetId = FileSetIdentity.Compute(new Dictionary<VirtualPath, ComposedFile> { [path] = file }) };
+        Assert.Equal("sha256:fe78c2fb21bd31e7664062f8bd57af722421d7beb7550e8ddff8e5db840e9ba4", target.FileSetId.ToString());
         var preserve = target with { Files = new Dictionary<VirtualPath, ComposedFile> { [path] = file with { Policy = FileInstallPolicy.Preserve } }.ToImmutableSortedDictionary() };
         Assert.NotEqual(target.FileSetId, FileSetIdentity.Compute(preserve.Files));
     }

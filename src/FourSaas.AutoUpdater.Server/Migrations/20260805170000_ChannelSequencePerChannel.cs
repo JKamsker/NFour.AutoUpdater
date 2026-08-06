@@ -7,6 +7,7 @@ namespace FourSaas.AutoUpdater.Server.Migrations;
 
 /// <inheritdoc />
 [Migration("20260805170000_ChannelSequencePerChannel")]
+[DbContext(typeof(ManagementDbContext))]
 public partial class ChannelSequencePerChannel : Migration
 {
     /// <inheritdoc />

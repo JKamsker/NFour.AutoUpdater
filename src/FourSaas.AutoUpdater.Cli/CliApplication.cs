@@ -91,7 +91,7 @@ public static class CliApplication
         }
     }
 
-    private static void PrintHelp() => Console.WriteLine("4sup — content-addressed variant updater\n\nCommands: install, update, switch, rollback, plan, status, verify, explain, pkg, release, channel, gc, mirror, prune, verify-repo, config, daemon\n\nTrust: first-party installs use the compiled root; self-hosted first install requires --trust-on-first-use with --trusted-key.\n\nDevelopment helpers: parse-address <address>, select --select=axis=value, verify-path <path>\n\nExit codes: 0 success, 1 validation, 2 usage, 3 backend, 4 precondition, 5 integrity, 6 concurrency, 7 cancelled.");
+    private static void PrintHelp() => Console.WriteLine("4sup — content-addressed variant updater\n\nCommands: install, update, switch, rollback, plan, status, verify, explain, pkg, release, channel, gc, mirror, prune, verify-repo, config, daemon\n\nPackage helpers: pkg schema prints the slice authoring JSON Schema.\n\nTrust: first-party installs use the compiled root; self-hosted first install requires --trust-on-first-use with --trusted-key.\n\nDevelopment helpers: parse-address <address>, select --select=axis=value, verify-path <path>\n\nExit codes: 0 success, 1 validation, 2 usage, 3 backend, 4 precondition, 5 integrity, 6 concurrency, 7 cancelled.");
 
     private static async ValueTask<int> ConfigurationCommandAsync(string[] args)
     {
@@ -594,7 +594,7 @@ public static class CliApplication
             .Where(x => !string.Equals(x.ToString().TrimEnd('/'), address.BaseUri.ToString().TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
             .Select(x => (IReadableObjectStore)new HttpObjectStore(x)))
             .ToArray();
-        await new InstallApplier().ApplyAsync(installRoot, plan, composed, installLock, store, layout, ledger, mirrors: mirrors, cache: new LocalContentCache(cacheRoot), protectedCacheEntries: protectedCacheEntries, preconditions: new ApplyPreconditions { MinimumInstalledReleaseSequence = verified.Lock.MinimumInstalledRelease, CurrentInstalledReleaseSequence = previous?.Lock.ReleaseSequence, ClientVersion = clientVersion, MinimumClientVersion = minimumClientVersion }).ConfigureAwait(false);
+        await new InstallApplier().ApplyAsync(installRoot, plan, composed, installLock, store, layout, ledger, mirrors: mirrors, cache: new LocalContentCache(cacheRoot), protectedCacheEntries: protectedCacheEntries, materializationProfile: args.Contains("--immutable-install", StringComparer.Ordinal) ? InstallMaterializationProfile.ImmutableInstall : InstallMaterializationProfile.CopyDefault, preconditions: new ApplyPreconditions { MinimumInstalledReleaseSequence = verified.Lock.MinimumInstalledRelease, CurrentInstalledReleaseSequence = previous?.Lock.ReleaseSequence, ClientVersion = clientVersion, MinimumClientVersion = minimumClientVersion }).ConfigureAwait(false);
         Console.WriteLine(args.Contains("--json", StringComparer.Ordinal) ? JsonSerializer.Serialize(new { applied = true, release = verified.Lock.ReleaseId, fileSetId = composed.FileSetId.ToString() }) : $"applied {verified.Lock.ReleaseId} ({composed.FileSetId})");
         return 0;
     }
@@ -621,6 +621,7 @@ public static class CliApplication
     {
         var subcommand = args.FirstOrDefault() ?? throw new FormatException("pkg requires slice, list, or show.");
         if (subcommand == "publish") return await PublishPackageCommandAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
+        if (subcommand == "schema") { Console.WriteLine(SliceRulesYaml.JsonSchema); return 0; }
         if (subcommand == "slice")
         {
             var rulesPath = GetOptionValue(args, "--rules") ?? throw new FormatException("pkg slice requires --rules <slice.yaml>.");
@@ -674,7 +675,7 @@ public static class CliApplication
             return await PublishPackageViaApiAsync(args, target.Address, packageId, versionLabel, sequence, package).ConfigureAwait(false);
         await using var destination = CreateWriteStore(target.Address);
         var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(destination).ConfigureAwait(false);
-        var published = await new PackageBuilder().BuildAsync(package, new PackageVersion(versionLabel, sequence), layout, destination).ConfigureAwait(false);
+        var published = await new PackageBuilder().BuildAsync(package, new PackageVersion(versionLabel, sequence), layout, destination, options: new PackageBuildOptions { HashCachePath = Path.GetFullPath(rulesPath) + ".hash-cache.json", RehashAll = args.Contains("--rehash-all", StringComparer.Ordinal), ReleaseSigningBuild = args.Contains("--release-signing", StringComparer.Ordinal), Validators = [new JsonContentValidator(), new PeHeaderValidator()] }).ConfigureAwait(false);
         await new StaticProjectionWriter(destination, layout).WriteRepositoryDescriptorAsync(descriptor).ConfigureAwait(false);
         await WritePackageIndexAsync(destination, layout, published.Manifest, published.Manifest.Id).ConfigureAwait(false);
         Console.WriteLine(JsonSerializer.Serialize(new { published = true, package = published.Manifest.Id.Value, version = published.Manifest.Version.Label, manifestDigest = ContentHash.Compute(published.ManifestBytes).ToString(), files = published.Manifest.FileCount }));
@@ -699,7 +700,7 @@ public static class CliApplication
             try
             {
                 await using var local = new LocalObjectStore(temporaryRoot);
-                var built = await new PackageBuilder().BuildAsync(package, new PackageVersion(versionLabel, sequence), layout, local).ConfigureAwait(false);
+                var built = await new PackageBuilder().BuildAsync(package, new PackageVersion(versionLabel, sequence), layout, local, options: new PackageBuildOptions { HashCachePath = Path.GetFullPath(GetOptionValue(args, "--rules")!) + ".hash-cache.json", RehashAll = args.Contains("--rehash-all", StringComparer.Ordinal), ReleaseSigningBuild = args.Contains("--release-signing", StringComparer.Ordinal), Validators = [new JsonContentValidator(), new PeHeaderValidator()] }).ConfigureAwait(false);
                 var hashes = built.Blobs.Values.Concat(built.Manifest.FileTable.Shards.Select(x => x.Digest)).Distinct().OrderBy(x => x.ToString(), StringComparer.Ordinal).ToArray();
                 var session = await api.OpenSessionAsync(repositoryId).ConfigureAwait(false);
                 var present = await api.QueryBlobsAsync(repositoryId, hashes).ConfigureAwait(false);

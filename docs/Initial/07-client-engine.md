@@ -160,7 +160,7 @@ The glob engine still exists, but only on the publishing side.
                                VERIFYING sha256 as bytes land
 5. ── barrier ──               nothing is written into the install tree until every blob is
                                present and verified
-6. Materialise                 hardlink-or-copy staged blobs into place; escalate on lock
+6. Materialise                 reflink-or-copy staged blobs into place; escalate on lock
 7. Delete                      the delete set; prune emptied directories
 8. COMMIT                      atomic + durable rewrite of .4sup/state.jsonl
 9. Remove .4sup/plan.json      the operation is over

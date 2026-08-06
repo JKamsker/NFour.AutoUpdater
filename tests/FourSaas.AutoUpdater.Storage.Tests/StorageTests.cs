@@ -57,6 +57,24 @@ public sealed class StorageTests
 
     [Theory]
     [MemberData(nameof(Stores))]
+    public async Task DelimitedListingReturnsObjectsAndCommonPrefixes(Func<string, IReadableObjectStore> factory)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "4sup-delimited-" + Guid.NewGuid().ToString("N"));
+        await using var store = factory(root);
+        var writable = Assert.IsAssignableFrom<IWritableObjectStore>(store);
+        await writable.PutAsync(new ObjectKey("packages/a/one"), new MemoryStream("1"u8.ToArray()), 1);
+        await writable.PutAsync(new ObjectKey("packages/a/two"), new MemoryStream("2"u8.ToArray()), 1);
+        await writable.PutAsync(new ObjectKey("packages/root"), new MemoryStream("3"u8.ToArray()), 1);
+        var delimited = Assert.IsAssignableFrom<IDelimitedObjectStore>(store);
+        var values = new List<ObjectListing>();
+        await foreach (var item in delimited.ListAsync("packages/", "/")) values.Add(item);
+        Assert.Contains(values, x => x.CommonPrefix == "packages/a/");
+        Assert.Contains(values, x => x.Object?.Value == "packages/root");
+        if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
     public async Task ConditionalCreateIsRaceFree(Func<string, IReadableObjectStore> factory)
     {
         var root = Path.Combine(Path.GetTempPath(), "4sup-race-" + Guid.NewGuid().ToString("N"));
@@ -137,11 +155,55 @@ public sealed class StorageTests
         }
     }
 
+    [Fact]
+    public async Task LiveNginxCharacterizationHonorsRawBytesAndRanges()
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("FOURSUP_HTTP"), "1", StringComparison.Ordinal)) Assert.Skip("Set FOURSUP_HTTP=1 after starting docker compose to run nginx integration tests.");
+        await using var store = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("http://localhost:8080/"));
+        var head = await store.HeadAsync(new ObjectKey("blob"));
+        Assert.NotNull(head);
+        Assert.Equal(11, head!.Length);
+        var read = await store.OpenAsync(new ObjectKey("blob"), 4, head.Validator);
+        Assert.NotNull(read);
+        await using (read!)
+        {
+            using var bytes = new MemoryStream();
+            await read.Content.CopyToAsync(bytes);
+            Assert.Equal("456789\n", Encoding.UTF8.GetString(bytes.ToArray()));
+        }
+        await using var encoded = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("http://localhost:8080/"), new GzipRequestHandler());
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await encoded.OpenAsync(new ObjectKey("blob")));
+    }
+
+    [Fact]
+    public async Task LiveVsftpdCharacterizationFailsClosedWithoutMachineListing()
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("FOURSUP_FTP"), "1", StringComparison.Ordinal)) Assert.Skip("Set FOURSUP_FTP=1 after starting docker compose to run FTP integration tests.");
+        await using var store = new FourSaas.AutoUpdater.Storage.Ftp.FtpObjectStore(new Uri("ftp://localhost:2121/"), new NetworkCredential("4sup-test", "4sup-test-password"), enableSsl: false);
+        var head = await store.HeadAsync(new ObjectKey("blob"));
+        Assert.NotNull(head);
+        Assert.Equal(11, head!.Length);
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+        {
+            await foreach (var _ in store.ListAsync()) { }
+        });
+    }
+
     private static async Task<string[]> ToArrayAsync(IAsyncEnumerable<ObjectKey> keys) { var result = new List<string>(); await foreach (var key in keys) result.Add(key.Value); return result.ToArray(); }
 
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
             => Task.FromResult(responder(request));
+    }
+
+    private sealed class GzipRequestHandler : DelegatingHandler
+    {
+        public GzipRequestHandler() : base(new HttpClientHandler { AutomaticDecompression = DecompressionMethods.None }) { }
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            request.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+            return base.SendAsync(request, cancellationToken);
+        }
     }
 }

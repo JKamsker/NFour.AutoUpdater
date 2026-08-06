@@ -482,7 +482,7 @@ public sealed class ManagementState
                 uploadUri,
                 localPath,
                 requiredHeaders,
-                enforcement = multipart is not null || _stagingStore is not IPresigningStore ? "serverVerified" : "storageEnforced",
+                enforcement = multipart is not null || _stagingStore is not IUploadIntegrityEnforcement { UploadDigestIsStorageEnforced: true } ? "serverVerified" : "storageEnforced",
                 multipartUploadId = multipart?.Upload.UploadId,
                 partSize = multipart?.Upload.PartSize,
                 parts = multipart?.Parts.Select(part => new
@@ -492,7 +492,8 @@ public sealed class ManagementState
                     requiredHeaders = part.RequiredHeaders.Select(header => new { name = header.Key, value = header.Value }).ToArray()
                 }).ToArray(),
                 completePath = multipart is null ? null : MultipartGrantPath(session.Repository, sessionId, grantId, "complete"),
-                abortPath = multipart is null ? null : MultipartGrantPath(session.Repository, sessionId, grantId, "abort")
+                abortPath = multipart is null ? null : MultipartGrantPath(session.Repository, sessionId, grantId, "abort"),
+                partsPath = multipart is null ? null : MultipartGrantPath(session.Repository, sessionId, grantId, "parts")
             });
         }
         PublishSessions[sessionId] = session with { ObjectCount = session.ObjectCount + requested.Count, TotalBytes = session.TotalBytes + requested.Sum(x => x.Length) };
@@ -503,6 +504,18 @@ public sealed class ManagementState
         return Results.Ok(new { items = response });
         }
         finally { _placementGate.Release(); }
+    }
+
+    public async Task<IResult> ListMultipartGrantPartsAsync(string repository, string sessionId, string grantId, CancellationToken cancellationToken = default)
+    {
+        if (!IsValidConfiguredRepository(repository) || !Grants.TryGetValue(grantId, out var grant) || !string.Equals(grant.Repository, repository, StringComparison.Ordinal) || !string.Equals(grant.SessionId, sessionId, StringComparison.Ordinal))
+            return Results.NotFound();
+        if (grant.MultipartUploadId is null || grant.MultipartPartSize is not { } partSize || _stagingStore is not IMultipartGrantStore multipartStore)
+            return Results.BadRequest(new { error = "not_multipart_grant" });
+        if (grant.Status == GrantInvalidated || grant.Used) return Results.Conflict();
+        if (grant.ExpiresAt <= DateTimeOffset.UtcNow) return Results.BadRequest(new { error = "grant_expired" });
+        var parts = await multipartStore.ListBrokeredMultipartPartsAsync(new MultipartUpload(grant.StagingKey, grant.MultipartUploadId, partSize), cancellationToken).ConfigureAwait(false);
+        return Results.Json(new { parts = parts.OrderBy(part => part.Number).Select(part => new { number = part.Number, etag = part.ETag, length = part.Length }).ToArray() });
     }
 
     public async Task<IResult> CompleteMultipartGrantAsync(string repository, string sessionId, string grantId, HttpRequest request, CancellationToken cancellationToken = default)
@@ -1426,6 +1439,12 @@ public sealed class ManagementState
             if (expectedType == "release-lock")
             {
                 var candidate = SignedDocument.DeserializePayload<ReleaseLock>(payload);
+                foreach (var axis in candidate.Axes)
+                    foreach (var oldValue in axis.Retired.Keys)
+                    {
+                        if (!axis.TryResolveRetired(oldValue, out var terminal, out _, out var retirementError) || !string.Equals(axis.Retired[oldValue], terminal, StringComparison.Ordinal))
+                            return Results.BadRequest(new { error = "retirement_mapping_not_terminal", axis = axis.Name, value = oldValue, detail = retirementError ?? terminal });
+                    }
                 if (candidate.State == ReleaseState.Published)
                     await RebuildReleaseProjectionsAsync(product, name, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
             }

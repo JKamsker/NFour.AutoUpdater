@@ -3,7 +3,7 @@ using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Local;
 
-public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideTransferStore, IServerSideVerifier
+public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideTransferStore, IServerSideVerifier
 {
     private readonly string _root;
     public LocalObjectStore(string root) => _root = Path.GetFullPath(root);
@@ -44,6 +44,19 @@ public sealed class LocalObjectStore : IListableObjectStore, IConditionalWriteSt
             var key = Path.GetRelativePath(_root, file).Replace(Path.DirectorySeparatorChar, '/');
             if (prefix is null || key.StartsWith(prefix, StringComparison.Ordinal)) yield return new ObjectKey(key);
             await Task.Yield();
+        }
+    }
+    public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
+        var root = prefix ?? string.Empty;
+        var prefixes = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var key in ListAsync(prefix, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            var remainder = key.Value[root.Length..];
+            var separator = remainder.IndexOf(delimiter, StringComparison.Ordinal);
+            if (separator < 0) yield return new ObjectListing(key, null);
+            else if (prefixes.Add(key.Value[..(root.Length + separator + delimiter.Length)])) yield return new ObjectListing(null, key.Value[..(root.Length + separator + delimiter.Length)]);
         }
     }
     public async ValueTask PutAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)

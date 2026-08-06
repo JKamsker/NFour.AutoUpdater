@@ -337,9 +337,9 @@ why the coverage matrix is a committed, digested artifact rather than a report.
 The variant-switch story assumes a local CAS ("most modern blobs are still cached"). Copying
 from it to materialise a 40 GB install costs 40 GB of extra disk and 40 GB of extra writes.
 
-**Mitigation** — [07](07-client-engine.md) §5: hardlink-first with a reflink fast path, and a
-**copy fallback for `Preserve` files** — the game mutates those in place, and a hardlink there
-would corrupt the shared CAS entry for every other install on the machine.
+**Mitigation** — [07](07-client-engine.md) §5: reflink-first with a copy default. Hardlinks are
+only available under the explicit immutable-install profile, because a writable hardlink would
+corrupt the shared CAS entry for every other install on the machine.
 
 ---
 

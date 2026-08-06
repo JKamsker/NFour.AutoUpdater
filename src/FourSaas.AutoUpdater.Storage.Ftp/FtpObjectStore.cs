@@ -8,7 +8,7 @@ namespace FourSaas.AutoUpdater.Storage.Ftp;
 /// negotiated by the library after connect; this adapter refuses to enumerate
 /// a server that does not advertise machine-readable listings.
 /// </summary>
-public sealed class FtpObjectStore : IListableObjectStore, IWritableObjectStore, IServerSideTransferStore
+public sealed class FtpObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IWritableObjectStore, IServerSideTransferStore
 {
     private readonly Uri _baseUri;
     private readonly NetworkCredential _credentials;
@@ -73,6 +73,19 @@ public sealed class FtpObjectStore : IListableObjectStore, IWritableObjectStore,
             if (prefix is null || value.StartsWith(prefix.Trim('/'), StringComparison.Ordinal)) yield return new ObjectKey(value);
         }
     }
+    public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
+        var root = prefix?.Trim('/') ?? string.Empty;
+        var prefixes = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var key in ListAsync(prefix, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            var remainder = key.Value[root.Length..];
+            var separator = remainder.IndexOf(delimiter, StringComparison.Ordinal);
+            if (separator < 0) yield return new ObjectListing(key, null);
+            else if (prefixes.Add(key.Value[..(root.Length + separator + delimiter.Length)])) yield return new ObjectListing(null, key.Value[..(root.Length + separator + delimiter.Length)]);
+        }
+    }
 
     public async ValueTask PutAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
@@ -103,6 +116,21 @@ public sealed class FtpObjectStore : IListableObjectStore, IWritableObjectStore,
 
     public async ValueTask<bool> TryCopyFromAsync(IReadableObjectStore sourceStore, ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
+        // When staging and served content share this FTP tree, promotion is an
+        // atomic server-side RNTO.  The byte-relay fallback below is reserved
+        // for a genuinely separate source store.
+        if (sourceStore is FtpObjectStore sourceFtp && CanUseSameServer(sourceFtp))
+        {
+            await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
+            var sourcePath = sourceFtp.RemotePath(source);
+            var destinationPath = RemotePath(destination);
+            if (!await client.FileExists(sourcePath, cancellationToken).ConfigureAwait(false)) throw new FileNotFoundException(source.Value);
+            if (!overwrite && await client.FileExists(destinationPath, cancellationToken).ConfigureAwait(false)) throw new IOException($"Destination '{destination}' already exists.");
+            await client.CreateDirectory(ParentPath(destinationPath), true, cancellationToken).ConfigureAwait(false);
+            if (!await client.MoveFile(sourcePath, destinationPath, overwrite ? FtpRemoteExists.Overwrite : FtpRemoteExists.Skip, cancellationToken).ConfigureAwait(false))
+                throw new IOException($"FTP server-side promotion of '{source}' to '{destination}' failed.");
+            return true;
+        }
         if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null)
             throw new IOException($"Destination '{destination}' already exists.");
         var body = await sourceStore.OpenAsync(source, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -135,6 +163,13 @@ public sealed class FtpObjectStore : IListableObjectStore, IWritableObjectStore,
     }
 
     private string RemoteRoot => _baseUri.AbsolutePath.TrimEnd('/');
+    private bool CanUseSameServer(FtpObjectStore other)
+        => string.Equals(_baseUri.Scheme, other._baseUri.Scheme, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(_baseUri.Host, other._baseUri.Host, StringComparison.OrdinalIgnoreCase)
+            && _baseUri.Port == other._baseUri.Port
+            && string.Equals(_credentials.UserName, other._credentials.UserName, StringComparison.Ordinal)
+            && string.Equals(_credentials.Password, other._credentials.Password, StringComparison.Ordinal)
+            && _enableSsl == other._enableSsl;
     private string RemotePath(ObjectKey key) => RemotePath(key.Value);
     private string RemotePath(string path) => $"{RemoteRoot}/{path.TrimStart('/')}";
     private string RelativePath(string path)

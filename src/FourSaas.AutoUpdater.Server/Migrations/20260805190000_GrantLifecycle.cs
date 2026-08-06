@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace FourSaas.AutoUpdater.Server.Migrations;
 
 [Migration("20260805190000_GrantLifecycle")]
+[DbContext(typeof(ManagementDbContext))]
 public partial class GrantLifecycle : Migration
 {
     protected override void Up(MigrationBuilder migrationBuilder)

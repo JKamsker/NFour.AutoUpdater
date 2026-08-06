@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace FourSaas.AutoUpdater.Server.Migrations;
 
 [Migration("20260805183000_SequenceClaims")]
+[DbContext(typeof(ManagementDbContext))]
 public partial class SequenceClaims : Migration
 {
     protected override void Up(MigrationBuilder migrationBuilder)

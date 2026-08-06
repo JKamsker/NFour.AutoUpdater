@@ -119,8 +119,10 @@ public sealed class PublishGate
                 if (!Identifier.IsValid(value.Id, "value", out var valueError)) diagnostics.Add(new("PKG003", DiagnosticSeverity.Error, valueError!, axis.Name));
             foreach (var old in axis.Retired.Keys)
             {
-                if (!axis.TryResolveRetired(old, out _, out _, out var retirementError))
+                if (!axis.TryResolveRetired(old, out var replacement, out _, out var retirementError))
                     diagnostics.Add(new(retirementError?.Contains("not a live axis value", StringComparison.Ordinal) == true ? "PKG018" : "PKG017", DiagnosticSeverity.Error, retirementError!, axis.Name));
+                else if (!string.Equals(axis.Retired[old], replacement, StringComparison.Ordinal))
+                    diagnostics.Add(new("PKG017", DiagnosticSeverity.Error, $"Retirement mapping '{old}' must point directly to terminal value '{replacement}'.", axis.Name));
             }
         }
         foreach (var requirement in release.Requirements)

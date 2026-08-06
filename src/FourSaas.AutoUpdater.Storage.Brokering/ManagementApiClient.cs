@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Http.Headers;
 using FourSaas.AutoUpdater.Core;
 
@@ -93,7 +94,8 @@ public sealed class ManagementApiClient : IAsyncDisposable
                 item.TryGetProperty("partSize", out var partSize) && partSize.TryGetInt64(out var size) ? size : null,
                 multipartParts,
                 item.TryGetProperty("completePath", out var completePath) && completePath.ValueKind == JsonValueKind.String ? completePath.GetString() : null,
-                item.TryGetProperty("abortPath", out var abortPath) && abortPath.ValueKind == JsonValueKind.String ? abortPath.GetString() : null));
+                item.TryGetProperty("abortPath", out var abortPath) && abortPath.ValueKind == JsonValueKind.String ? abortPath.GetString() : null,
+                item.TryGetProperty("partsPath", out var partsPath) && partsPath.ValueKind == JsonValueKind.String ? partsPath.GetString() : null));
         }
         return result;
     }
@@ -143,15 +145,27 @@ public sealed class ManagementApiClient : IAsyncDisposable
 
         try
         {
+            var existing = grant.PartsPath is null
+                ? new Dictionary<int, MultipartPartState>()
+                : await GetMultipartPartsAsync(grant, cancellationToken).ConfigureAwait(false);
             var completed = new List<object>(grant.MultipartParts.Length);
             long remaining = length;
             foreach (var part in grant.MultipartParts.OrderBy(x => x.Number))
             {
                 var expectedPartLength = Math.Min(partSize, remaining);
                 if (expectedPartLength <= 0) throw new InvalidDataException($"Multipart grant '{grant.GrantId}' contains too many parts.");
-                await using var partContent = await ReadExactlyAsync(content, expectedPartLength, cancellationToken).ConfigureAwait(false);
-                var etag = await UploadPartAsync(part, partContent, expectedPartLength, cancellationToken).ConfigureAwait(false);
-                completed.Add(new { number = part.Number, etag });
+                if (existing.TryGetValue(part.Number, out var saved))
+                {
+                    if (saved.Length != expectedPartLength) throw new InvalidDataException($"Multipart grant '{grant.GrantId}' has an existing part {part.Number} with the wrong length.");
+                    await SkipExactlyAsync(content, expectedPartLength, cancellationToken).ConfigureAwait(false);
+                    completed.Add(new { number = part.Number, etag = saved.ETag });
+                }
+                else
+                {
+                    await using var partContent = await ReadExactlyAsync(content, expectedPartLength, cancellationToken).ConfigureAwait(false);
+                    var etag = await UploadPartAsync(part, partContent, expectedPartLength, cancellationToken).ConfigureAwait(false);
+                    completed.Add(new { number = part.Number, etag });
+                }
                 remaining -= expectedPartLength;
             }
             if (remaining != 0 || await HasMoreBytesAsync(content, cancellationToken).ConfigureAwait(false))
@@ -183,6 +197,22 @@ public sealed class ManagementApiClient : IAsyncDisposable
         if (!grant.IsMultipart || grant.AbortPath is null) throw new ArgumentException("The grant does not expose a multipart abort operation.", nameof(grant));
         using var response = await SendAsync(HttpMethod.Post, grant.AbortPath, null, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<Dictionary<int, MultipartPartState>> GetMultipartPartsAsync(ApiUploadGrant grant, CancellationToken cancellationToken)
+    {
+        using var response = await SendAsync(HttpMethod.Get, grant.PartsPath!, null, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false), cancellationToken: cancellationToken).ConfigureAwait(false);
+        var result = new Dictionary<int, MultipartPartState>();
+        foreach (var part in document.RootElement.GetProperty("parts").EnumerateArray())
+        {
+            var number = part.GetProperty("number").GetInt32();
+            var etag = part.GetProperty("etag").GetString() ?? throw new InvalidDataException("Multipart status returned an empty ETag.");
+            var length = part.GetProperty("length").GetInt64();
+            if (!result.TryAdd(number, new MultipartPartState(etag, length))) throw new InvalidDataException($"Multipart status returned duplicate part {number}.");
+        }
+        return result;
     }
 
     public async ValueTask<IReadOnlySet<string>> QueryBlobsAsync(string repository, IEnumerable<ContentHash> hashes, CancellationToken cancellationToken = default)
@@ -309,10 +339,27 @@ public sealed class ManagementApiClient : IAsyncDisposable
         var one = new byte[1];
         return await source.ReadAsync(one.AsMemory(), cancellationToken).ConfigureAwait(false) != 0;
     }
+
+    private static async ValueTask SkipExactlyAsync(Stream source, long length, CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+        try
+        {
+            var remaining = length;
+            while (remaining > 0)
+            {
+                var read = await source.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), cancellationToken).ConfigureAwait(false);
+                if (read == 0) throw new EndOfStreamException("Multipart payload ended before an existing part could be skipped.");
+                remaining -= read;
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
+    }
 }
 
 public sealed record ApiPresignedPart(int Number, Uri Uri, ImmutableArray<HttpHeaderRequirement> RequiredHeaders);
-public sealed record ApiUploadGrant(string GrantId, ObjectKey StagingKey, ContentHash ExpectedDigest, long ExpectedLength, DateTimeOffset ExpiresAt, Uri? UploadUri, string Enforcement, ImmutableArray<HttpHeaderRequirement> RequiredHeaders, string? LocalPath, string? MultipartUploadId = null, long? MultipartPartSize = null, ImmutableArray<ApiPresignedPart> MultipartParts = default, string? CompletePath = null, string? AbortPath = null)
+public sealed record ApiUploadGrant(string GrantId, ObjectKey StagingKey, ContentHash ExpectedDigest, long ExpectedLength, DateTimeOffset ExpiresAt, Uri? UploadUri, string Enforcement, ImmutableArray<HttpHeaderRequirement> RequiredHeaders, string? LocalPath, string? MultipartUploadId = null, long? MultipartPartSize = null, ImmutableArray<ApiPresignedPart> MultipartParts = default, string? CompletePath = null, string? AbortPath = null, string? PartsPath = null)
 {
     public bool IsMultipart => !string.IsNullOrWhiteSpace(MultipartUploadId) || !MultipartParts.IsDefaultOrEmpty;
 }
+internal sealed record MultipartPartState(string ETag, long Length);

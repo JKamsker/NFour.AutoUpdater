@@ -1,4 +1,5 @@
 using Amazon.S3;
+using FourSaas.AutoUpdater.Core;
 using FourSaas.AutoUpdater.Storage;
 using FourSaas.AutoUpdater.Storage.S3;
 using System.Text;
@@ -7,6 +8,23 @@ namespace FourSaas.AutoUpdater.Storage.S3.Tests;
 
 public sealed class S3Tests
 {
+    [Theory]
+    [InlineData(S3ProviderProfile.Aws, true)]
+    [InlineData(S3ProviderProfile.Minio, true)]
+    [InlineData(S3ProviderProfile.R2, true)]
+    [InlineData(S3ProviderProfile.B2, false)]
+    [InlineData(S3ProviderProfile.Generic, false)]
+    public async Task ProviderProfilesExposeTheirDeclaredIntegritySurface(S3ProviderProfile profile, bool conditional)
+    {
+        using var client = new AmazonS3Client(new AmazonS3Config { ServiceURL = "http://localhost:9000", ForcePathStyle = true });
+        await using S3ObjectStore store = conditional
+            ? new S3ConditionalObjectStore("bucket", client: client, providerProfile: profile)
+            : new S3ObjectStore("bucket", client: client, providerProfile: profile);
+        Assert.Equal(conditional, store.Capabilities.HasFlag(StorageCapabilities.ConditionalWrite));
+        Assert.Equal(conditional, store.UploadDigestIsStorageEnforced);
+        Assert.True(StorageCapabilityNegotiation.IsConsistent(store));
+    }
+
     [Fact]
     public async Task ProviderProfileDoesNotAssumeBackblazeConditionalWrites()
     {
@@ -16,6 +34,10 @@ public sealed class S3Tests
         Assert.False(store.Capabilities.HasFlag(StorageCapabilities.ConditionalWrite));
         Assert.True(StorageCapabilityNegotiation.IsConsistent(store));
         await Assert.ThrowsAsync<NotSupportedException>(async () => await store.PutIfAbsentAsync(new ObjectKey("object"), new MemoryStream("bytes"u8.ToArray())));
+        var headers = store.GetRequiredUploadHeaders(new UploadGrantDescriptor(new ObjectKey("_staging/x"), ContentHash.Compute("x"u8), 1, DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.DoesNotContain("x-amz-checksum-sha256", headers.Keys, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("If-None-Match", headers.Keys, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal("1", headers["Content-Length"]);
 
         using var conditionalClient = new AmazonS3Client(new AmazonS3Config { ServiceURL = "http://localhost:9000", ForcePathStyle = true });
         await using var conditional = new S3ConditionalObjectStore("bucket", client: conditionalClient, providerProfile: S3ProviderProfile.Minio);

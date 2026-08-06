@@ -12,6 +12,56 @@ namespace FourSaas.AutoUpdater.Publishing.Tests;
 public sealed class PublishingTests
 {
     [Fact]
+    public async Task PackageBuilderUsesOnePassDigestsCacheAndValidators()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "4sup-publish-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var source = Path.Combine(root, "data.json");
+        await File.WriteAllTextAsync(source, "{\"ok\":true}");
+        var cachePath = Path.Combine(root, "hash-cache.json");
+        var package = new SlicedPackage(new PackageId("demo"), [new SlicedFile(source, new VirtualPath("data.json"), FileInstallPolicy.Replace)], []);
+        await using var store = new MemoryObjectStore();
+        var built = await new PackageBuilder().BuildAsync(package, new PackageVersion("1.0.0", 1), new RepositoryLayout(new RepositoryLayoutTemplates()), store, options: new PackageBuildOptions { HashCachePath = cachePath, Validators = [new JsonContentValidator()] });
+        Assert.True(File.Exists(cachePath));
+        var entry = (await new StaticRepository(store, new RepositoryDescriptor { RepositoryId = "test", GeneratedAt = DateTimeOffset.UtcNow }).GetManifestAsync(new PackageId("demo"), new PackageVersion("1.0.0", 1)))!;
+        var tableEntry = await ReadSingleAsync(new StaticRepository(store, new RepositoryDescriptor { RepositoryId = "test", GeneratedAt = DateTimeOffset.UtcNow }), entry);
+        Assert.Equal(ContentHash.Compute("{\"ok\":true}"u8, HashAlgorithmId.Md5), tableEntry.Md5);
+        Assert.Equal(1, built.Manifest.FileCount);
+        Directory.Delete(root, true);
+    }
+
+    [Fact]
+    public void SliceSchemaIsGeneratedAndDependenciesAreParsed()
+    {
+        using var schema = JsonDocument.Parse(SliceRulesYaml.JsonSchema);
+        Assert.Equal("https://json-schema.org/draft/2020-12/schema", schema.RootElement.GetProperty("$schema").GetString());
+        using var checkedIn = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "schemas", "slice.schema.json")));
+        Assert.True(System.Text.Json.Nodes.JsonNode.DeepEquals(System.Text.Json.Nodes.JsonNode.Parse(schema.RootElement.GetRawText()), System.Text.Json.Nodes.JsonNode.Parse(checkedIn.RootElement.GetRawText())), "The embedded authoring schema drifted from the checked-in schema.");
+        var rules = SliceRulesYaml.Parse("source: build\npackages:\n  - id: core\n    include: [**/*]\n    requires: [{ id: base, minSequence: 3 }]\nunmatched: error\n");
+        Assert.Equal(3, rules.Packages.Single().Requires.Single().MinSequence);
+        Assert.Equal("base", rules.Packages.Single().Requires.Single().Id.Value);
+    }
+    [Fact]
+    public void ReleaseAuthoringStoresTerminalRetirementMappings()
+    {
+        var axis = Axis("ui", AxisCardinality.One, "modern") with
+        {
+            Retired = ImmutableDictionary<string, string>.Empty
+                .Add("legacy", "old")
+                .Add("old", "modern")
+        };
+
+        var release = new ReleaseBuilder().Build(
+            "demo", "r1", 1, [axis], [], new Dictionary<PackageId, PackageManifest>(),
+            new RepositoryLayout(new RepositoryLayoutTemplates()), DateTimeOffset.UtcNow,
+            coverageDigest: ContentHash.Compute("coverage"u8));
+
+        Assert.Equal("modern", release.Axes.Single().Retired["legacy"]);
+        Assert.Equal("modern", release.Axes.Single().Retired["old"]);
+        Assert.Equal("modern", new ReleaseBuilder().Publish(release).Axes.Single().Retired["legacy"]);
+    }
+
+    [Fact]
     public async Task PublishGateAllowsUnconstrainedDependentWhenDependencyCoversWholeAxis()
     {
         var dependent = new PackageId("dependent");
@@ -161,6 +211,7 @@ public sealed class PublishingTests
     [Fact]
     public void ShardDigestIsOrderedByIndex()
     {
+        Assert.Equal(3, FileTableSharding.GetShardIndex(new VirtualPath("data/file.bin"), 16));
         var a = ContentHash.Compute("a"u8); var b = ContentHash.Compute("b"u8);
         var first = FileTableSharding.ComputeTableDigest([new FileTableShardRef { Index = 0, Digest = a, Count = 0, Size = 0 }, new FileTableShardRef { Index = 1, Digest = b, Count = 0, Size = 0 }]);
         var second = FileTableSharding.ComputeTableDigest([new FileTableShardRef { Index = 1, Digest = b, Count = 0, Size = 0 }, new FileTableShardRef { Index = 0, Digest = a, Count = 0, Size = 0 }]);
@@ -297,4 +348,10 @@ public sealed class PublishingTests
         Requires = requires.IsDefault ? manifest.Requires : requires,
         Conflicts = conflicts.IsDefault ? manifest.Conflicts : conflicts
     };
+
+    private static async ValueTask<PackageFileEntry> ReadSingleAsync(IPackageRepository repository, PackageManifest manifest)
+    {
+        await foreach (var entry in repository.ReadFileTableAsync(manifest)) return entry;
+        throw new InvalidDataException("Expected one file-table row.");
+    }
 }

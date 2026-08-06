@@ -52,6 +52,16 @@ public sealed class GoldenRepoTests
             new FixedTimeProvider(DateTimeOffset.UtcNow.AddDays(2)));
 
         Assert.Contains(layout.Blob(ContentHash.Parse("sha256:e70491a42942db28d2e54d9d0116bd1b477953f9ecdb4e8e9ce690466a00c661")), result.Deleted);
+
+        var collected = await new GarbageCollector().CollectLiveAsync(
+            store, layout, [alpha.Lock, beta.Lock], repository,
+            new GarbageCollectionOptions { MinimumBlobAge = TimeSpan.Zero },
+            new FixedTimeProvider(DateTimeOffset.UtcNow.AddDays(2)));
+
+        var orphanKey = layout.Blob(ContentHash.Parse("sha256:e70491a42942db28d2e54d9d0116bd1b477953f9ecdb4e8e9ce690466a00c661"));
+        Assert.Contains(orphanKey, collected.Deleted);
+        Assert.Contains(collected.Quarantined, key => key.Value.EndsWith('/' + orphanKey.Value.Split('/').Last(), StringComparison.Ordinal));
+        Assert.Null(await store.HeadAsync(orphanKey));
     }
 
     [Fact]
@@ -63,10 +73,13 @@ public sealed class GoldenRepoTests
     [Fact]
     public void SignedVectorsVerifyAndRejectDuplicatePayloadProperties()
     {
-        var key = Base64Url.Decode("A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg");
-        var trusted = new Dictionary<string, byte[]> { ["vector-key"] = key };
+        using var keyVector = JsonDocument.Parse(File.ReadAllBytes(VectorPath("vector-key.json")));
+        var keyId = keyVector.RootElement.GetProperty("keyId").GetString()!;
+        var key = Base64Url.Decode(keyVector.RootElement.GetProperty("publicKey").GetString()!);
+        var trusted = new Dictionary<string, byte[]> { [keyId] = key };
         var validBytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "vectors", "signed", "valid-envelope.json"));
         var valid = SignedDocument.DeserializeEnvelope(validBytes);
+        Assert.Equal("M5lGz-5zebLNq3BU_yhCUYT8mVYw5oNTdExn0Hc0WfhuyOrIlTjTYlkA6HiDBrDnasnFi8gTmwmN9EzDGMGoAw", valid.Signatures.Single().Signature);
         Assert.True(SignedDocument.Verify(valid, trusted, out var validPayload, out var validError), validError);
         Assert.Equal("{\"message\": \"héllo\",\n \"number\": -7}", Encoding.UTF8.GetString(Base64Url.Decode(valid.Payload)));
         JsonRules.Validate(validPayload);
@@ -75,6 +88,10 @@ public sealed class GoldenRepoTests
         var duplicate = SignedDocument.DeserializeEnvelope(duplicateBytes);
         Assert.False(SignedDocument.Verify(duplicate, trusted, out _, out var duplicateError));
         Assert.Contains("Duplicate JSON", duplicateError, StringComparison.Ordinal);
+
+        using var duplicateVector = JsonDocument.Parse(File.ReadAllBytes(VectorPath("duplicate-key.json")));
+        Assert.Equal("reject", duplicateVector.RootElement.GetProperty("expected").GetString());
+        Assert.Throws<FormatException>(() => JsonRules.Validate(Encoding.UTF8.GetBytes(duplicateVector.RootElement.GetProperty("payload").GetString()!)));
     }
 
     [Fact]
@@ -146,6 +163,13 @@ public sealed class GoldenRepoTests
             Assert.True(SignedDocument.Verify(envelope, new Dictionary<string, byte[]> { ["shape"] = key.PublicKey }, out var verified, out var error), error);
             Assert.Equal(bytes, verified);
         }
+
+        using var whitespace = JsonDocument.Parse(File.ReadAllBytes(VectorPath("whitespace-payload.json")));
+        var whitespaceBytes = Encoding.UTF8.GetBytes(whitespace.RootElement.GetProperty("payload").GetString()!.Replace("\\n", "\n", StringComparison.Ordinal).Replace("\\\"", "\"", StringComparison.Ordinal));
+        var whitespaceKey = FixtureKey(91);
+        var whitespaceEnvelope = SignedDocument.Sign("channel-pointer", whitespaceBytes, "shape-whitespace", whitespaceKey.PrivateKey);
+        Assert.True(SignedDocument.Verify(whitespaceEnvelope, new Dictionary<string, byte[]> { ["shape-whitespace"] = whitespaceKey.PublicKey }, out var verifiedWhitespace, out var whitespaceError), whitespaceError);
+        Assert.Equal(whitespaceBytes, verifiedWhitespace);
     }
 
     [Fact]
@@ -203,6 +227,19 @@ public sealed class GoldenRepoTests
             Assert.Contains(composed.Files.Values, x => x.Owner.Value == $"alpha.ui.{ui}");
             Assert.Equal(composed.FileSetId, FileSetIdentity.Compute(composed.Files));
         }
+    }
+
+    [Fact]
+    public async Task CheckedInGoldenTreeRejectsUnknownRepositorySchemaVersion()
+    {
+        await using var store = await LoadGoldenStoreAsync();
+        var bytes = await ReadObjectAsync(store, new ObjectKey("repo.json"));
+        var mutated = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(bytes).Replace("\"schemaVersion\":1", "\"schemaVersion\":2", StringComparison.Ordinal));
+        await store.PutAsync(new ObjectKey("repo.json"), new MemoryStream(mutated), mutated.LongLength);
+
+        var error = await Assert.ThrowsAsync<FormatException>(() => RepositoryFactory.LoadDescriptorAsync(store).AsTask());
+        Assert.Contains("schemaVersion 2", error.Message, StringComparison.Ordinal);
+        Assert.Contains("minimumClientVersion", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
