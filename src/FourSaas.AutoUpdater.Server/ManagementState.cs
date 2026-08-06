@@ -1048,10 +1048,16 @@ public sealed class ManagementState
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
         if (!PackageVersions.ContainsKey((repository, package, version))) return Results.NotFound();
         if (!PackageFileTableRegistrations.ContainsKey((repository, package, version))) return Results.Conflict(new { error = "file_table_not_registered" });
+
+        // Project first, commit second.  The index is a regenerable derived object, so an
+        // index that briefly runs ahead of the publication flag is self-correcting; a
+        // publication flag that runs ahead of a projection that then failed leaves the
+        // public index permanently missing a version nobody will republish.
+        await RebuildPackageProjectionAsync(repository, package, alsoPublished: (repository, package, version)).ConfigureAwait(false);
+
         PublishedPackageVersions[(repository, package, version)] = true;
         Persist();
         await MarkPackagePublishedAsync(repository, package, version).ConfigureAwait(false);
-        await RebuildPackageProjectionAsync(repository, package).ConfigureAwait(false);
         RecordAudit("publisher", "package.publish", $"{repository}/{package}/{version}", "accepted");
         return Results.Ok(new { package, version, state = "published" });
     }
@@ -1385,6 +1391,14 @@ public sealed class ManagementState
             {
                 var release = SignedDocument.DeserializePayload<ReleaseLock>(payload);
                 if (release.SchemaVersion != 1 || !string.Equals(release.ProductId, product, StringComparison.Ordinal) || !string.Equals(release.ReleaseId, name, StringComparison.Ordinal)) return Results.BadRequest(new { error = "route_identity_mismatch" });
+
+                // Only a published release may occupy the immutable public release path.
+                // Static readers reject any other state, and because this path refuses to
+                // replace a release id with different bytes, accepting a draft here would
+                // consume the id and its sequence while leaving behind an object that no
+                // client can ever use.  Drafts stay in the draft workflow.
+                if (release.State != ReleaseState.Published)
+                    return Results.Conflict(new { error = "release_not_published", state = release.State.ToString() });
             }
         }
         catch (Exception ex) { return Results.BadRequest(new { error = "payload_invalid", detail = ex.Message }); }
@@ -1445,8 +1459,8 @@ public sealed class ManagementState
                         if (!axis.TryResolveRetired(oldValue, out var terminal, out _, out var retirementError) || !string.Equals(axis.Retired[oldValue], terminal, StringComparison.Ordinal))
                             return Results.BadRequest(new { error = "retirement_mapping_not_terminal", axis = axis.Name, value = oldValue, detail = retirementError ?? terminal });
                     }
-                if (candidate.State == ReleaseState.Published)
-                    await RebuildReleaseProjectionsAsync(product, name, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
+                // Derived projections for this release are rebuilt only after the immutable
+                // release object is durably placed further down; see the note there.
             }
             if (expectedType == "revocation" && previous is not null)
             {
@@ -1508,6 +1522,27 @@ public sealed class ManagementState
             await UpsertPlacementAsync(expectedType, product, name, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
             if (expectedType == "revocation") await UpsertRevocationAsync(product, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
             await EnsureRepositoryDescriptorAsync(request.HttpContext.RequestAborted).ConfigureAwait(false);
+
+            // Derived projections are rebuilt strictly after the immutable release object and
+            // its control-plane row are committed.  Writing the bundle or index first would
+            // let a later conflict, storage failure or crash leave public projections
+            // referencing a release that does not exist and was never accepted.
+            //
+            // Failing here therefore does not invalidate the placement: the release is real
+            // and the projections are regenerable, so the failure is reported as a partial
+            // result and the reconcile endpoint rebuilds them idempotently.
+            if (expectedType == "release-lock")
+            {
+                try
+                {
+                    await RebuildReleaseProjectionsAsync(product, name, bytes, request.HttpContext.RequestAborted).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    RecordAudit("system", "release.projection", $"{product}/{name}", "deferred");
+                    return Results.Json(new { placed = true, projections = "deferred", detail = ex.Message }, statusCode: StatusCodes.Status202Accepted);
+                }
+            }
             return Results.NoContent();
         }
         finally { _placementGate.Release(); }
@@ -1651,14 +1686,29 @@ public sealed class ManagementState
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task RebuildPackageProjectionAsync(string repository, string package)
+    /// <param name="alsoPublished">
+    /// A version that is about to be committed as published.  Passing it lets the projection
+    /// be written before the publication flag is durable, so a projection failure aborts the
+    /// publish rather than leaving the index behind it.
+    /// </param>
+    private async Task RebuildPackageProjectionAsync(string repository, string package, (string Repository, string Package, string Version)? alsoPublished = null)
     {
         if (_store is null || !PackageId.TryCreate(package, out var packageId)) return;
+
+        // Only published versions belong in the public index.  Selecting every registered
+        // version would advertise drafts that no client is permitted to install.
         var manifestRows = PackageVersions
-            .Where(x => string.Equals(x.Key.Repository, repository, StringComparison.Ordinal) && string.Equals(x.Key.Package, package, StringComparison.Ordinal))
+            .Where(x => string.Equals(x.Key.Repository, repository, StringComparison.Ordinal)
+                     && string.Equals(x.Key.Package, package, StringComparison.Ordinal)
+                     && ((PublishedPackageVersions.TryGetValue(x.Key, out var published) && published)
+                         || (alsoPublished is { } pending && x.Key.Repository == pending.Repository && x.Key.Package == pending.Package && x.Key.Version == pending.Version)))
             .Select(x => (Manifest: RepositoryJson.DeserializeManifest(x.Value), Bytes: x.Value))
             .ToArray();
-        await new StaticProjectionWriter(_store, _layout).WritePackageIndexAsync(packageId, manifestRows.Select(x => x.Manifest), manifestRows.ToDictionary(x => x.Manifest.Id, x => x.Bytes)).ConfigureAwait(false);
+
+        // Keyed by (id, version): every version of a package shares the id, so an id-keyed
+        // map both collides on insert and mislabels bytes once a second version exists.
+        var exactBytes = manifestRows.ToDictionary(x => ManifestKey.For(x.Manifest), x => x.Bytes);
+        await new StaticProjectionWriter(_store, _layout).WritePackageIndexAsync(packageId, manifestRows.Select(x => x.Manifest), exactBytes).ConfigureAwait(false);
     }
 
     private async Task RebuildReleaseProjectionsAsync(string product, string releaseId, byte[] envelopeBytes, CancellationToken cancellationToken)
@@ -1669,7 +1719,7 @@ public sealed class ManagementState
         if (release.State != ReleaseState.Published) return;
         await ValidateReleaseArtifactsAsync(product, releaseId, release, cancellationToken).ConfigureAwait(false);
         var manifests = new List<PackageManifest>();
-        var manifestBytes = new Dictionary<PackageId, byte[]>();
+        var manifestBytes = new Dictionary<ManifestKey, byte[]>();
         foreach (var pin in release.Packages)
         {
             var result = await _store.OpenAsync(_layout.Package(pin.Id, pin.Version), cancellationToken: cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(pin.ManifestPath);
@@ -1678,7 +1728,7 @@ public sealed class ManagementState
                 var bytes = await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false);
                 if (ContentHash.Compute(bytes) != pin.ManifestDigest) throw new CryptographicException($"Manifest '{pin.Id}@{pin.Version}' failed its release pin.");
                 manifests.Add(RepositoryJson.DeserializeManifest(bytes));
-                manifestBytes[pin.Id] = bytes;
+                manifestBytes[ManifestKey.For(pin.Id, pin.Version)] = bytes;
             }
         }
         var writer = new StaticProjectionWriter(_store, _layout);
