@@ -248,6 +248,13 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
     private const int LockRetryInitialDelayMilliseconds = 5;
     private const int LockRetryMaximumDelayMilliseconds = 250;
 
+    /// <summary>
+    /// How long an ERROR_ACCESS_DENIED on the lock file is treated as Windows delete-pending
+    /// rather than a real permission failure. Delete-pending clears in microseconds; a genuine
+    /// permission error raises the same exception and must surface quickly.
+    /// </summary>
+    private const int DeletePendingRetryWindowMilliseconds = 2_000;
+
     private async ValueTask<FileStream> AcquireKeyLockAsync(ObjectKey key, CancellationToken cancellationToken)
     {
         var lockRoot = Path.Combine(_root, ".4sup-locks");
@@ -262,7 +269,8 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         // zero-byte file is deliberately left in place.
         var options = FileOptions.Asynchronous | (OperatingSystem.IsWindows() ? FileOptions.DeleteOnClose : FileOptions.None);
 
-        var deadline = Environment.TickCount64 + LockAcquireTimeoutMilliseconds;
+        var start = Environment.TickCount64;
+        var deadline = start + LockAcquireTimeoutMilliseconds;
         var delay = LockRetryInitialDelayMilliseconds;
         while (true)
         {
@@ -275,6 +283,20 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
                 // indefinite spin that reports nothing useful.
                 if (Environment.TickCount64 >= deadline)
                     throw new TimeoutException($"Timed out after {LockAcquireTimeoutMilliseconds} ms waiting for the object-store lock on '{key}'.", ex);
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                delay = Math.Min(delay * 2, LockRetryMaximumDelayMilliseconds);
+            }
+            catch (UnauthorizedAccessException ex) when (Environment.TickCount64 - start < DeletePendingRetryWindowMilliseconds)
+            {
+                // Windows delete-pending. Closing the previous holder's DeleteOnClose handle
+                // unlinks the file, and an open that lands in that window fails with
+                // ERROR_ACCESS_DENIED — surfaced here as UnauthorizedAccessException rather
+                // than the sharing violation the contention check above expects.
+                //
+                // The state clears almost immediately, so it is retried only briefly. A real
+                // permission problem raises the same exception type and must not be retried
+                // for the full lock timeout, which is why this window is separate and short.
+                _ = ex;
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
                 delay = Math.Min(delay * 2, LockRetryMaximumDelayMilliseconds);
             }
