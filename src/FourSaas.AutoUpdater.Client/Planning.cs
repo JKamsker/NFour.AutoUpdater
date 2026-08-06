@@ -92,7 +92,7 @@ public sealed class InstallPlanner : IInstallPlanner
         FileIdentity? rootIdentity = FileIdentityProvider.TryGet(observed.InstallRoot, out var observedRoot) ? observedRoot : null;
         return new InstallPlan { Operations = operations.ToImmutable(), BlobsToFetch = blobs.Values.ToImmutableArray(), BytesToDownload = stagingBytes, BytesToWrite = writeBytes == 0 ? operations.OfType<FileOperation.Write>().Sum(x => x.Size) : writeBytes, PeakFreeSpaceRequiredByVolume = peak, NetInstallDelta = net, ParentIdentities = parents.ToImmutable(), RootIdentity = rootIdentity };
 
-        void AddBlob(ContentHash content, long size) { if (!blobs.ContainsKey(content)) blobs[content] = new BlobLocator(content); }
+        void AddBlob(ContentHash content, long size) { if (!blobs.ContainsKey(content)) blobs[content] = new BlobLocator(content, size); }
     }
 
 }

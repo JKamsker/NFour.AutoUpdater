@@ -91,6 +91,11 @@ public readonly struct ContentHash : IEquatable<ContentHash>, IComparable<Conten
         };
         if ((int)algorithm < 0)
             throw new FormatException($"Unknown hash algorithm '{value[..separator]}'.");
+        // Blake3 has a name and a digest length here but no implementation behind Compute.
+        // Parsing it would mint a hash that every verification path then refuses to evaluate,
+        // so it is rejected at the boundary instead - fail closed, not halfway.
+        if (algorithm == HashAlgorithmId.Blake3)
+            throw new NotSupportedException("Hash algorithm 'blake3' is declared but not implemented; documents using it cannot be verified.");
         var hex = value[(separator + 1)..];
         if (hex.Length % 2 != 0 || hex.Any(static c => !Uri.IsHexDigit(c)) || hex.Any(char.IsUpper))
             throw new FormatException("A content hash must contain lowercase hexadecimal bytes.");
@@ -98,14 +103,21 @@ public readonly struct ContentHash : IEquatable<ContentHash>, IComparable<Conten
         return new ContentHash(algorithm, bytes);
     }
 
+    /// <summary>
+    /// Non-throwing parse. Null, empty and whitespace all return false rather than throwing:
+    /// <see cref="Parse"/> raises <see cref="ArgumentException"/> for those, which is not a
+    /// <see cref="FormatException"/>, so they would otherwise escape a "Try" method.
+    /// </summary>
     public static bool TryParse(string? value, out ContentHash hash)
     {
+        hash = default;
+        if (string.IsNullOrWhiteSpace(value)) return false;
         try
         {
-            hash = Parse(value ?? string.Empty);
+            hash = Parse(value);
             return true;
         }
-        catch (FormatException)
+        catch (Exception ex) when (ex is FormatException or ArgumentException or NotSupportedException)
         {
             hash = default;
             return false;
@@ -159,7 +171,12 @@ public readonly struct ContentHash : IEquatable<ContentHash>, IComparable<Conten
     };
 }
 
-public readonly record struct BlobLocator(ContentHash Content)
+/// <param name="Size">
+/// The manifest-declared length of the blob.  The downloader needs this to bound a transfer:
+/// without it, a mirror can stream indefinitely and the mismatch is only discovered once the
+/// stream ends, by which point the disk is already full.
+/// </param>
+public readonly record struct BlobLocator(ContentHash Content, long Size)
 {
     public override string ToString() => Content.ToString();
 }
@@ -192,6 +209,9 @@ public readonly record struct PackageVersion : IComparable<PackageVersion>
     private static readonly System.Text.RegularExpressions.Regex Grammar = new("^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$", System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
     public PackageVersion(string label, long sequence)
     {
+        // Null-checked before Length: a null label would otherwise surface as a
+        // NullReferenceException instead of the argument error callers expect.
+        ArgumentNullException.ThrowIfNull(label);
         if (sequence < 0 || label.Length is 0 or > 64 || !Grammar.IsMatch(label) || label.Contains("..", StringComparison.Ordinal) || label.Contains("--", StringComparison.Ordinal))
             throw new ArgumentException("Invalid package version.", nameof(label));
         Label = label;

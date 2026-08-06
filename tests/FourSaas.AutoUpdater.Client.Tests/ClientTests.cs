@@ -72,7 +72,7 @@ public sealed class ClientTests
             await bad.PutAsync(key, new MemoryStream("poisoned"u8.ToArray()));
             await good.PutAsync(key, new MemoryStream(expectedBytes));
             var staging = Path.Combine(root, "staging");
-            var length = await new BlobFetcher().FetchFromMirrorsAsync([bad, good], key, expected, staging);
+            var length = await new BlobFetcher().FetchFromMirrorsAsync([bad, good], key, expected, expectedBytes.Length, staging);
             Assert.Equal(expectedBytes.Length, length);
             Assert.Equal(expectedBytes, await File.ReadAllBytesAsync(staging));
         }
@@ -93,10 +93,10 @@ public sealed class ClientTests
             await inner.PutAsync(key, new MemoryStream(bytes, writable: false), bytes.Length);
             await using var faulty = new FaultyObjectStore(inner) { FailAfterBytes = 17 };
             var staging = Path.Combine(root, "blob");
-            await Assert.ThrowsAsync<IOException>(() => new BlobFetcher().FetchAsync(faulty, key, hash, staging).AsTask());
+            await Assert.ThrowsAsync<IOException>(() => new BlobFetcher().FetchAsync(faulty, key, hash, bytes.Length, staging).AsTask());
             Assert.InRange(new FileInfo(staging).Length, 17, 85);
             faulty.FailAfterBytes = null;
-            Assert.Equal(bytes.Length, await new BlobFetcher().FetchAsync(faulty, key, hash, staging));
+            Assert.Equal(bytes.Length, await new BlobFetcher().FetchAsync(faulty, key, hash, bytes.Length, staging));
             Assert.Equal(bytes, await File.ReadAllBytesAsync(staging));
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }

@@ -28,12 +28,18 @@ public sealed class NullApplyProgressSink : IApplyProgressSink { public ValueTas
 
 public sealed class BlobFetcher
 {
-    public async ValueTask<long> FetchAsync(IReadableObjectStore store, ObjectKey key, ContentHash expected, string stagingPath, CancellationToken cancellationToken = default)
+    /// <param name="expectedLength">
+    /// The manifest-declared length of the blob.  The transfer is bounded by it: a mirror
+    /// that streams past the declared length is treated as an integrity failure at the moment
+    /// it overruns, rather than after it has filled the disk and the final hash disagrees.
+    /// </param>
+    public async ValueTask<long> FetchAsync(IReadableObjectStore store, ObjectKey key, ContentHash expected, long expectedLength, string stagingPath, CancellationToken cancellationToken = default)
     {
+        if (expectedLength < 0) throw new ArgumentOutOfRangeException(nameof(expectedLength));
         Directory.CreateDirectory(Path.GetDirectoryName(stagingPath)!);
         var metadataPath = stagingPath + ".resume.json";
 
-        if (File.Exists(stagingPath))
+        if (File.Exists(stagingPath) && new FileInfo(stagingPath).Length == expectedLength)
         {
             try
             {
@@ -48,6 +54,14 @@ public sealed class BlobFetcher
         }
 
         var offset = File.Exists(stagingPath) ? new FileInfo(stagingPath).Length : 0;
+
+        // A staged prefix longer than the whole blob cannot be a prefix of it.
+        if (offset > expectedLength)
+        {
+            DeleteIfPresent(stagingPath);
+            DeleteIfPresent(metadataPath);
+            offset = 0;
+        }
         var validator = offset == 0 ? null : ReadValidator(metadataPath, expected);
         if (offset > 0 && validator is not { IsStrong: true })
         {
@@ -102,9 +116,11 @@ public sealed class BlobFetcher
                 }
                 await using (var target = new FileStream(stagingPath, offset == 0 ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
                 await using (var hashedResponse = new HashingWriteStream(target, hash))
-                    await response.Content.CopyToAsync(hashedResponse, cancellationToken).ConfigureAwait(false);
+                    await CopyBoundedAsync(response.Content, hashedResponse, expectedLength - offset, key, cancellationToken).ConfigureAwait(false);
 
                 offset = new FileInfo(stagingPath).Length;
+                if (offset != expectedLength)
+                    throw new InvalidDataException($"Blob '{key}' is {offset} bytes but the manifest declares {expectedLength}.");
                 var actual = new ContentHash(expected.Algorithm, hash.GetHashAndReset());
                 if (actual != expected)
                     throw new InvalidDataException($"Blob '{key}' failed content verification.");
@@ -131,7 +147,30 @@ public sealed class BlobFetcher
         throw new IOException($"The storage backend changed or refused the validator for '{key}' while resuming.", lastFailure);
     }
 
-    public async ValueTask<long> FetchFromMirrorsAsync(IReadOnlyList<IReadableObjectStore> mirrors, ObjectKey key, ContentHash expected, string stagingPath, CancellationToken cancellationToken = default, Action<IReadableObjectStore>? demoteMirror = null)
+    /// <summary>
+    /// Copies at most <paramref name="remaining"/> bytes, failing as soon as the source tries
+    /// to send more.  Reading to EOF would let a hostile or broken mirror write unbounded data
+    /// into staging before the length or digest check ever runs.
+    /// </summary>
+    private static async ValueTask CopyBoundedAsync(Stream source, Stream destination, long remaining, ObjectKey key, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[128 * 1024];
+        while (true)
+        {
+            // One byte beyond the budget is requested deliberately: it distinguishes "exactly
+            // the declared length" from "more is coming".
+            var wanted = (int)Math.Min(buffer.Length, remaining + 1);
+            if (wanted <= 0) break;
+            var read = await source.ReadAsync(buffer.AsMemory(0, wanted), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            if (read > remaining)
+                throw new InvalidDataException($"Blob '{key}' streamed more than its manifest-declared length; the mirror is serving invalid content.");
+            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+            remaining -= read;
+        }
+    }
+
+    public async ValueTask<long> FetchFromMirrorsAsync(IReadOnlyList<IReadableObjectStore> mirrors, ObjectKey key, ContentHash expected, long expectedLength, string stagingPath, CancellationToken cancellationToken = default, Action<IReadableObjectStore>? demoteMirror = null)
     {
         if (mirrors.Count == 0) throw new ArgumentException("At least one mirror is required.", nameof(mirrors));
         Exception? last = null;
@@ -139,7 +178,7 @@ public sealed class BlobFetcher
         foreach (var mirror in mirrors)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { return await FetchAsync(mirror, key, expected, stagingPath, cancellationToken).ConfigureAwait(false); }
+            try { return await FetchAsync(mirror, key, expected, expectedLength, stagingPath, cancellationToken).ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex) when (ex is IOException or InvalidDataException or CryptographicException)
             {
@@ -294,8 +333,8 @@ public sealed class InstallApplier
                 var activeMirrors = mirrors is { Count: > 0 } ? mirrors.Where(x => !demotedMirrors.ContainsKey(x)).ToArray() : [];
                 if (mirrors is { Count: > 0 } && activeMirrors.Length == 0) throw new InvalidDataException($"All mirrors were demoted after serving invalid content for '{key}'.");
                 fetchedLength = activeMirrors.Length > 0
-                    ? await _fetcher.FetchFromMirrorsAsync(activeMirrors, key, blob.Content, path, token, mirror => demotedMirrors.TryAdd(mirror, 0)).ConfigureAwait(false)
-                    : await _fetcher.FetchAsync(source, key, blob.Content, path, token).ConfigureAwait(false);
+                    ? await _fetcher.FetchFromMirrorsAsync(activeMirrors, key, blob.Content, blob.Size, path, token, mirror => demotedMirrors.TryAdd(mirror, 0)).ConfigureAwait(false)
+                    : await _fetcher.FetchAsync(source, key, blob.Content, blob.Size, path, token).ConfigureAwait(false);
                 if (cache is not null)
                 {
                     await using var cachedContent = File.OpenRead(path);
@@ -452,16 +491,21 @@ public sealed class InstallApplier
 
     private static void ValidateRecoveryMarker(RecoveryPlanMarker actual, RecoveryPlanMarker expected)
     {
-        if (actual.SchemaVersion != expected.SchemaVersion || !string.Equals(actual.FileSetId, expected.FileSetId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseDigest, expected.ReleaseDigest, StringComparison.Ordinal) || !string.Equals(actual.ProductId, expected.ProductId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseId, expected.ReleaseId, StringComparison.Ordinal) || !actual.Blobs.SequenceEqual(expected.Blobs, StringComparer.Ordinal) || actual.BytesToDownload != expected.BytesToDownload || actual.BytesToWrite != expected.BytesToWrite || actual.NetInstallDelta != expected.NetInstallDelta || !actual.Operations.SequenceEqual(expected.Operations) || !actual.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal).SequenceEqual(expected.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal) ) || !string.Equals(actual.RootIdentity, expected.RootIdentity, StringComparison.Ordinal))
+        if (actual.SchemaVersion != expected.SchemaVersion || !string.Equals(actual.FileSetId, expected.FileSetId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseDigest, expected.ReleaseDigest, StringComparison.Ordinal) || !string.Equals(actual.ProductId, expected.ProductId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseId, expected.ReleaseId, StringComparison.Ordinal) || !actual.Blobs.SequenceEqual(expected.Blobs) || actual.BytesToDownload != expected.BytesToDownload || actual.BytesToWrite != expected.BytesToWrite || actual.NetInstallDelta != expected.NetInstallDelta || !actual.Operations.SequenceEqual(expected.Operations) || !actual.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal).SequenceEqual(expected.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal) ) || !string.Equals(actual.RootIdentity, expected.RootIdentity, StringComparison.Ordinal))
             throw new ApplyPreconditionException("An unfinished apply belongs to a different release, file set, or operation plan; recover it before starting another operation.");
     }
 
-    private sealed record RecoveryPlanMarker(int SchemaVersion, string FileSetId, string ReleaseDigest, string ProductId, string ReleaseId, string[] Blobs, RecoveryOperation[] Operations, long BytesToDownload, long BytesToWrite, long NetInstallDelta, DateTimeOffset CreatedAt)
+    private sealed record RecoveryBlob(string Content, long Size);
+
+    private sealed record RecoveryPlanMarker(int SchemaVersion, string FileSetId, string ReleaseDigest, string ProductId, string ReleaseId, RecoveryBlob[] Blobs, RecoveryOperation[] Operations, long BytesToDownload, long BytesToWrite, long NetInstallDelta, DateTimeOffset CreatedAt)
     {
         public Dictionary<string, string> ParentIdentities { get; init; } = new(StringComparer.Ordinal);
         public string? RootIdentity { get; init; }
 
-        public static RecoveryPlanMarker Create(ComposedFileSet target, InstallLock installLock, InstallPlan plan) => new(1, target.FileSetId.ToString(), installLock.ReleaseDigest.ToString(), installLock.ProductId, installLock.ReleaseId, plan.BlobsToFetch.Select(x => x.Content.ToString()).OrderBy(x => x, StringComparer.Ordinal).ToArray(), plan.Operations.Select(RecoveryOperation.From).ToArray(), plan.BytesToDownload, plan.BytesToWrite, plan.NetInstallDelta, DateTimeOffset.UtcNow)
+        // Schema 2 records each blob's declared size alongside its digest. A recovered plan
+        // must be able to bound its downloads exactly as the original plan did; a marker that
+        // stored only digests would silently drop that bound on resume.
+        public static RecoveryPlanMarker Create(ComposedFileSet target, InstallLock installLock, InstallPlan plan) => new(2, target.FileSetId.ToString(), installLock.ReleaseDigest.ToString(), installLock.ProductId, installLock.ReleaseId, plan.BlobsToFetch.Select(x => new RecoveryBlob(x.Content.ToString(), x.Size)).OrderBy(x => x.Content, StringComparer.Ordinal).ToArray(), plan.Operations.Select(RecoveryOperation.From).ToArray(), plan.BytesToDownload, plan.BytesToWrite, plan.NetInstallDelta, DateTimeOffset.UtcNow)
         {
             ParentIdentities = plan.ParentIdentities.ToDictionary(x => x.Key.Value, x => x.Value.Value, StringComparer.Ordinal),
             RootIdentity = plan.RootIdentity?.Value
@@ -470,7 +514,7 @@ public sealed class InstallApplier
         public InstallPlan ToInstallPlan() => new()
         {
             Operations = Operations.Select(x => x.ToOperation()).ToImmutableArray(),
-            BlobsToFetch = Blobs.Select(x => new BlobLocator(ContentHash.Parse(x))).ToImmutableArray(),
+            BlobsToFetch = Blobs.Select(x => new BlobLocator(ContentHash.Parse(x.Content), x.Size)).ToImmutableArray(),
             BytesToDownload = BytesToDownload,
             BytesToWrite = BytesToWrite,
             PeakFreeSpaceRequiredByVolume = ImmutableDictionary<string, long>.Empty,
