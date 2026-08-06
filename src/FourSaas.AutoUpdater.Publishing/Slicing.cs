@@ -33,11 +33,14 @@ public sealed class SliceEngine
         var filesByPackage = rules.Packages.ToDictionary(x => x.Id, _ => ImmutableArray.CreateBuilder<SlicedFile>());
         var source = Path.GetFullPath(rules.Source);
         if (!Directory.Exists(source)) return new([], [new("PKG014", DiagnosticSeverity.Error, $"Source directory '{source}' does not exist.")]);
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories).OrderBy(static x => x, StringComparer.Ordinal))
+        // The walk must not descend through links.  Enumerating recursively and checking only
+        // the leaf lets an ordinary file reached via a symlinked parent pass the check, so a
+        // link in the source tree could pull secrets or unrelated files into a package.
+        foreach (var (file, isLink) in LinkSafeDirectoryWalk.EnumerateFileEntries(source).OrderBy(static x => x.Path, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var relative = Path.GetRelativePath(source, file).Replace(Path.DirectorySeparatorChar, '/');
-            if (File.GetAttributes(file).HasFlag(FileAttributes.ReparsePoint))
+            if (isLink)
             {
                 diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, $"Symlink or reparse-point source '{relative}' is not publishable.", relative));
                 continue;
@@ -59,13 +62,13 @@ public sealed class SliceEngine
         }
         // Empty directories are explicit package entries. Non-empty directories are
         // materialised by their file entries and do not need redundant rows.
-        foreach (var directory in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories)
-                     .Where(x => !Directory.EnumerateFileSystemEntries(x).Any())
-                     .OrderBy(static x => x, StringComparer.Ordinal))
+        foreach (var (directory, isLinkedDirectory) in LinkSafeDirectoryWalk.EnumerateDirectoryEntries(source)
+                     .Where(x => x.IsLink || !Directory.EnumerateFileSystemEntries(x.Path).Any())
+                     .OrderBy(static x => x.Path, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var relative = Path.GetRelativePath(source, directory).Replace(Path.DirectorySeparatorChar, '/');
-            if (new DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint))
+            if (isLinkedDirectory)
             {
                 diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, $"Symlink or reparse-point source directory '{relative}' is not publishable.", relative));
                 continue;
