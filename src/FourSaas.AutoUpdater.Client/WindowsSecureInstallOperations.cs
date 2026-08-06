@@ -28,6 +28,9 @@ internal static class WindowsSecureInstallOperations
     private const uint Win32BackupSemantics = 0x02000000;
     private const uint FileAttributeDirectory = 0x00000010;
     private const uint FileAttributeReparsePoint = 0x00000400;
+    private const uint FileTraverse = 0x00000020;
+    /// Rights needed to walk an ancestor directory and inspect its attributes, and nothing more.
+    private const uint DirectoryTraverseAccess = GenericRead | FileTraverse | Synchronize;
     private const uint ObjCaseInsensitive = 0x00000040;
     private const uint ObjDontReparse = 0x00001000;
     private const int FileRenameInformation = 10;
@@ -67,7 +70,10 @@ internal static class WindowsSecureInstallOperations
         var renamed = false;
         try
         {
-            using (var output = new FileStream(temporary, FileAccess.Write, 128 * 1024, isAsync: false))
+            // FileStream takes ownership of whatever handle it is given, so it gets a
+            // duplicate.  `temporary` must stay open past the copy: the rename below is
+            // issued against that handle, and the finally block deletes through it.
+            using (var output = new FileStream(DuplicateHandle(temporary), FileAccess.Write, 128 * 1024, isAsync: false))
             using (var input = File.OpenRead(stagedPath))
             {
                 input.CopyTo(output);
@@ -160,7 +166,11 @@ internal static class WindowsSecureInstallOperations
     {
         var absolute = Path.GetFullPath(path);
         var volume = Path.GetPathRoot(absolute) ?? throw new IOException($"Unable to determine the volume for '{path}'.");
-        using var volumeHandle = OpenAbsolute(volume, GenericRead | GenericWrite | Synchronize, 0);
+        // Ancestors of the install root are only traversed and checked for reparse points;
+        // nothing is ever written to them. Requesting write access here would demand rights a
+        // standard user does not hold on the volume root or on directories like C:\Users, so
+        // an unelevated install under any system-owned ancestor would fail outright.
+        using var volumeHandle = OpenAbsolute(volume, DirectoryTraverseAccess, 0);
         var relative = Path.GetRelativePath(volume, absolute);
         var components = relative == "." ? [] : relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
         return OpenDirectoryFromHandle(volumeHandle, components);
@@ -174,7 +184,7 @@ internal static class WindowsSecureInstallOperations
             foreach (var component in components)
             {
                 if (component is "" or "." or ".." || component.IndexOfAny(['/', '\\']) >= 0) throw new IOException("Invalid install root component.");
-                var next = OpenRelative(current, component, GenericRead | GenericWrite | Synchronize, FileDirectoryFile, FileOpen)
+                var next = OpenRelative(current, component, DirectoryTraverseAccess, FileDirectoryFile, FileOpen)
                     ?? throw new IOException($"Install-root component '{component}' does not exist.");
                 EnsureDirectory(next, component);
                 current.Dispose();
