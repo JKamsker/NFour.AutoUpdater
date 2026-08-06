@@ -128,15 +128,60 @@ if (string.IsNullOrWhiteSpace(oidcAuthority) && string.Equals(Environment.GetEnv
 }
 
 var app = builder.Build();
+// Telemetry rate limiting.
+//
+// The partition map is bounded and self-evicting. An unbounded dictionary keyed by remote
+// address is itself a memory-exhaustion vector: the endpoint is anonymous, so anyone able to
+// vary a source address can add entries that are never removed. Stale windows are swept as
+// they are encountered, and a hard partition cap plus a global request ceiling bound the
+// worst case even when every request presents a fresh address.
 var telemetryWindows = new ConcurrentDictionary<string, (DateTimeOffset Window, int Count)>(StringComparer.Ordinal);
+var telemetryGlobalWindow = (Window: DateTimeOffset.UtcNow, Count: 0);
+var telemetryGlobalLock = new object();
+var telemetrySweep = DateTimeOffset.UtcNow;
+const int TelemetryPerPartitionPerMinute = 30;
+const int TelemetryGlobalPerMinute = 5000;
+const int TelemetryMaximumPartitions = 50_000;
+
 app.Use(async (context, next) =>
 {
     if (context.Request.Method == "POST" && context.Request.Path.StartsWithSegments("/api/v1/telemetry"))
     {
-        var key = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         var now = DateTimeOffset.UtcNow;
-        var current = telemetryWindows.AddOrUpdate(key, (now, 1), (_, previous) => now - previous.Window >= TimeSpan.FromMinutes(1) ? (now, 1) : (previous.Window, previous.Count + 1));
-        if (current.Count > 30)
+        var window = TimeSpan.FromMinutes(1);
+
+        // A global ceiling still applies when partitioning is defeated, whether by address
+        // spoofing or simply by many genuine clients behind one proxy.
+        lock (telemetryGlobalLock)
+        {
+            telemetryGlobalWindow = now - telemetryGlobalWindow.Window >= window ? (now, 1) : (telemetryGlobalWindow.Window, telemetryGlobalWindow.Count + 1);
+            if (telemetryGlobalWindow.Count > TelemetryGlobalPerMinute)
+            {
+                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                return;
+            }
+        }
+
+        if (now - telemetrySweep >= window)
+        {
+            telemetrySweep = now;
+            foreach (var (staleKey, value) in telemetryWindows)
+                if (now - value.Window >= window) telemetryWindows.TryRemove(staleKey, out _);
+        }
+
+        // ASP.NET Core resolves RemoteIpAddress from forwarded headers only when
+        // ForwardedHeaders middleware is configured with known proxies. Behind an
+        // unconfigured proxy every client shares one address and shares one partition, which
+        // is why the global ceiling above is not optional.
+        var key = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        if (!telemetryWindows.ContainsKey(key) && telemetryWindows.Count >= TelemetryMaximumPartitions)
+        {
+            context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            return;
+        }
+
+        var current = telemetryWindows.AddOrUpdate(key, (now, 1), (_, previous) => now - previous.Window >= window ? (now, 1) : (previous.Window, previous.Count + 1));
+        if (current.Count > TelemetryPerPartitionPerMinute)
         {
             context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
             return;
