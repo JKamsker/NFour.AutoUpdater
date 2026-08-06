@@ -445,9 +445,37 @@ public sealed class ManagementState
                 return Results.BadRequest(new { error = "invalid_grant_request" });
             requested.Add((hash, length));
         }
-        if (session.ObjectCount + requested.Count > session.MaxObjects || session.TotalBytes + requested.Sum(x => x.Length) > session.MaxTotalBytes) return Results.BadRequest(new { error = "session_quota_exceeded" });
+        // A publisher controls both the item count and every declared length, so the quota
+        // check must not be expressible as an addition. Sum(long) throws on overflow and the
+        // subsequent addition wraps silently, which turns a hostile request into either a 500
+        // or a quota bypass. Bounds are therefore checked by subtraction against the
+        // remaining budget, which cannot overflow.
+        if (requested.Count > session.MaxObjects - session.ObjectCount)
+            return Results.BadRequest(new { error = "session_quota_exceeded", limit = "maxObjects" });
+
+        var remainingBytes = session.MaxTotalBytes - session.TotalBytes;
+        foreach (var item in requested)
+        {
+            if (item.Length > remainingBytes)
+                return Results.BadRequest(new { error = "session_quota_exceeded", limit = "maxTotalBytes" });
+            remainingBytes -= item.Length;
+        }
+
+        // Two grants for the same digest in one request would share a staging key and race
+        // each other's uploads.
+        if (requested.Select(x => x.Hash).Distinct().Count() != requested.Count)
+            return Results.BadRequest(new { error = "duplicate_grant_request" });
+
         var expires = DateTimeOffset.UtcNow.AddMinutes(15);
         var response = new List<object>(requested.Count);
+
+        // Grants and any multipart uploads created during this request are tracked so a
+        // failure part-way through can be undone. Returning early without this left orphaned
+        // multipart uploads billing storage and grant rows for objects nobody would upload.
+        var createdGrantIds = new List<string>(requested.Count);
+        var createdMultipartUploads = new List<MultipartUpload>();
+        try
+        {
         foreach (var item in requested)
         {
             var grantId = Guid.NewGuid().ToString("N");
@@ -470,6 +498,8 @@ public sealed class ManagementState
                 : null;
             if (multipart is null && uploadUri is null && localPath is null && !string.Equals(_stagingStore?.GetType().Name, "MemoryObjectStore", StringComparison.Ordinal))
                 return Results.BadRequest(new { error = "upload_grant_unavailable", detail = "The configured staging backend exposes neither a presigned upload, multipart grant, nor a local path handoff." });
+            if (multipart is not null) createdMultipartUploads.Add(multipart.Upload);
+            createdGrantIds.Add(grantId);
             Grants[grantId] = new GrantState(grantId, sessionId, session.Repository, stagingKey, item.Hash, item.Length, expires, false,
                 GrantIssued, null, null, null, multipart?.Upload.UploadId, multipart?.Upload.PartSize, false, false, null);
             response.Add(new
@@ -496,12 +526,27 @@ public sealed class ManagementState
                 partsPath = multipart is null ? null : MultipartGrantPath(session.Repository, sessionId, grantId, "parts")
             });
         }
-        PublishSessions[sessionId] = session with { ObjectCount = session.ObjectCount + requested.Count, TotalBytes = session.TotalBytes + requested.Sum(x => x.Length) };
+        PublishSessions[sessionId] = session with
+        {
+            ObjectCount = session.ObjectCount + requested.Count,
+            TotalBytes = checked(session.TotalBytes + requested.Sum(x => x.Length))
+        };
         RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "publish.grants.mint", $"{session.Repository}/{sessionId}", "accepted");
         Persist();
         await UpsertSessionAsync(PublishSessions[sessionId], request.HttpContext.RequestAborted).ConfigureAwait(false);
-        foreach (var grant in Grants.Values.Where(x => x.SessionId == sessionId)) await UpsertGrantAsync(grant, request.HttpContext.RequestAborted).ConfigureAwait(false);
+
+        // Only the grants this request minted are written. Re-upserting every grant in the
+        // session made each call cost O(grants in session), so a session that mints grants
+        // incrementally paid quadratically for the privilege.
+        foreach (var grantId in createdGrantIds)
+            if (Grants.TryGetValue(grantId, out var created)) await UpsertGrantAsync(created, request.HttpContext.RequestAborted).ConfigureAwait(false);
         return Results.Ok(new { items = response });
+        }
+        catch
+        {
+            await RollbackPartialGrantsAsync(createdGrantIds, createdMultipartUploads).ConfigureAwait(false);
+            throw;
+        }
         }
         finally { _placementGate.Release(); }
     }
@@ -1644,6 +1689,25 @@ public sealed class ManagementState
                 }
         }
         catch (Exception ex) { throw new InvalidDataException($"Management state persistence is corrupt: {ex.Message}", ex); }
+    }
+
+    /// <summary>
+    /// Undoes grants and multipart uploads created by a request that then failed.
+    ///
+    /// A brokered multipart upload is server-side state that storage bills for until it is
+    /// completed or aborted, and a grant row for an object no client will now upload is
+    /// permanent clutter. Best-effort: a failure to abort is swallowed because the original
+    /// exception is the one worth reporting, and staging GC aborts stragglers later.
+    /// </summary>
+    private async ValueTask RollbackPartialGrantsAsync(IReadOnlyList<string> grantIds, IReadOnlyList<MultipartUpload> multipartUploads)
+    {
+        foreach (var grantId in grantIds) Grants.TryRemove(grantId, out _);
+        if (_stagingStore is IMultipartGrantStore multipartStore)
+            foreach (var upload in multipartUploads)
+            {
+                try { await multipartStore.AbortBrokeredMultipartUploadAsync(upload, CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception) { }
+            }
     }
 
     private static string Scoped(string repository, ContentHash hash) => repository + "\0" + hash;
