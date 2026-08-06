@@ -150,11 +150,27 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
             // verify-before-upload behavior without making the publisher's RAM
             // usage proportional to the object size.
             var temporaryPath = Path.Combine(Path.GetTempPath(), "4sup-s3-cas-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+            // The spool was described as bounded but had no bound: CopyToAsync ran to EOF, so
+            // a stream that never ends filled the disk. The declared length is the bound when
+            // the caller supplies one; otherwise the single-PUT limit applies, since anything
+            // larger cannot be written by this path anyway.
+            var spoolLimit = length ?? 5L * 1024 * 1024 * 1024;
             try
             {
                 await using (var buffered = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
                 {
-                    await content.CopyToAsync(buffered, cancellationToken).ConfigureAwait(false);
+                    var buffer = new byte[1024 * 1024];
+                    var remaining = spoolLimit;
+                    while (true)
+                    {
+                        var wanted = (int)Math.Min(buffer.Length, remaining + 1);
+                        if (wanted <= 0) break;
+                        var read = await content.ReadAsync(buffer.AsMemory(0, wanted), cancellationToken).ConfigureAwait(false);
+                        if (read == 0) break;
+                        if (read > remaining) throw new InvalidDataException($"Content for '{key}' exceeds the declared length of {spoolLimit} bytes.");
+                        await buffered.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                        remaining -= read;
+                    }
                     await buffered.FlushAsync(cancellationToken).ConfigureAwait(false);
                 }
                 await using var replay = new FileStream(temporaryPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
@@ -211,38 +227,57 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
     public async ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default) => await _client.DeleteObjectAsync(new DeleteObjectRequest { BucketName = _bucket, Key = FullKey(key) }, cancellationToken).ConfigureAwait(false);
     public async ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
-        var gate = _copyLocks.GetOrAdd(FullKey(destination), static _ => new SemaphoreSlim(1, 1));
+        var destinationKey = FullKey(destination);
+        var gate = _copyLocks.GetOrAdd(destinationKey, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
             var sourceHead = await HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
+            var sourceETag = sourceHead.Validator?.Value;
             const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
             if (sourceHead.Length <= copyObjectLimit)
             {
-                var copy = new CopyObjectRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = FullKey(destination), MetadataDirective = S3MetadataDirective.REPLACE };
+                var copy = new CopyObjectRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = destinationKey, MetadataDirective = S3MetadataDirective.REPLACE };
                 copy.Headers["Cache-Control"] = CacheControlFor(destination);
                 copy.Headers["Content-Encoding"] = string.Empty;
+                // Pin the exact source generation. Without it the object copied may not be the
+                // one whose length and digest were just inspected.
+                if (sourceETag is not null) copy.ETagToMatch = sourceETag;
+                // The HEAD above is advisory only; a concurrent writer can create the
+                // destination between that check and this copy. Where the provider supports
+                // conditional writes, make the copy itself refuse to overwrite.
+                if (!overwrite && SupportsConditionalWrites) copy.Headers["If-None-Match"] = "*";
                 await _client.CopyObjectAsync(copy, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
-            var upload = await FindIncompleteMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false)
-                ?? await StartMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false);
-            var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
-                .ToDictionary(part => part.Number);
-            var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
-            var partNumber = 1;
-            for (long first = 0; first < sourceHead.Length; first += partSize)
+            var binding = CopySourceBinding(_bucket, FullKey(source), sourceHead);
+            var upload = await ResumeOrStartBoundCopyAsync(destination, binding, cancellationToken).ConfigureAwait(false);
+            try
             {
-                var last = Math.Min(sourceHead.Length - 1, first + partSize - 1);
-                if (!partsByNumber.ContainsKey(partNumber))
-                    partsByNumber[partNumber] = await CopyPartAsync(upload, source, partNumber, first, last, cancellationToken).ConfigureAwait(false);
-                partNumber++;
+                var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
+                    .ToDictionary(part => part.Number);
+                var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
+                var partNumber = 1;
+                for (long first = 0; first < sourceHead.Length; first += partSize)
+                {
+                    var last = Math.Min(sourceHead.Length - 1, first + partSize - 1);
+                    if (!partsByNumber.ContainsKey(partNumber))
+                        partsByNumber[partNumber] = await CopyPartAsync(upload, source, partNumber, first, last, cancellationToken, sourceETag).ConfigureAwait(false);
+                    partNumber++;
+                }
+                await CompleteMultipartUploadAsync(upload, partsByNumber.Values.OrderBy(part => part.Number).ToArray(), cancellationToken).ConfigureAwait(false);
             }
-            await CompleteMultipartUploadAsync(upload, partsByNumber.Values.OrderBy(part => part.Number).ToArray(), cancellationToken).ConfigureAwait(false);
+            catch
+            {
+                // An abandoned multipart upload is billed until it is aborted, and leaving it
+                // behind also leaves parts a later resume might wrongly adopt.
+                try { await AbortMultipartUploadAsync(upload, CancellationToken.None).ConfigureAwait(false); } catch (Exception) { }
+                throw;
+            }
         }
-        finally { gate.Release(); }
+        finally { ReleaseCopyGate(destinationKey, gate); }
     }
     public async ValueTask<bool> TryCopyFromAsync(IReadableObjectStore sourceStore, ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
@@ -251,12 +286,14 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
         // share an account/region or even implement the same copy API; the caller can
         // fall back to a verified byte transfer when this identity is unknown.
         if (!ReferenceEquals(_client, remote._client) && (_providerIdentity is null || !string.Equals(_providerIdentity, remote._providerIdentity, StringComparison.Ordinal))) return false;
-        var gate = _copyLocks.GetOrAdd(FullKey(destination), static _ => new SemaphoreSlim(1, 1));
+        var destinationKey = FullKey(destination);
+        var gate = _copyLocks.GetOrAdd(destinationKey, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
             var sourceHead = await remote.HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
+            var sourceETag = sourceHead.Validator?.Value;
             const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
             if (sourceHead.Length <= copyObjectLimit)
             {
@@ -270,41 +307,113 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
                 };
                 copy.Headers["Cache-Control"] = CacheControlFor(destination);
                 copy.Headers["Content-Encoding"] = string.Empty;
+                if (sourceETag is not null) copy.ETagToMatch = sourceETag;
+                if (!overwrite && SupportsConditionalWrites) copy.Headers["If-None-Match"] = "*";
                 await _client.CopyObjectAsync(copy, cancellationToken).ConfigureAwait(false);
                 return true;
             }
 
-            var upload = await FindIncompleteMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false)
-                ?? await StartMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false);
-            var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
-                .ToDictionary(part => part.Number);
-            var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
-            var partNumber = 1;
-            for (long first = 0; first < sourceHead.Length; first += partSize)
+            var binding = CopySourceBinding(remote._bucket, remote.FullKey(source), sourceHead);
+            var upload = await ResumeOrStartBoundCopyAsync(destination, binding, cancellationToken).ConfigureAwait(false);
+            try
             {
-                var last = Math.Min(sourceHead.Length - 1, first + partSize - 1);
-                if (!partsByNumber.ContainsKey(partNumber))
+                var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
+                    .ToDictionary(part => part.Number);
+                var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
+                var partNumber = 1;
+                for (long first = 0; first < sourceHead.Length; first += partSize)
                 {
-                    var response = await _client.CopyPartAsync(new CopyPartRequest
+                    var last = Math.Min(sourceHead.Length - 1, first + partSize - 1);
+                    if (!partsByNumber.ContainsKey(partNumber))
                     {
-                        SourceBucket = remote._bucket,
-                        SourceKey = remote.FullKey(source),
-                        DestinationBucket = _bucket,
-                        DestinationKey = FullKey(upload.Key),
-                        UploadId = upload.UploadId,
-                        PartNumber = partNumber,
-                        FirstByte = first,
-                        LastByte = last
-                    }, cancellationToken).ConfigureAwait(false);
-                    partsByNumber[partNumber] = new MultipartPart(partNumber, response.ETag, last - first + 1);
+                        var request = new CopyPartRequest
+                        {
+                            SourceBucket = remote._bucket,
+                            SourceKey = remote.FullKey(source),
+                            DestinationBucket = _bucket,
+                            DestinationKey = FullKey(upload.Key),
+                            UploadId = upload.UploadId,
+                            PartNumber = partNumber,
+                            FirstByte = first,
+                            LastByte = last
+                        };
+                        // Every part is pinned to the same source generation, so a source
+                        // mutated part-way through the copy fails the transfer instead of
+                        // producing a destination spliced from two generations.
+                        if (sourceETag is not null) request.ETagToMatch = [sourceETag];
+                        var response = await _client.CopyPartAsync(request, cancellationToken).ConfigureAwait(false);
+                        partsByNumber[partNumber] = new MultipartPart(partNumber, response.ETag, last - first + 1);
+                    }
+                    partNumber++;
                 }
-                partNumber++;
+                await CompleteMultipartUploadAsync(upload, partsByNumber.Values.OrderBy(part => part.Number).ToArray(), cancellationToken).ConfigureAwait(false);
+                return true;
             }
-            await CompleteMultipartUploadAsync(upload, partsByNumber.Values.OrderBy(part => part.Number).ToArray(), cancellationToken).ConfigureAwait(false);
-            return true;
+            catch
+            {
+                try { await AbortMultipartUploadAsync(upload, CancellationToken.None).ConfigureAwait(false); } catch (Exception) { }
+                throw;
+            }
         }
-        finally { gate.Release(); }
+        finally { ReleaseCopyGate(destinationKey, gate); }
     }
+    /// <summary>
+    /// Metadata key recording which exact source generation a copy multipart upload was
+    /// started for.
+    /// </summary>
+    private const string CopySourceBindingMetadata = "x-amz-meta-4sup-copy-source";
+
+    /// <summary>
+    /// Finds a resumable copy upload for <paramref name="destination"/> that was started for
+    /// this exact source generation, aborting any that was not.
+    ///
+    /// Resuming purely on destination key is unsafe: an upload left over from a copy of a
+    /// different source, a different length or a different part size would have its existing
+    /// parts reused, silently assembling an object from two generations. The binding below
+    /// makes a mismatched upload unusable rather than merely unlikely to be picked.
+    /// </summary>
+    private async ValueTask<MultipartUpload> ResumeOrStartBoundCopyAsync(ObjectKey destination, string binding, CancellationToken cancellationToken)
+    {
+        var existing = await FindIncompleteMultipartUploadAsync(destination, cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+        {
+            string? existingBinding = null;
+            try
+            {
+                var describe = await _client.ListPartsAsync(new ListPartsRequest { BucketName = _bucket, Key = FullKey(destination), UploadId = existing.UploadId }, cancellationToken).ConfigureAwait(false);
+                existingBinding = describe.ResponseMetadata?.Metadata is { } metadata && metadata.TryGetValue(CopySourceBindingMetadata, out var value) ? value : null;
+            }
+            catch (AmazonS3Exception) { }
+
+            if (string.Equals(existingBinding, binding, StringComparison.Ordinal)) return existing;
+
+            // Not ours, or bound to a different generation: abandon it rather than inherit
+            // its parts. Leaving it would also accrue storage charges indefinitely.
+            try { await AbortMultipartUploadAsync(existing, cancellationToken).ConfigureAwait(false); } catch (AmazonS3Exception) { }
+        }
+
+        var partSize = 16L * 1024 * 1024;
+        var request = new InitiateMultipartUploadRequest { BucketName = _bucket, Key = FullKey(destination) };
+        request.Headers["Cache-Control"] = CacheControlFor(destination);
+        request.Headers["Content-Encoding"] = string.Empty;
+        request.Metadata.Add(CopySourceBindingMetadata, binding);
+        var response = await _client.InitiateMultipartUploadAsync(request, cancellationToken).ConfigureAwait(false);
+        return new MultipartUpload(destination, response.UploadId, partSize);
+    }
+
+    /// <summary>Identity of a source generation: its ETag and length.</summary>
+    private static string CopySourceBinding(string bucket, string key, ObjectHead head)
+        => $"{bucket}/{key}|{head.Validator?.Value ?? "?"}|{head.Length}";
+
+    /// <summary>Releases a per-destination copy gate once nothing is waiting on it.</summary>
+    private void ReleaseCopyGate(string destinationKey, SemaphoreSlim gate)
+    {
+        gate.Release();
+        // The map previously grew one entry per destination key for the lifetime of the
+        // process. Removing an uncontended gate keeps it proportional to concurrent copies.
+        if (gate.CurrentCount == 1) _copyLocks.TryRemove(new KeyValuePair<string, SemaphoreSlim>(destinationKey, gate));
+    }
+
     public async ValueTask<MultipartUpload> StartMultipartUploadAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
         var partSize = 16L * 1024 * 1024;
@@ -452,9 +561,18 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
         return new MultipartPart(partNumber, response.ETag, length);
     }
 
-    public async ValueTask<MultipartPart> CopyPartAsync(MultipartUpload upload, ObjectKey source, int partNumber, long firstByte, long lastByte, CancellationToken cancellationToken = default)
+    public ValueTask<MultipartPart> CopyPartAsync(MultipartUpload upload, ObjectKey source, int partNumber, long firstByte, long lastByte, CancellationToken cancellationToken = default)
+        => CopyPartAsync(upload, source, partNumber, firstByte, lastByte, cancellationToken, sourceETagToMatch: null);
+
+    /// <param name="sourceETagToMatch">
+    /// Pins the copy to one source generation. Without it, a source mutated between parts
+    /// yields a destination assembled from more than one generation.
+    /// </param>
+    public async ValueTask<MultipartPart> CopyPartAsync(MultipartUpload upload, ObjectKey source, int partNumber, long firstByte, long lastByte, CancellationToken cancellationToken, string? sourceETagToMatch)
     {
-        var response = await _client.CopyPartAsync(new CopyPartRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = FullKey(upload.Key), UploadId = upload.UploadId, PartNumber = partNumber, FirstByte = firstByte, LastByte = lastByte }, cancellationToken).ConfigureAwait(false);
+        var partRequest = new CopyPartRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = FullKey(upload.Key), UploadId = upload.UploadId, PartNumber = partNumber, FirstByte = firstByte, LastByte = lastByte };
+        if (sourceETagToMatch is not null) partRequest.ETagToMatch = [sourceETagToMatch];
+        var response = await _client.CopyPartAsync(partRequest, cancellationToken).ConfigureAwait(false);
         return new MultipartPart(partNumber, response.ETag, lastByte - firstByte + 1);
     }
 
@@ -480,7 +598,11 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
     private static long MultipartPartSizeFor(long length)
     {
         const long minimum = 16L * 1024 * 1024;
-        const long maximumParts = 10_000;
+        // S3 permits 10,000 parts, but a brokered grant returns a presigned URL per part in a
+        // single response. At the protocol maximum that response reaches several megabytes of
+        // URLs before any payload moves. Fewer, larger parts keep it to a sane size and stay
+        // well inside the 5 GiB per-part limit for any object S3 can hold.
+        const long maximumParts = 1_000;
         var required = (length + maximumParts - 1) / maximumParts;
         var rounded = ((required + minimum - 1) / minimum) * minimum;
         return Math.Max(minimum, rounded);
