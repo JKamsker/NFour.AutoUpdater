@@ -67,7 +67,12 @@ internal static class SecureInstallOperations
         return false;
     }
 
-    public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, bool executable = false, FileIdentity? expectedParent = null, bool preferHardLink = false)
+    /// <param name="mode">
+    /// POSIX permission bits to apply. Resolved by the caller from the manifest-declared mode
+    /// and the install policy, so an arbitrary declared mode is honoured rather than every
+    /// executable silently receiving 0755.
+    /// </param>
+    public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, uint mode = PosixFileMode.DefaultRegular, FileIdentity? expectedParent = null, bool preferHardLink = false)
     {
         if (OperatingSystem.IsWindows()) return WindowsSecureInstallOperations.TryReplaceFile(root, path, stagedPath, expectedParent, preferHardLink);
         if (!Supported) return false;
@@ -77,7 +82,10 @@ internal static class SecureInstallOperations
         VerifyParent(parent, expectedParent, path);
         var name = components[^1];
         var temporaryName = ".4sup-new-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
-        if (preferHardLink && !executable && LinkAt(PosixPlatform.AT_FDCWD, stagedPath, parent, temporaryName, 0) == 0)
+        // A hardlink shares the inode with the shared cache, so its permissions cannot be
+        // adjusted independently. It is only usable when the target mode already matches the
+        // mode the cache objects are stored with.
+        if (preferHardLink && mode == PosixFileMode.DefaultRegular && LinkAt(PosixPlatform.AT_FDCWD, stagedPath, parent, temporaryName, 0) == 0)
         {
             try
             {
@@ -93,8 +101,8 @@ internal static class SecureInstallOperations
             using (var destination = new FileStream(new SafeFileHandle((IntPtr)descriptor, ownsHandle: true), FileAccess.Write, 128 * 1024, isAsync: false))
             {
                 var cloned = OperatingSystem.IsLinux() && TryReflink(descriptor, stagedPath);
-                if (executable && Fchmod(descriptor, Mode0755) != 0)
-                    ThrowLastError($"set executable mode for '{path}'");
+                if (mode != Mode0644 && Fchmod(descriptor, mode) != 0)
+                    ThrowLastError($"set mode {PosixFileMode.Format(mode)} for '{path}'");
                 if (!cloned) awaitCopy(stagedPath, destination);
             }
             if (RenameAt(parent, temporaryName, parent, name) != 0)

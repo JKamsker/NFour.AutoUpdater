@@ -400,13 +400,13 @@ public sealed class InstallApplier
                         // The local CAS is shared and must never be exposed through a
                         // writable hardlink by default. Hardlinks are reserved for
                         // callers that explicitly enforce an immutable install profile.
-                        if (!SecureInstallOperations.TryReplaceFile(installRoot, write.Path, staged, write.Policy == FileInstallPolicy.Executable, expectedParent, preferHardLink: materializationProfile == InstallMaterializationProfile.ImmutableInstall))
+                        if (!SecureInstallOperations.TryReplaceFile(installRoot, write.Path, staged, PosixFileMode.Resolve(write.Mode, write.Policy), expectedParent, preferHardLink: materializationProfile == InstallMaterializationProfile.ImmutableInstall))
                         {
                             var temporary = destination! + ".4sup-new-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
                             try
                             {
                                 File.Copy(staged, temporary, overwrite: false);
-                                if (write.Policy == FileInstallPolicy.Executable && (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())) TryMakeExecutable(temporary);
+                                if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) TryApplyMode(temporary, PosixFileMode.Resolve(write.Mode, write.Policy));
                                 if (File.Exists(destination!))
                                 {
                                     var aside = destination + ".old-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
@@ -423,7 +423,7 @@ public sealed class InstallApplier
                             finally { if (File.Exists(temporary)) File.Delete(temporary); }
                         }
                     }
-                    nextFiles[write.Path] = new InstalledFile(write.Path, write.Content, write.Size, write.Owner, write.Policy, write.Size, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                    nextFiles[write.Path] = new InstalledFile(write.Path, write.Content, write.Size, write.Owner, write.Policy, write.Size, DateTimeOffset.UtcNow.ToUnixTimeSeconds(), Mode: write.Mode);
                     written += write.Size;
                     break;
                 case FileOperation.Adopt adopt:
@@ -524,11 +524,11 @@ public sealed class InstallApplier
         };
     }
 
-    private sealed record RecoveryOperation(string Kind, string Path, string? Content, long Size, string? Owner, FileInstallPolicy? Policy, string? ObservedContent, string? Reason)
+    private sealed record RecoveryOperation(string Kind, string Path, string? Content, long Size, string? Owner, FileInstallPolicy? Policy, string? ObservedContent, string? Reason, string? Mode = null)
     {
         public static RecoveryOperation From(FileOperation operation) => operation switch
         {
-            FileOperation.Write write => new("write", write.Path.Value, write.Content.ToString(), write.Size, write.Owner.Value, write.Policy, null, null),
+            FileOperation.Write write => new("write", write.Path.Value, write.Content.ToString(), write.Size, write.Owner.Value, write.Policy, null, null, write.Mode),
             FileOperation.Delete delete => new("delete", delete.Path.Value, null, 0, delete.PreviousOwner.Value, null, null, null),
             FileOperation.Keep keep => new("keep", keep.Path.Value, null, 0, null, null, null, null),
             FileOperation.Orphan orphan => new("orphan", orphan.Path.Value, null, 0, orphan.PreviousOwner.Value, null, null, orphan.Reason),
@@ -542,7 +542,7 @@ public sealed class InstallApplier
             if (!VirtualPath.TryCreate(Path, out var path, out var error)) throw new FormatException(error);
             return Kind switch
             {
-                "write" when ContentHash.TryParse(Content, out var hash) && PackageId.TryCreate(Owner, out var owner) => new FileOperation.Write(path, hash, Size, owner, Policy ?? FileInstallPolicy.Replace),
+                "write" when ContentHash.TryParse(Content, out var hash) && PackageId.TryCreate(Owner, out var owner) => new FileOperation.Write(path, hash, Size, owner, Policy ?? FileInstallPolicy.Replace, Mode),
                 "delete" when PackageId.TryCreate(Owner, out var deleteOwner) => new FileOperation.Delete(path, deleteOwner),
                 "keep" => new FileOperation.Keep(path),
                 "orphan" when PackageId.TryCreate(Owner, out var orphanOwner) => new FileOperation.Orphan(path, orphanOwner, Reason ?? "Recovered orphan"),
@@ -590,11 +590,16 @@ public sealed class InstallApplier
             current = Path.GetDirectoryName(current)!;
         }
     }
-    private static void TryMakeExecutable(string path)
+    /// <summary>
+    /// Applies resolved permission bits on the fallback (non-handle-relative) write path.
+    /// Replaces the previous hardcoded 0755-for-executables behaviour, which ignored whatever
+    /// the manifest actually declared.
+    /// </summary>
+    private static void TryApplyMode(string path, uint mode)
     {
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) return;
 #pragma warning disable CA1416
-        try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute); } catch (PlatformNotSupportedException) { }
+        try { File.SetUnixFileMode(path, (UnixFileMode)(mode & 0xFFF)); } catch (PlatformNotSupportedException) { }
 #pragma warning restore CA1416
     }
 }

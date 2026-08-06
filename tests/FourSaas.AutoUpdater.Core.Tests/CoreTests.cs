@@ -149,6 +149,47 @@ public sealed class CoreTests
         Assert.False(rejected.Accepted);
     }
 
+    [Theory]
+    [InlineData("0644", 0x1A4)]
+    [InlineData("0755", 0x1ED)]
+    [InlineData("0600", 0x180)]
+    public void FileModesParseTheirOctalPermissionBits(string text, uint expected)
+    {
+        Assert.True(PosixFileMode.TryParse(text, out var mode, out var error), error);
+        Assert.Equal(expected, mode);
+        Assert.Equal(text, PosixFileMode.Format(mode));
+    }
+
+    [Theory]
+    [InlineData("4755")] // setuid
+    [InlineData("2755")] // setgid
+    [InlineData("1777")] // sticky
+    public void FileModesRejectSetuidSetgidAndSticky(string text)
+    {
+        Assert.False(PosixFileMode.TryParse(text, out _, out var error));
+        Assert.Contains("setuid", error, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("755")]    // too short
+    [InlineData("00755")]  // too long
+    [InlineData("0778")]   // not octal
+    [InlineData("07x5")]
+    [InlineData(null)]
+    public void FileModesRejectAnythingOutsideTheFourDigitOctalGrammar(string? text)
+    {
+        Assert.False(PosixFileMode.TryParse(text, out _, out var error));
+        Assert.NotNull(error);
+    }
+
+    [Fact]
+    public void FileModeResolutionPrefersTheDeclaredModeOverThePolicyDefault()
+    {
+        Assert.Equal(0x1C0u, PosixFileMode.Resolve("0700", FileInstallPolicy.Executable));
+        Assert.Equal(PosixFileMode.DefaultExecutable, PosixFileMode.Resolve(null, FileInstallPolicy.Executable));
+        Assert.Equal(PosixFileMode.DefaultRegular, PosixFileMode.Resolve(null, FileInstallPolicy.Replace));
+    }
+
     private static PackageId Id(string value) => new(value);
     private static LockedPackage Pin(PackageId id) => new() { Id = id, Version = new PackageVersion("1.0.0", 1), ManifestPath = "", ManifestDigest = ContentHash.Compute([]), FileCount = 0, InstallSize = 0, DownloadSize = 0 };
 }

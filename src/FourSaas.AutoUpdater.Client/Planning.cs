@@ -3,13 +3,18 @@ namespace FourSaas.AutoUpdater.Client;
 public enum ObservedKind { File, Directory, Reparse, Other }
 public enum HashPolicy { Never, Changed, Always }
 public readonly record struct FileIdentity(string Value);
-public sealed record InstalledFile(VirtualPath Path, ContentHash? Content, long Size, PackageId Owner, FileInstallPolicy Policy, long ObservedSize, long ObservedMtimeUnix, string State = "managed", ContentHash? ObservedContent = null, ImmutableDictionary<string, JsonElement>? UnknownFields = null);
+public sealed record InstalledFile(VirtualPath Path, ContentHash? Content, long Size, PackageId Owner, FileInstallPolicy Policy, long ObservedSize, long ObservedMtimeUnix, string State = "managed", ContentHash? ObservedContent = null, ImmutableDictionary<string, JsonElement>? UnknownFields = null, string? Mode = null);
 public sealed record ObservedEntry(VirtualPath Path, bool Exists, ObservedKind Kind, long Size, long MtimeUnixSeconds, FileIdentity? Identity, ContentHash? Hash);
 public sealed record ObservedTreeSnapshot(string InstallRoot, ImmutableDictionary<VirtualPath, ObservedEntry> Entries);
 
 public abstract record FileOperation(VirtualPath Path)
 {
-    public sealed record Write(VirtualPath Path, ContentHash Content, long Size, PackageId Owner, FileInstallPolicy Policy) : FileOperation(Path);
+    /// <param name="Mode">
+    /// Manifest-declared POSIX mode, or null to use the policy default. Carried on the
+    /// operation rather than re-derived at apply time so that a plan, its recovery marker and
+    /// the ledger all describe the same intended permissions.
+    /// </param>
+    public sealed record Write(VirtualPath Path, ContentHash Content, long Size, PackageId Owner, FileInstallPolicy Policy, string? Mode = null) : FileOperation(Path);
     public sealed record Delete(VirtualPath Path, PackageId PreviousOwner) : FileOperation(Path);
     public sealed record Keep(VirtualPath Path) : FileOperation(Path);
     public sealed record Orphan(VirtualPath Path, PackageId PreviousOwner, string Reason) : FileOperation(Path);
@@ -52,7 +57,7 @@ public sealed class InstallPlanner : IInstallPlanner
             {
                 if (want.Kind == FileEntryKind.Directory) { operations.Add(new FileOperation.EnsureDirectory(path)); continue; }
                 if (want.Policy == FileInstallPolicy.Preserve && observation is { Exists: true, Kind: ObservedKind.File }) operations.Add(new FileOperation.Adopt(path, want.Owner, want.Policy, observation.Hash));
-                else { operations.Add(new FileOperation.Write(path, want.Content, want.Size, want.Owner, want.Policy)); AddBlob(want.Content, want.Size); }
+                else { operations.Add(new FileOperation.Write(path, want.Content, want.Size, want.Owner, want.Policy, want.Mode)); AddBlob(want.Content, want.Size); }
                 continue;
             }
             var observedMatches = observation is { Exists: true, Kind: ObservedKind.File } && (observation.Hash is null || observation.Hash == want.Content);
@@ -63,7 +68,7 @@ public sealed class InstallPlanner : IInstallPlanner
             }
             else if (have.Content == want.Content && have.State != "adopted" && observedMatches) operations.Add(new FileOperation.Keep(path));
             else if (want.Policy == FileInstallPolicy.Preserve && observation is { Exists: true, Kind: ObservedKind.File }) operations.Add(new FileOperation.Keep(path));
-            else { operations.Add(new FileOperation.Write(path, want.Content, want.Size, want.Owner, want.Policy)); AddBlob(want.Content, want.Size); }
+            else { operations.Add(new FileOperation.Write(path, want.Content, want.Size, want.Owner, want.Policy, want.Mode)); AddBlob(want.Content, want.Size); }
         }
         if (current is not null)
             foreach (var (path, had) in current)

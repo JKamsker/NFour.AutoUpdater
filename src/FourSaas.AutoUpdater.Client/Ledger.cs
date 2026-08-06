@@ -77,7 +77,7 @@ public sealed class InstallLedger
             if (!string.Equals(record.Kind, "f", StringComparison.Ordinal)) throw new FormatException("Install ledger contains an unknown record kind.");
             var filePath = new VirtualPath(record.Path);
             if (files.ContainsKey(filePath)) throw new FormatException($"Install ledger contains duplicate path '{filePath}'.");
-            files[filePath] = new InstalledFile(filePath, record.Hash is null ? null : ContentHash.Parse(record.Hash), record.Size, new PackageId(record.Owner), record.Policy ?? FileInstallPolicy.Replace, record.ObservedSize, record.Mtime, record.State ?? "managed", record.ObservedHash is null ? null : ContentHash.Parse(record.ObservedHash), record.ExtensionData?.ToImmutableDictionary(StringComparer.Ordinal));
+            files[filePath] = new InstalledFile(filePath, record.Hash is null ? null : ContentHash.Parse(record.Hash), record.Size, new PackageId(record.Owner), record.Policy ?? FileInstallPolicy.Replace, record.ObservedSize, record.Mtime, record.State ?? "managed", record.ObservedHash is null ? null : ContentHash.Parse(record.ObservedHash), record.ExtensionData?.ToImmutableDictionary(StringComparer.Ordinal), record.Mode);
         }
         var selection = new VariantSelection { Axes = lockRecord.Selection.ToImmutableSortedDictionary(x => x.Key, x => x.Value.ToImmutableSortedSet(StringComparer.Ordinal), StringComparer.Ordinal) };
         var trustedKeys = ImmutableDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
@@ -122,7 +122,7 @@ public sealed class InstallLedger
                 {
                     FileInstallPolicy? policy = file.Policy == FileInstallPolicy.Replace ? null : file.Policy;
                     var state = string.Equals(file.State, "managed", StringComparison.Ordinal) ? null : file.State;
-                    var fileRecord = new FileRecord("f", file.Path.Value, file.Content?.ToString(), file.Size, file.Owner.Value, policy, file.ObservedSize, file.ObservedMtimeUnix, state, file.ObservedContent?.ToString())
+                    var fileRecord = new FileRecord("f", file.Path.Value, file.Content?.ToString(), file.Size, file.Owner.Value, policy, file.ObservedSize, file.ObservedMtimeUnix, state, file.ObservedContent?.ToString(), file.Mode)
                     {
                         ExtensionData = file.UnknownFields is null || file.UnknownFields.IsEmpty ? null : file.UnknownFields.ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal)
                     };
@@ -186,7 +186,8 @@ public sealed class InstallLedger
         [property: JsonPropertyName("os")] long ObservedSize,
         [property: JsonPropertyName("mt")] long Mtime,
         [property: JsonPropertyName("st")] string? State,
-        [property: JsonPropertyName("oh")] string? ObservedHash)
+        [property: JsonPropertyName("oh")] string? ObservedHash,
+        [property: JsonPropertyName("md")] string? Mode = null)
     {
         [JsonExtensionData] public Dictionary<string, JsonElement>? ExtensionData { get; init; }
     }

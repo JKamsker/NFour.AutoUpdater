@@ -144,10 +144,18 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
         [JsonPropertyName("k")] public FileEntryKind Kind { get; init; } = FileEntryKind.File;
         [JsonPropertyName("mode")] public string? Mode { get; init; }
     }
+    /// <summary>
+    /// Validates a declared file mode at ingestion.
+    ///
+    /// The grammar is an allowlist, and setuid/setgid/sticky are refused outright: a package
+    /// able to request them would be requesting privilege escalation on every machine that
+    /// installs it. Rejecting here means no such mode can reach a client at all.
+    /// </summary>
     private static void ValidateMode(string? mode, FileInstallPolicy policy)
     {
-        if (mode is not null && (mode.Length != 4 || mode.Any(x => x is < '0' or > '7'))) throw new FormatException("File-table mode must be a four-digit POSIX octal string.");
-        if (mode is not null && policy != FileInstallPolicy.Executable) throw new FormatException("A file mode is only valid with executable policy.");
+        if (mode is null) return;
+        if (!PosixFileMode.TryParse(mode, out _, out var error)) throw new FormatException(error);
+        if (policy != FileInstallPolicy.Executable) throw new FormatException("A file mode is only valid with executable policy.");
     }
 }
 
