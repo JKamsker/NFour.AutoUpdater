@@ -1,3 +1,4 @@
+using FourSaas.AutoUpdater.Core;
 using FourSaas.AutoUpdater.Storage;
 
 namespace FourSaas.AutoUpdater.Storage.Http;
@@ -7,12 +8,28 @@ public sealed class HttpObjectStore : IRangeReadableObjectStore
     private readonly HttpClient _client;
     private readonly Uri _baseUri;
 
-    public HttpObjectStore(Uri baseUri, HttpMessageHandler? handler = null)
+    /// <param name="additionalAllowedOrigins">
+    /// Extra origins a redirect may target, for deployments that legitimately redirect blob
+    /// reads to a CDN or storage endpoint. The base URI's own origin is always permitted.
+    /// </param>
+    public HttpObjectStore(Uri baseUri, HttpMessageHandler? handler = null, IEnumerable<Uri>? additionalAllowedOrigins = null)
     {
         _baseUri = new Uri(baseUri.ToString().TrimEnd('/') + "/", UriKind.Absolute);
         if (handler is HttpClientHandler configured)
+        {
             configured.AutomaticDecompression = System.Net.DecompressionMethods.None;
-        _client = new HttpClient(handler ?? new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None });
+            // Redirects are followed by OriginPinnedHttpHandler, which checks every hop.
+            configured.AllowAutoRedirect = false;
+        }
+
+        // Repository reads must not be steerable to an arbitrary host by whoever controls the
+        // origin, a proxy or DNS: that is client-side request forgery, and it also allows an
+        // HTTPS deployment to be quietly downgraded to cleartext.
+        var origins = new List<Uri> { _baseUri };
+        if (additionalAllowedOrigins is not null) origins.AddRange(additionalAllowedOrigins);
+        _client = new HttpClient(new OriginPinnedHttpHandler(
+            origins,
+            handler ?? new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None, AllowAutoRedirect = false }));
     }
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range;
     public int RecommendedParallelism => 32;

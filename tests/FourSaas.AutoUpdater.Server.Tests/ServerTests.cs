@@ -276,7 +276,9 @@ public sealed class ServerTests
         var payload = "abcd"u8.ToArray();
         var handler = new MultipartResumeHandler(ContentHash.Compute(payload));
         using var http = new HttpClient(handler);
-        await using var client = new ManagementApiClient(new Uri("https://localhost"), client: http);
+        // The storage origin the stub hands back in its presigned URIs must be declared;
+        // upload URIs pointing anywhere else are refused.
+        await using var client = new ManagementApiClient(new Uri("https://localhost"), client: http, allowedStorageOrigins: [new Uri("https://storage/")]);
         var grant = (await client.CreateGrantsAsync("repo", "session", [(ContentHash.Compute(payload), payload.Length)])).Single();
 
         await Assert.ThrowsAsync<IOException>(() => client.UploadMultipartAsync(grant, new MemoryStream(payload), payload.Length).AsTask());

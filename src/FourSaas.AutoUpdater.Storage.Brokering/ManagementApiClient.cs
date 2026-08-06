@@ -16,16 +16,33 @@ public sealed class ManagementApiClient : IAsyncDisposable
     private readonly Uri _apiRoot;
     private readonly string? _bearer;
 
-    public ManagementApiClient(Uri apiBase, string? bearerToken = null, HttpClient? client = null)
+    /// <param name="allowedStorageOrigins">
+    /// Origins that a grant's presigned upload URI may point at, in addition to the
+    /// management API's own origin.  Configure this in any deployment where the storage
+    /// endpoints are known.
+    /// </param>
+    public ManagementApiClient(Uri apiBase, string? bearerToken = null, HttpClient? client = null, IEnumerable<Uri>? allowedStorageOrigins = null)
     {
         if (!apiBase.IsAbsoluteUri || apiBase.Scheme is not ("http" or "https")) throw new ArgumentException("The management API base must be an absolute HTTP(S) URI.", nameof(apiBase));
         if (apiBase.Scheme == "http" && !string.Equals(Environment.GetEnvironmentVariable("FOURSUP_INSECURE_TRANSPORT"), "1", StringComparison.Ordinal))
             throw new UnauthorizedAccessException("The management API must use HTTPS; set FOURSUP_INSECURE_TRANSPORT=1 only for local development.");
         _apiRoot = new Uri(apiBase.ToString().TrimEnd('/') + "/api/v1/", UriKind.Absolute);
         _bearer = bearerToken;
-        _client = client ?? new HttpClient(new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None });
+        _allowedStorageOrigins = (allowedStorageOrigins ?? []).Select(OriginPinnedHttpHandler.OriginOf).Append(OriginPinnedHttpHandler.OriginOf(_apiRoot)).ToHashSet(StringComparer.Ordinal);
+
+        // Redirects are never followed by this client.  Every request it makes either carries
+        // a bearer token or carries payload bytes together with storage-required headers; a
+        // redirect would either replay those somewhere else or silently truncate the body.
+        // A 3xx therefore surfaces as an error through EnsureSuccessAsync.
+        _client = client ?? new HttpClient(new HttpClientHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.None,
+            AllowAutoRedirect = false,
+        });
         _ownsClient = client is null;
     }
+
+    private readonly IReadOnlySet<string> _allowedStorageOrigins;
 
     public async ValueTask<PublishSession> OpenSessionAsync(string repository, CancellationToken cancellationToken = default)
     {
@@ -295,14 +312,33 @@ public sealed class ManagementApiClient : IAsyncDisposable
 
     private static string Segment(string value) => Uri.EscapeDataString(value);
 
-    private static Uri? ParseUploadUri(JsonElement item)
+    private Uri? ParseUploadUri(JsonElement item)
     {
         if (!item.TryGetProperty("uploadUri", out var value) || value.ValueKind != JsonValueKind.String) return null;
         return ParseStorageUri(value.GetString()!);
     }
 
-    private static Uri ParseStorageUri(string value)
-        => Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" ? uri : throw new FormatException("The management API returned an invalid storage upload URI.");
+    /// <summary>
+    /// Validates a storage URI handed back by the management API before payload bytes and
+    /// storage-required headers are sent to it.
+    ///
+    /// The URI arrives over the network, so a compromised or misconfigured control plane can
+    /// choose where an upload lands.  It is therefore checked against the configured storage
+    /// origins rather than merely parsed.
+    /// </summary>
+    private Uri ParseStorageUri(string value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+            throw new FormatException("The management API returned an invalid storage upload URI.");
+        if (!string.IsNullOrEmpty(uri.UserInfo))
+            throw new FormatException("The management API returned a storage upload URI containing userinfo.");
+        if (uri.Scheme == "http" && !string.Equals(Environment.GetEnvironmentVariable("FOURSUP_INSECURE_TRANSPORT"), "1", StringComparison.Ordinal))
+            throw new UnauthorizedAccessException($"Refusing to upload over cleartext to '{uri.Host}'; set FOURSUP_INSECURE_TRANSPORT=1 only for local development.");
+        var origin = OriginPinnedHttpHandler.OriginOf(uri);
+        if (!_allowedStorageOrigins.Contains(origin))
+            throw new UnauthorizedAccessException($"The management API returned an upload URI for unconfigured storage origin '{origin}'.");
+        return uri;
+    }
 
     private async ValueTask<string> UploadPartAsync(ApiPresignedPart part, Stream content, long length, CancellationToken cancellationToken)
     {
