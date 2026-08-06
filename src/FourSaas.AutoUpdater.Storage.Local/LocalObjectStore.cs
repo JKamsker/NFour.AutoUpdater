@@ -37,7 +37,10 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(_root)) yield break;
-        foreach (var file in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories).OrderBy(static x => x, StringComparer.Ordinal))
+        // Enumeration must not follow links: a single junction planted inside the root would
+        // otherwise report files from outside it as store objects, and callers that delete
+        // what enumeration returns would delete them.
+        foreach (var file in LinkSafeDirectoryWalk.EnumerateFiles(_root).OrderBy(static x => x, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (IsInternalPath(file)) continue;
@@ -106,9 +109,14 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var verification = File.OpenRead(temporary);
-            if (await ContentHash.ComputeAsync(verification, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false) != expectedDigest)
-                throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
+            // The verification handle must be closed before the rename: File.OpenRead takes
+            // FileShare.Read, which does not permit a concurrent rename, so leaving it open
+            // across the Move fails with a sharing violation on Windows.
+            await using (var verification = File.OpenRead(temporary))
+            {
+                if (await ContentHash.ComputeAsync(verification, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false) != expectedDigest)
+                    throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
+            }
             File.Move(temporary, destination, overwrite: false);
             FlushContainingDirectory(destination);
             return true;
@@ -179,11 +187,44 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
     }
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
+    /// <summary>
+    /// Maps an object key to an absolute path inside the store root.
+    ///
+    /// Lexical containment alone is not a containment boundary: <c>Path.GetFullPath</c>
+    /// normalises "..", but it does not resolve links, so a symlink or Windows junction
+    /// planted anywhere inside the root redirects the resulting read, write, copy or delete
+    /// to an arbitrary location that still passes the prefix test.  Every component between
+    /// the root and the leaf is therefore checked for a reparse point and rejected.
+    ///
+    /// Residual risk, stated plainly: these are path-based checks, so an attacker who can
+    /// create links inside the root and win a race between the check and the subsequent open
+    /// can still redirect an operation.  Closing that window entirely requires opening each
+    /// component handle-relatively with no-follow and mutating through those handles.  This
+    /// implementation raises the bar from "any planted link succeeds" to "only a won race
+    /// succeeds"; deployments that cannot guarantee an exclusively-owned store root should
+    /// not treat the local backend as a security boundary.
+    /// </summary>
     private string Resolve(ObjectKey key)
     {
         var combined = Path.GetFullPath(Path.Combine(_root, key.Value.Replace('/', Path.DirectorySeparatorChar)));
         if (!combined.StartsWith(_root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.Ordinal) && !string.Equals(combined, _root, StringComparison.Ordinal)) throw new IOException("Object key escapes the store root.");
+        EnsureNoLinksBelowRoot(combined);
         return combined;
+    }
+
+    /// Rejects a path if any existing component strictly below the store root is a symlink,
+    /// junction or other reparse point.  Components that do not exist yet cannot redirect
+    /// anything, so their absence is not an error.
+    private void EnsureNoLinksBelowRoot(string absolutePath)
+    {
+        var rootLength = _root.TrimEnd(Path.DirectorySeparatorChar).Length;
+        if (absolutePath.Length <= rootLength) return;
+        for (var index = absolutePath.IndexOf(Path.DirectorySeparatorChar, rootLength + 1); ; index = absolutePath.IndexOf(Path.DirectorySeparatorChar, index + 1))
+        {
+            var component = index < 0 ? absolutePath : absolutePath[..index];
+            if (LinkSafeDirectoryWalk.IsLink(component)) throw new IOException($"Refusing to traverse a link inside the object-store root: '{component}'.");
+            if (index < 0) break;
+        }
     }
     private static ObjectValidator Validator(FileInfo info) => new(ObjectValidatorKind.SizeAndMtime, $"{info.Length}:{info.LastWriteTimeUtc.Ticks}", false);
 
@@ -203,18 +244,51 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         return temporary;
     }
 
+    private const int LockAcquireTimeoutMilliseconds = 30_000;
+    private const int LockRetryInitialDelayMilliseconds = 5;
+    private const int LockRetryMaximumDelayMilliseconds = 250;
+
     private async ValueTask<FileStream> AcquireKeyLockAsync(ObjectKey key, CancellationToken cancellationToken)
     {
         var lockRoot = Path.Combine(_root, ".4sup-locks");
         Directory.CreateDirectory(lockRoot);
         var name = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key.Value))).ToLowerInvariant() + ".lock";
         var path = Path.Combine(lockRoot, name);
+
+        // On Windows the lock file is removed when the handle closes, so per-key lock files
+        // do not accumulate for the lifetime of the store.  On Unix, DeleteOnClose unlinks
+        // the path while other waiters may still hold advisory locks on that inode, which
+        // would let a waiter and a fresh creator both believe they own the key; there the
+        // zero-byte file is deliberately left in place.
+        var options = FileOptions.Asynchronous | (OperatingSystem.IsWindows() ? FileOptions.DeleteOnClose : FileOptions.None);
+
+        var deadline = Environment.TickCount64 + LockAcquireTimeoutMilliseconds;
+        var delay = LockRetryInitialDelayMilliseconds;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.Asynchronous); }
-            catch (IOException) { await Task.Delay(25, cancellationToken).ConfigureAwait(false); }
+            try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, options); }
+            catch (IOException ex) when (IsContention(ex))
+            {
+                // Only genuine contention is retried.  Treating every IOException as a busy
+                // lock turns a permission error, a full disk or an invalid path into an
+                // indefinite spin that reports nothing useful.
+                if (Environment.TickCount64 >= deadline)
+                    throw new TimeoutException($"Timed out after {LockAcquireTimeoutMilliseconds} ms waiting for the object-store lock on '{key}'.", ex);
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                delay = Math.Min(delay * 2, LockRetryMaximumDelayMilliseconds);
+            }
         }
+    }
+
+    private static bool IsContention(IOException exception)
+    {
+        const int ErrorSharingViolation = 32;
+        const int ErrorLockViolation = 33;
+        const int Ewouldblock = 11;
+        if (exception is FileNotFoundException or DirectoryNotFoundException or PathTooLongException) return false;
+        var code = exception.HResult & 0xFFFF;
+        return code is ErrorSharingViolation or ErrorLockViolation or Ewouldblock;
     }
 
     private bool IsInternalPath(string path)
