@@ -20,7 +20,10 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
         if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
         if (offset > entry.Bytes.LongLength)
             return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = Stream.Null, ActualStartOffset = 0, StatusCode = 416, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
-        return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = new MemoryStream(entry.Bytes, (int)offset, entry.Bytes.Length - (int)offset, writable: false, publiclyVisible: true), ActualStartOffset = offset, StatusCode = offset == 0 ? 200 : 206, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
+        // publiclyVisible: false — with it set, a caller can retrieve the underlying array via
+        // MemoryStream.GetBuffer and mutate the stored object in place while the recorded
+        // ETag and validator continue to describe the original bytes.
+        return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = new MemoryStream(entry.Bytes, (int)offset, entry.Bytes.Length - (int)offset, writable: false, publiclyVisible: false), ActualStartOffset = offset, StatusCode = offset == 0 ? 200 : 206, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
     }
     public ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default) => ValueTask.FromResult(_entries.TryGetValue(key.Value, out var entry) ? new ObjectHead(entry.Bytes.LongLength, new(ObjectValidatorKind.ETag, entry.ETag), LastModified: entry.LastModified) : null);
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
