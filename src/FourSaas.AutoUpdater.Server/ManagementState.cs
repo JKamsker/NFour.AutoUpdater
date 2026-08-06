@@ -235,6 +235,24 @@ public sealed class ManagementState
     private ConcurrentDictionary<string, GrantState> Grants { get; } = new(StringComparer.Ordinal);
     public ConcurrentDictionary<string, DateTimeOffset> VerifiedBlobs { get; } = new(StringComparer.Ordinal);
     public ConcurrentDictionary<string, byte[]> TrustedKeys { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Keys that were trusted at some point and have since been revoked.
+    ///
+    /// Used only to read documents that were accepted while the key was valid — never to
+    /// accept a new one. Verifying an already-placed, immutable release does not re-authorise
+    /// it; refusing to verify it only prevents maintenance from reasoning about what it
+    /// references.
+    /// </summary>
+    public ConcurrentDictionary<string, byte[]> HistoricalKeys { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Current and historical keys, for reads of already-accepted documents.</summary>
+    private IReadOnlyDictionary<string, byte[]> VerificationKeysForStoredDocuments()
+    {
+        var keys = new Dictionary<string, byte[]>(TrustedKeys, StringComparer.Ordinal);
+        foreach (var (keyId, value) in HistoricalKeys) keys.TryAdd(keyId, value);
+        return keys;
+    }
     public sealed record AuditEvent(DateTimeOffset At, string Actor, string Action, string Resource, string Outcome);
     public ConcurrentQueue<AuditEvent> AuditEvents { get; } = new();
 
@@ -1117,7 +1135,16 @@ public sealed class ManagementState
             if (!accepted) return Results.Conflict();
             foreach (var publicKey in candidate.Keys.Where(x => !candidate.RevokedKeyIds.Contains(x.KeyId, StringComparer.Ordinal)))
                 TrustedKeys[publicKey.KeyId] = Base64Url.Decode(publicKey.PublicKey);
-            foreach (var revoked in candidate.RevokedKeyIds) TrustedKeys.TryRemove(revoked, out _);
+            foreach (var revoked in candidate.RevokedKeyIds)
+            {
+                // A revoked key must never validate a *new* document, so it leaves TrustedKeys.
+                // It is retained separately because documents it signed while it was valid are
+                // already placed and immutable, and maintenance still has to be able to read
+                // them. Dropping the key outright made every release signed before a rotation
+                // unverifiable, which turned routine key rotation into a permanent garbage
+                // collection outage.
+                if (TrustedKeys.TryRemove(revoked, out var revokedKey)) HistoricalKeys[revoked] = revokedKey;
+            }
             Persist();
             await PersistTrustedKeysAsync(cancellationToken).ConfigureAwait(false);
             RecordAudit(request.HttpContext.Items["4sup-role"]?.ToString() ?? "unknown", "key-manifest.place", repository, "accepted");
@@ -1334,17 +1361,32 @@ public sealed class ManagementState
         {
             var (descriptor, layout) = await RepositoryFactory.LoadDescriptorAsync(_store, cancellationToken).ConfigureAwait(false);
             var releases = new List<ReleaseLock>();
-            foreach (var bytes in Releases.Where(x => Products.ContainsKey(x.Key.Product) || x.Key.Product is not null).Select(x => x.Value))
+            var unverifiable = new List<string>();
+            var verificationKeys = VerificationKeysForStoredDocuments();
+            foreach (var (identity, bytes) in Releases.Where(x => Products.ContainsKey(x.Key.Product) || x.Key.Product is not null))
             {
                 var envelope = SignedDocument.DeserializeEnvelope(bytes);
-                if (!SignedDocument.Verify(envelope, TrustedKeys, out var payload, out var error)) throw new CryptographicException(error);
-                var release = SignedDocument.DeserializePayload<ReleaseLock>(payload);
+                ReleaseLock release;
+                if (SignedDocument.Verify(envelope, verificationKeys, out var payload, out var error))
+                {
+                    release = SignedDocument.DeserializePayload<ReleaseLock>(payload);
+                }
+                else
+                {
+                    // Refusing to proceed would stop collection for the whole repository
+                    // because of one release nobody can verify. Instead the release is still
+                    // treated as live, so everything it references is preserved, and the
+                    // condition is reported. Erring towards keeping blobs is the safe
+                    // direction here; erring towards deleting them is not.
+                    unverifiable.Add($"{identity.Product}/{identity.Release}: {error}");
+                    release = SignedDocument.DeserializePayload<ReleaseLock>(Base64Url.Decode(envelope.Payload));
+                }
                 if (release.State == ReleaseState.Published) releases.Add(release);
             }
             var repositoryView = new StaticRepository(_store, descriptor);
             var result = await new GarbageCollector().CollectLiveAsync(listable, layout, releases, repositoryView, new GarbageCollectionOptions { DryRun = dryRun }, cancellationToken: cancellationToken).ConfigureAwait(false);
-            RecordAudit("operator", "repository.gc", repository, dryRun ? "dry-run" : "accepted");
-            return Results.Ok(new { marked = result.Marked.Select(x => x.Value).ToArray(), quarantined = result.Quarantined.Select(x => x.Value).ToArray(), deleted = result.Deleted.Select(x => x.Value).ToArray(), diagnostics = result.Diagnostics });
+            RecordAudit("operator", "repository.gc", repository, dryRun ? "dry-run" : unverifiable.Count == 0 ? "accepted" : "alerted");
+            return Results.Ok(new { marked = result.Marked.Select(x => x.Value).ToArray(), quarantined = result.Quarantined.Select(x => x.Value).ToArray(), deleted = result.Deleted.Select(x => x.Value).ToArray(), diagnostics = result.Diagnostics, unverifiableReleases = unverifiable.ToArray() });
         }
         catch (FileNotFoundException ex) { return Results.NotFound(new { error = ex.Message }); }
         catch (Exception ex) when (ex is FormatException or InvalidDataException or CryptographicException) { return Results.BadRequest(new { error = ex.Message }); }
