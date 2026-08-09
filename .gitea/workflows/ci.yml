@@ -125,6 +125,8 @@ jobs:
         run: bash scripts/secret-scan.sh
       - name: Diff hygiene
         run: git diff --check
+      - name: C# file-size policy
+        run: scripts/check-file-size.sh
 
   # The trust-root guard is a release gate, so it is tested rather than assumed: a guard that
   # silently stopped firing would be worse than not having one.

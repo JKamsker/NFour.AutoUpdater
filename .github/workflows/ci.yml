@@ -117,6 +117,8 @@ jobs:
         run: bash scripts/secret-scan.sh
       - name: Diff hygiene
         run: git diff --check
+      - name: C# file-size policy
+        run: scripts/check-file-size.sh
 
   # Prove both sides of the release guard: development roots fail unless explicitly
   # acknowledged, while a supplied production-shaped root builds successfully.
