@@ -1,0 +1,108 @@
+name: 4sup CI
+
+on:
+  push:
+  pull_request:
+
+# Release configuration refuses to build with the development trust root compiled in
+# (FS4SUP001). CI is not producing a shippable client, so it acknowledges that explicitly.
+env:
+  DOTNET_BUILD_ARGS: "-p:FourSaasAllowDevelopmentTrustRoot=true"
+
+jobs:
+  # Exercise both Darwin ABIs explicitly. macos-15-intel is x64; macos-15 is arm64.
+  # macos-latest alone currently covers arm64 and would leave the $INODE64 path unexecuted.
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore
+        run: dotnet restore AutoUpdater.sln
+      - name: Build
+        run: dotnet build AutoUpdater.sln --no-restore --configuration Release $DOTNET_BUILD_ARGS
+        shell: bash
+      - name: Test
+        run: dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
+        shell: bash
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+      - name: Start integration services
+        run: docker compose up -d postgres minio minio-init nginx vsftpd
+      - name: Wait for PostgreSQL
+        run: |
+          for attempt in $(seq 1 30); do
+            if docker compose exec -T postgres pg_isready -U 4sup -d 4sup; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      - name: Restore
+        run: dotnet restore AutoUpdater.sln
+      - name: Build
+        run: dotnet build AutoUpdater.sln --no-restore --configuration Release $DOTNET_BUILD_ARGS
+      - name: Test (all backends enabled)
+        env:
+          FOURSUP_MINIO: 1
+          FOURSUP_HTTP: 1
+          FOURSUP_FTP: 1
+          FOURSUP_POSTGRES: 1
+          FOURSUP_DATABASE: Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password
+        run: dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore
+        run: dotnet restore AutoUpdater.sln
+      - name: Dependency vulnerability audit
+        run: |
+          dotnet list AutoUpdater.sln package --include-transitive --vulnerable --format json > vulnerable.json
+          cat vulnerable.json
+          if grep -q '"severity"' vulnerable.json; then
+            echo "Vulnerable packages reported above."
+            exit 1
+          fi
+      - name: Deprecated package report
+        run: dotnet list AutoUpdater.sln package --include-transitive --deprecated
+      - name: Secret scan
+        run: bash scripts/secret-scan.sh
+      - name: Diff hygiene
+        run: git diff --check
+
+  # Prove both sides of the release guard: development roots fail unless explicitly
+  # acknowledged, while a supplied production-shaped root builds successfully.
+  release-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: '10.0.x'
+      - name: A Release build carrying the development trust root must fail
+        run: |
+          if dotnet build src/FourSaas.AutoUpdater.Core -c Release -t:Rebuild > guard.log 2>&1; then
+            echo "Release build succeeded with the development trust root; FS4SUP001 is not enforcing."
+            cat guard.log
+            exit 1
+          fi
+          grep -q FS4SUP001 guard.log || { echo "Build failed for an unrelated reason:"; cat guard.log; exit 1; }
+      - name: A Release build with a supplied root must succeed
+        run: dotnet build src/FourSaas.AutoUpdater.Core -c Release -t:Rebuild -p:FourSaasTrustRootKeyId=ci-root -p:FourSaasTrustRootPublicKey=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo
