@@ -18,6 +18,15 @@ namespace FourSaas.AutoUpdater.Server.Tests;
 
 public sealed class ServerTests
 {
+    private const string IntegrationRepositoryPrefix = "ci";
+    private const int IntegrationRepositorySuffixLength = 12;
+    private const string ReleaseSequenceScope = "release";
+    private const string DemoSequenceName = "demo";
+    private const string SequencePropertyName = "sequence";
+    private const string CompactGuidFormat = "N";
+    private const long InitialSequence = 1;
+    private const long RestartedSequence = 2;
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -158,22 +167,20 @@ public sealed class ServerTests
     [Fact]
     public async Task LivePostgresMigrationAndSequenceReservationSurviveStateRestart()
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("FOURSUP_POSTGRES"), "1", StringComparison.Ordinal)) return;
-        var connection = Environment.GetEnvironmentVariable("FOURSUP_DATABASE")
-            ?? "Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password";
+        var connection = PostgresIntegrationSettings.GetRequiredConnectionString();
         var options = new DbContextOptionsBuilder<ManagementDbContext>().UseNpgsql(connection).Options;
         await using (var database = new ManagementDbContext(options)) await database.Database.MigrateAsync();
         var factory = new TestDbContextFactory(options);
         await using var store = new MemoryObjectStore();
-        var repository = "ci" + Guid.NewGuid().ToString("N")[..12];
+        var repository = IntegrationRepositoryPrefix + Guid.NewGuid().ToString(CompactGuidFormat)[..IntegrationRepositorySuffixLength];
         var first = new ManagementState(store, databaseFactory: factory, repositoryId: repository);
-        var firstResult = await first.AllocateSequenceAsync(repository, "release", "demo");
-        Assert.Equal(200, Assert.IsAssignableFrom<IStatusCodeHttpResult>(firstResult).StatusCode);
-        Assert.Equal(1, (long)Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value!.GetType().GetProperty("sequence")!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value)!);
+        var firstResult = await first.AllocateSequenceAsync(repository, ReleaseSequenceScope, DemoSequenceName);
+        Assert.Equal(StatusCodes.Status200OK, Assert.IsAssignableFrom<IStatusCodeHttpResult>(firstResult).StatusCode);
+        Assert.Equal(InitialSequence, (long)Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value!.GetType().GetProperty(SequencePropertyName)!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value)!);
 
         var second = new ManagementState(store, databaseFactory: factory, repositoryId: repository);
-        var secondResult = await second.AllocateSequenceAsync(repository, "release", "demo");
-        Assert.Equal(2, (long)Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value!.GetType().GetProperty("sequence")!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value)!);
+        var secondResult = await second.AllocateSequenceAsync(repository, ReleaseSequenceScope, DemoSequenceName);
+        Assert.Equal(RestartedSequence, (long)Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value!.GetType().GetProperty(SequencePropertyName)!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value)!);
     }
 
     [Fact]

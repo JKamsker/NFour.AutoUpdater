@@ -76,13 +76,19 @@ jobs:
           nginx_endpoint="$(docker compose port nginx "$nginx_http_port")"
           nginx_published_port="${nginx_endpoint##*:}"
           printf 'FOURSUP_HTTP_URI=http://127.0.0.1:%s/\n' "$nginx_published_port" >> "$GITHUB_ENV"
+          postgres_database_port=5432
+          postgres_endpoint="$(docker compose port postgres "$postgres_database_port")"
+          postgres_published_port="${postgres_endpoint##*:}"
+          postgres_database="$(docker compose exec -T postgres printenv POSTGRES_DB | tr -d '\r')"
+          postgres_user="$(docker compose exec -T postgres printenv POSTGRES_USER | tr -d '\r')"
+          postgres_password="$(docker compose exec -T postgres printenv POSTGRES_PASSWORD | tr -d '\r')"
+          printf 'FOURSUP_DATABASE=Host=127.0.0.1;Port=%s;Database=%s;Username=%s;Password=%s\n' "$postgres_published_port" "$postgres_database" "$postgres_user" "$postgres_password" >> "$GITHUB_ENV"
       - name: Test (all backends enabled)
         env:
           FOURSUP_MINIO: 1
           FOURSUP_HTTP: 1
           FOURSUP_FTP: 1
           FOURSUP_POSTGRES: 1
-          FOURSUP_DATABASE: Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password
         run: dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
 
   supply-chain:

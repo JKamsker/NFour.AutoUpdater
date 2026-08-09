@@ -13,12 +13,11 @@ namespace FourSaas.AutoUpdater.Server.Tests;
 
 public sealed class MultiInstancePostgresTests
 {
-    private const string PostgresGateEnvironmentVariable = "FOURSUP_POSTGRES";
-    private const string DatabaseEnvironmentVariable = "FOURSUP_DATABASE";
-    private const string EnabledEnvironmentValue = "1";
     private const string RepositoryPrefix = "multi";
+    private const string CompactGuidFormat = "N";
     private const int RepositorySuffixLength = 12;
     private const int ConcurrentAllocationCount = 20;
+    private const int AllocationStartIndex = 0;
     private const long FirstSequence = 1;
     private const string SequenceScope = "release";
     private const string SequenceName = "product";
@@ -32,22 +31,19 @@ public sealed class MultiInstancePostgresTests
     [Fact]
     public async Task TwoInstancesAllocateGrantSealAndCollectConcurrently()
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable(PostgresGateEnvironmentVariable), EnabledEnvironmentValue, StringComparison.Ordinal))
-            Assert.Skip("Set FOURSUP_POSTGRES=1 and FOURSUP_DATABASE to run PostgreSQL integration tests.");
-        var connection = Environment.GetEnvironmentVariable(DatabaseEnvironmentVariable);
-        if (string.IsNullOrWhiteSpace(connection)) Assert.Skip("FOURSUP_DATABASE is required for PostgreSQL integration tests.");
+        var connection = PostgresIntegrationSettings.GetRequiredConnectionString();
 
         var options = new DbContextOptionsBuilder<ManagementDbContext>().UseNpgsql(connection).Options;
         await using (var database = new ManagementDbContext(options)) await database.Database.MigrateAsync();
         var factory = new TestDbContextFactory(options);
         await using var repositoryStore = new MemoryObjectStore();
         await using var stagingStore = new MemoryObjectStore();
-        var repository = RepositoryPrefix + Guid.NewGuid().ToString("N")[..RepositorySuffixLength];
+        var repository = RepositoryPrefix + Guid.NewGuid().ToString(CompactGuidFormat)[..RepositorySuffixLength];
         var first = new ManagementState(repositoryStore, stagingStore: stagingStore, databaseFactory: factory, repositoryId: repository);
         var second = new ManagementState(repositoryStore, stagingStore: stagingStore, databaseFactory: factory, repositoryId: repository);
         var instances = new[] { first, second };
 
-        var allocations = await Task.WhenAll(Enumerable.Range(0, ConcurrentAllocationCount).Select(index =>
+        var allocations = await Task.WhenAll(Enumerable.Range(AllocationStartIndex, ConcurrentAllocationCount).Select(index =>
             instances[index % instances.Length].AllocateSequenceAsync(repository, SequenceScope, SequenceName)));
         Assert.Equal(Enumerable.Range((int)FirstSequence, ConcurrentAllocationCount).Select(value => (long)value), allocations.Select(SequenceOf).Order());
 
