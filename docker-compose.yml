@@ -50,17 +50,27 @@ services:
 
   vsftpd:
     image: fauria/vsftpd@sha256:6d71d7c7f1b0ab2844ec7dc7999a30aef6d758b6d8179cf5967513f87c79c177
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        mkdir -p /home/vsftpd/4sup-test &&
+        cp -a /seed/. /home/vsftpd/4sup-test/ &&
+        exec /usr/sbin/run-vsftpd.sh
     environment:
       FTP_USER: 4sup-test
       FTP_PASS: 4sup-test-password
       PASV_ADDRESS: 127.0.0.1
       PASV_MIN_PORT: 21100
       PASV_MAX_PORT: 21110
+      REVERSE_LOOKUP_ENABLE: "NO"
     ports:
-      - "2121:21"
+      - "${FOURSUP_FTP_PORT:-22121}:21"
       - "21100-21110:21100-21110"
     volumes:
-      - ./tests/fixtures/ftp-user:/home/vsftpd/4sup-test:ro
+      - ftp-data:/home/vsftpd
+      - ./tests/fixtures/ftp-user:/seed:ro
 
 volumes:
   minio-data:
+  ftp-data:

@@ -54,6 +54,16 @@ jobs:
         run: dotnet restore AutoUpdater.sln
       - name: Build
         run: dotnet build AutoUpdater.sln --no-restore --configuration Release $DOTNET_BUILD_ARGS
+      - name: Configure FTP test client
+        run: |
+          ftp_control_port=21
+          ftp_endpoint="$(docker compose port vsftpd "$ftp_control_port")"
+          ftp_published_port="${ftp_endpoint##*:}"
+          ftp_user="$(docker compose exec -T vsftpd printenv FTP_USER | tr -d '\r')"
+          ftp_password="$(docker compose exec -T vsftpd printenv FTP_PASS | tr -d '\r')"
+          printf 'FOURSUP_FTP_URI=ftp://127.0.0.1:%s/\n' "$ftp_published_port" >> "$GITHUB_ENV"
+          printf 'FOURSUP_FTP_USER=%s\n' "$ftp_user" >> "$GITHUB_ENV"
+          printf 'FOURSUP_FTP_PASSWORD=%s\n' "$ftp_password" >> "$GITHUB_ENV"
       - name: Test (all backends enabled)
         env:
           FOURSUP_MINIO: 1

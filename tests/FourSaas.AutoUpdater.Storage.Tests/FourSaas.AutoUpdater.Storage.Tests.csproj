@@ -1,4 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><IsTestProject>true</IsTestProject><NoWarn>$(NoWarn);xUnit1051</NoWarn><RootNamespace>FourSaas.AutoUpdater.Storage.Tests</RootNamespace></PropertyGroup>
   <ItemGroup><ProjectReference Include="../../src/FourSaas.AutoUpdater.Storage.Memory/FourSaas.AutoUpdater.Storage.Memory.csproj" /><ProjectReference Include="../../src/FourSaas.AutoUpdater.Storage.Local/FourSaas.AutoUpdater.Storage.Local.csproj" /><ProjectReference Include="../../src/FourSaas.AutoUpdater.Storage.Http/FourSaas.AutoUpdater.Storage.Http.csproj" /><ProjectReference Include="../../src/FourSaas.AutoUpdater.Storage.Ftp/FourSaas.AutoUpdater.Storage.Ftp.csproj" /><ProjectReference Include="../../src/FourSaas.AutoUpdater.Core/FourSaas.AutoUpdater.Core.csproj" /><PackageReference Include="Microsoft.NET.Test.Sdk" /><PackageReference Include="xunit.v3" /><PackageReference Include="xunit.runner.visualstudio" /></ItemGroup>
+  <ItemGroup><None Include="../fixtures/ftp-user/blob" Link="fixtures/ftp/blob" CopyToOutputDirectory="PreserveNewest" /></ItemGroup>
 </Project>

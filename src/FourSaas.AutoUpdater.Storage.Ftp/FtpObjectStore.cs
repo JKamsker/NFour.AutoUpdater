@@ -10,13 +10,23 @@ namespace FourSaas.AutoUpdater.Storage.Ftp;
 /// </summary>
 public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore, IServerSideTransferStore
 {
+    private const string FtpScheme = "ftp";
+    private const string FtpsScheme = "ftps";
+    private const int DefaultControlPort = 21;
+    private const int TransportParallelism = 4;
+    private const int DisabledRetryCount = 0;
+    private const char RemotePathSeparator = '/';
+    private const string ValidatorFieldSeparator = ":";
+    private const string TemporaryObjectMarker = ".tmp-";
+    private const string CompactGuidFormat = "N";
+
     private readonly Uri _baseUri;
     private readonly NetworkCredential _credentials;
     private readonly bool _enableSsl;
 
     public FtpObjectStore(Uri baseUri, NetworkCredential credentials, bool enableSsl = true)
     {
-        if (!baseUri.IsAbsoluteUri || baseUri.Scheme is not ("ftp" or "ftps"))
+        if (!baseUri.IsAbsoluteUri || baseUri.Scheme is not (FtpScheme or FtpsScheme))
             throw new ArgumentException("FTP store requires an absolute ftp or ftps URI.", nameof(baseUri));
         _baseUri = baseUri;
         _credentials = credentials;
@@ -32,7 +42,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
     // request a normal caller could construct.  Advertising a capability no caller can
     // safely exercise would only produce silent restarts.
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.Delete;
-    public int RecommendedParallelism => 4;
+    public int RecommendedParallelism => TransportParallelism;
 
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
@@ -56,7 +66,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
             {
                 Content = content,
                 ActualStartOffset = offset,
-                StatusCode = offset == 0 ? 200 : 206,
+                StatusCode = (int)(offset == 0 ? HttpStatusCode.OK : HttpStatusCode.PartialContent),
                 Validator = null
             };
         }
@@ -73,7 +83,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         if (!await client.FileExists(path, cancellationToken).ConfigureAwait(false)) return null;
         var size = await client.GetFileSize(path, 0, cancellationToken).ConfigureAwait(false);
         var modified = await client.GetModifiedTime(path, cancellationToken).ConfigureAwait(false);
-        return new ObjectHead(size, new(ObjectValidatorKind.SizeAndMtime, $"{size}:{modified.ToUniversalTime().Ticks}", false), LastModified: modified.ToUniversalTime());
+        return new ObjectHead(size, new(ObjectValidatorKind.SizeAndMtime, $"{size}{ValidatorFieldSeparator}{modified.ToUniversalTime().Ticks}", false), LastModified: modified.ToUniversalTime());
     }
 
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -94,7 +104,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
     public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
-        var root = prefix?.Trim('/') ?? string.Empty;
+        var root = prefix?.Trim(RemotePathSeparator) ?? string.Empty;
         var prefixes = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var key in ListAsync(prefix, cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -110,7 +120,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
         var destination = RemotePath(key);
         await client.CreateDirectory(ParentPath(destination), true, cancellationToken).ConfigureAwait(false);
-        var temporary = destination + ".tmp-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        var temporary = destination + TemporaryObjectMarker + Guid.NewGuid().ToString(CompactGuidFormat, CultureInfo.InvariantCulture);
         try
         {
             var status = await client.UploadStream(content, temporary, FtpRemoteExists.Overwrite, true, null, cancellationToken).ConfigureAwait(false);
@@ -165,9 +175,9 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         {
             EncryptionMode = _enableSsl ? FtpEncryptionMode.Explicit : FtpEncryptionMode.None,
             DataConnectionEncryption = _enableSsl,
-            RetryAttempts = 0
+            RetryAttempts = DisabledRetryCount
         };
-        var client = new AsyncFtpClient(_baseUri.Host, _credentials, _baseUri.Port > 0 ? _baseUri.Port : 21, config);
+        var client = new AsyncFtpClient(_baseUri.Host, _credentials, _baseUri.Port > 0 ? _baseUri.Port : DefaultControlPort, config);
         try
         {
             await client.Connect(cancellationToken).ConfigureAwait(false);
@@ -180,7 +190,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         }
     }
 
-    private string RemoteRoot => _baseUri.AbsolutePath.TrimEnd('/');
+    private string RemoteRoot => _baseUri.AbsolutePath.TrimEnd(RemotePathSeparator);
     private bool CanUseSameServer(FtpObjectStore other)
         => string.Equals(_baseUri.Scheme, other._baseUri.Scheme, StringComparison.OrdinalIgnoreCase)
             && string.Equals(_baseUri.Host, other._baseUri.Host, StringComparison.OrdinalIgnoreCase)
@@ -189,13 +199,13 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
             && string.Equals(_credentials.Password, other._credentials.Password, StringComparison.Ordinal)
             && _enableSsl == other._enableSsl;
     private string RemotePath(ObjectKey key) => RemotePath(key.Value);
-    private string RemotePath(string path) => $"{RemoteRoot}/{path.TrimStart('/')}";
+    private string RemotePath(string path) => $"{RemoteRoot}{RemotePathSeparator}{path.TrimStart(RemotePathSeparator)}";
     private string RelativePath(string path)
     {
-        var root = RemoteRoot.TrimEnd('/') + "/";
-        return path.StartsWith(root, StringComparison.Ordinal) ? path[root.Length..].Trim('/') : path.Trim('/');
+        var root = RemoteRoot.TrimEnd(RemotePathSeparator) + RemotePathSeparator;
+        return path.StartsWith(root, StringComparison.Ordinal) ? path[root.Length..].Trim(RemotePathSeparator) : path.Trim(RemotePathSeparator);
     }
-    private static string ParentPath(string path) => path[..path.LastIndexOf('/')];
+    private static string ParentPath(string path) => path[..path.LastIndexOf(RemotePathSeparator)];
 
     private sealed class ClientResponseStream(Stream inner, AsyncFtpClient client) : Stream
     {

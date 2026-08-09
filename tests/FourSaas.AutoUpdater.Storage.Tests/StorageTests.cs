@@ -11,6 +11,10 @@ namespace FourSaas.AutoUpdater.Storage.Tests;
 
 public sealed class StorageTests
 {
+    private const int HttpFixtureLength = 11;
+    private const string UnreachableFtpsServerUri = "ftps://example.invalid/";
+    private const string PlaceholderCredential = "test";
+
     public static IEnumerable<object[]> Stores()
     {
         yield return [new Func<string, IReadableObjectStore>(_ => new MemoryObjectStore())];
@@ -107,7 +111,7 @@ public sealed class StorageTests
         Assert.True(StorageCapabilityNegotiation.IsConsistent(memory));
         await using var http = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("https://example.invalid/"));
         Assert.True(StorageCapabilityNegotiation.IsConsistent(http));
-        await using var ftp = new FourSaas.AutoUpdater.Storage.Ftp.FtpObjectStore(new Uri("ftps://example.invalid/"), new System.Net.NetworkCredential("test", "test"));
+        await using var ftp = new FourSaas.AutoUpdater.Storage.Ftp.FtpObjectStore(new Uri(UnreachableFtpsServerUri), new System.Net.NetworkCredential(PlaceholderCredential, PlaceholderCredential));
         Assert.True(StorageCapabilityNegotiation.IsConsistent(ftp));
     }
 
@@ -162,7 +166,7 @@ public sealed class StorageTests
         await using var store = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("http://localhost:8080/"));
         var head = await store.HeadAsync(new ObjectKey("blob"));
         Assert.NotNull(head);
-        Assert.Equal(11, head!.Length);
+        Assert.Equal(HttpFixtureLength, head!.Length);
         var read = await store.OpenAsync(new ObjectKey("blob"), 4, head.Validator);
         Assert.NotNull(read);
         await using (read!)
@@ -173,20 +177,6 @@ public sealed class StorageTests
         }
         await using var encoded = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("http://localhost:8080/"), new GzipRequestHandler());
         await Assert.ThrowsAsync<InvalidDataException>(async () => await encoded.OpenAsync(new ObjectKey("blob")));
-    }
-
-    [Fact]
-    public async Task LiveVsftpdCharacterizationFailsClosedWithoutMachineListing()
-    {
-        if (!string.Equals(Environment.GetEnvironmentVariable("FOURSUP_FTP"), "1", StringComparison.Ordinal)) Assert.Skip("Set FOURSUP_FTP=1 after starting docker compose to run FTP integration tests.");
-        await using var store = new FourSaas.AutoUpdater.Storage.Ftp.FtpObjectStore(new Uri("ftp://localhost:2121/"), new NetworkCredential("4sup-test", "4sup-test-password"), enableSsl: false);
-        var head = await store.HeadAsync(new ObjectKey("blob"));
-        Assert.NotNull(head);
-        Assert.Equal(11, head!.Length);
-        await Assert.ThrowsAsync<NotSupportedException>(async () =>
-        {
-            await foreach (var _ in store.ListAsync()) { }
-        });
     }
 
     private static async Task<string[]> ToArrayAsync(IAsyncEnumerable<ObjectKey> keys) { var result = new List<string>(); await foreach (var key in keys) result.Add(key.Value); return result.ToArray(); }
