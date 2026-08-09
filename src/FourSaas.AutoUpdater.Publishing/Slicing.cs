@@ -7,6 +7,21 @@ public sealed record SlicePackageDefinition
     public ImmutableArray<string> Include { get; init; } = [];
     public ImmutableArray<string> Exclude { get; init; } = [];
     public ImmutableDictionary<string, string> Rewrite { get; init; } = ImmutableDictionary<string, string>.Empty;
+
+    /// <summary>
+    /// Prefix removed from a matched source path to produce its install path.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Rewrite"/> maps one exact path to one exact path, which cannot express
+    /// "this whole subtree installs one level up". Expressing that per file would mean one
+    /// rewrite entry per file — for a build of this size, a configuration nobody can maintain
+    /// and the thing the layout convention exists to avoid. A prefix covers a subtree of any
+    /// size in one line.
+    ///
+    /// Applied before <see cref="Rewrite"/>, so an individual file can still be redirected
+    /// afterwards.
+    /// </remarks>
+    public string? StripPrefix { get; init; }
     public ImmutableArray<SlicePolicy> Policies { get; init; } = [];
     public ImmutableArray<PackageDependency> Requires { get; init; } = [];
 }
@@ -54,7 +69,15 @@ public sealed class SliceEngine
             if (matches.Length > 1) diagnostics.Add(new("PKG014b", DiagnosticSeverity.Error, $"Source file '{relative}' matched multiple packages: {string.Join(", ", matches.Select(x => x.Id))}.", relative));
             foreach (var definition in matches)
             {
-                var destinationText = definition.Rewrite.TryGetValue(relative, out var rewritten) ? rewritten : relative;
+                var destinationText = SlicePaths.Strip(relative, definition.StripPrefix);
+                destinationText = definition.Rewrite.TryGetValue(destinationText, out var rewritten) ? rewritten
+                    : definition.Rewrite.TryGetValue(relative, out var legacyRewritten) ? legacyRewritten
+                    : destinationText;
+                if (destinationText.Length == 0)
+                {
+                    diagnostics.Add(new("PKG017", DiagnosticSeverity.Error, $"Source file '{relative}' has nothing left after stripping prefix '{definition.StripPrefix}'.", relative));
+                    continue;
+                }
                 if (!VirtualPath.TryCreate(destinationText, out var destination, out var error)) { diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, error ?? "Invalid path.", relative)); continue; }
                 var policy = definition.Policies.Where(x => Glob.IsMatch(relative, x.Pattern)).Select(x => x.Policy).LastOrDefault();
                 filesByPackage[definition.Id].Add(new SlicedFile(file, destination, policy));
@@ -82,7 +105,11 @@ public sealed class SliceEngine
             if (matches.Length > 1) diagnostics.Add(new("PKG014b", DiagnosticSeverity.Error, $"Source directory '{relative}' matched multiple packages: {string.Join(", ", matches.Select(x => x.Id))}.", relative));
             foreach (var definition in matches)
             {
-                var destinationText = definition.Rewrite.TryGetValue(relative, out var rewritten) ? rewritten : relative;
+                var destinationText = SlicePaths.Strip(relative, definition.StripPrefix);
+                destinationText = definition.Rewrite.TryGetValue(destinationText, out var rewritten) ? rewritten
+                    : definition.Rewrite.TryGetValue(relative, out var legacyRewritten) ? legacyRewritten
+                    : destinationText;
+                if (destinationText.Length == 0) continue;
                 if (!VirtualPath.TryCreate(destinationText, out var destination, out var error)) { diagnostics.Add(new("PKG012", DiagnosticSeverity.Error, error ?? "Invalid path.", relative)); continue; }
                 filesByPackage[definition.Id].Add(new SlicedFile(directory, destination, FileInstallPolicy.Replace, FileEntryKind.Directory));
             }
@@ -102,9 +129,35 @@ public sealed class SliceEngine
     }
 }
 
+public static class SlicePaths
+{
+    /// <summary>
+    /// Removes <paramref name="prefix"/> from the front of <paramref name="path"/>.
+    /// Returns the path unchanged when the prefix does not apply, so a rule with a prefix can
+    /// still match files outside it without silently mangling them.
+    /// </summary>
+    public static string Strip(string path, string? prefix)
+    {
+        if (string.IsNullOrEmpty(prefix)) return path;
+        var normalised = prefix.Trim('/');
+        if (normalised.Length == 0) return path;
+        if (!path.StartsWith(normalised, StringComparison.Ordinal)) return path;
+        if (path.Length == normalised.Length) return string.Empty;
+        return path[normalised.Length] == '/' ? path[(normalised.Length + 1)..] : path;
+    }
+}
+
 public static class Glob
 {
+    // Patterns are few and reused across every file in the build; paths number in the
+    // hundreds of thousands. Rebuilding and re-parsing the regex per (file, pattern) pair made
+    // matching the dominant cost of slicing a large tree.
+    private static readonly ConcurrentDictionary<string, System.Text.RegularExpressions.Regex> Compiled = new(StringComparer.Ordinal);
+
     public static bool IsMatch(string path, string pattern)
+        => Compiled.GetOrAdd(pattern, Build).IsMatch(path);
+
+    private static System.Text.RegularExpressions.Regex Build(string pattern)
     {
         var regex = new StringBuilder("^");
         for (var i = 0; i < pattern.Length; i++)
@@ -116,6 +169,6 @@ public static class Glob
             else regex.Append(System.Text.RegularExpressions.Regex.Escape(c.ToString()));
         }
         regex.Append("$");
-        return System.Text.RegularExpressions.Regex.IsMatch(path, regex.ToString(), System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        return new System.Text.RegularExpressions.Regex(regex.ToString(), System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.Compiled);
     }
 }

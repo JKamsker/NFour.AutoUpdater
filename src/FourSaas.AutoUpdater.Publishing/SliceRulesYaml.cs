@@ -38,6 +38,7 @@ public static class SliceRulesYaml
                 "id": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9]|[.-][a-z0-9])*$"},
                 "include": {"type": "array", "items": {"type": "string"}},
                 "exclude": {"type": "array", "items": {"type": "string"}},
+                "stripPrefix": {"type": "string", "minLength": 1},
                 "rewrite": {"type": "object", "additionalProperties": {"type": "string"}},
                 "policy": {"type": "object", "additionalProperties": {"enum": ["replace", "preserve", "executable"]}},
                 "requires": {"type": "array", "items": {"$ref": "#/$defs/dependency"}}
@@ -94,10 +95,11 @@ public static class SliceRulesYaml
             if (colon < 0) throw new FormatException($"Unrecognised slice.yaml entry '{text}'.");
             var key = text[..colon].Trim().Trim('"'); var value = text[(colon + 1)..].Trim();
             if (value.Length == 0) { section = key; continue; }
-            if (section is null && key is "include" or "exclude" or "rewrite" or "policy" or "requires")
+            if (section is null && key is "include" or "exclude" or "rewrite" or "policy" or "requires" or "stripPrefix")
                 EnsureFirst(seenPackageKeys.TryGetValue(current, out var existing) ? existing : seenPackageKeys[current] = new HashSet<string>(StringComparer.Ordinal), key);
             switch (key)
             {
+                case "stripPrefix": current.StripPrefix = Unquote(value); section = null; break;
                 case "include": current.Include.AddRange(ParseList(value)); section = null; break;
                 case "exclude": current.Exclude.AddRange(ParseList(value)); section = null; break;
                 case "rewrite" when value.StartsWith('{'): foreach (var pair in ParseMap(value)) current.Rewrite[pair.Key] = pair.Value; section = null; break;
@@ -148,12 +150,13 @@ public static class SliceRulesYaml
     private sealed class MutablePackage
     {
         public required PackageId Id { get; init; }
+        public string? StripPrefix { get; set; }
         public List<string> Include { get; } = [];
         public List<string> Exclude { get; } = [];
         public Dictionary<string, string> Rewrite { get; } = new(StringComparer.Ordinal);
         public List<SlicePolicy> Policies { get; } = [];
         public List<PackageDependency> Requires { get; } = [];
-        public SlicePackageDefinition ToImmutable() => new() { Id = Id, Include = Include.ToImmutableArray(), Exclude = Exclude.ToImmutableArray(), Rewrite = Rewrite.ToImmutableDictionary(StringComparer.Ordinal), Policies = Policies.ToImmutableArray(), Requires = Requires.ToImmutableArray() };
+        public SlicePackageDefinition ToImmutable() => new() { Id = Id, StripPrefix = StripPrefix, Include = Include.ToImmutableArray(), Exclude = Exclude.ToImmutableArray(), Rewrite = Rewrite.ToImmutableDictionary(StringComparer.Ordinal), Policies = Policies.ToImmutableArray(), Requires = Requires.ToImmutableArray() };
     }
 
     private static IEnumerable<PackageDependency> ParseDependencies(string value) => value.Trim().TrimStart('[').TrimEnd(']').Split("},", StringSplitOptions.RemoveEmptyEntries).Select(x => ParseDependency(x.Trim().Trim('{', '}', ' ')));

@@ -42,6 +42,24 @@ public sealed class PublishingTests
         Assert.Equal("base", rules.Packages.Single().Requires.Single().Id.Value);
     }
     [Fact]
+    public void StripPrefixMapsAWholeSubtreeWithoutPerFileRules()
+    {
+        // The point of stripPrefix: one line relocates a subtree of any size. Expressing this
+        // with `rewrite` would need an entry per file, which for a 200k-file build is the
+        // unmaintainable configuration the layout convention exists to avoid.
+        Assert.Equal("data/strings.bin", SlicePaths.Strip("axis/lang/de/data/strings.bin", "axis/lang/de"));
+        Assert.Equal("data/strings.bin", SlicePaths.Strip("axis/lang/de/data/strings.bin", "axis/lang/de/"));
+        Assert.Equal("data/strings.bin", SlicePaths.Strip("data/strings.bin", null));
+
+        // A path outside the prefix is returned untouched rather than mangled, so a rule can
+        // carry a prefix and still match something else without silently corrupting it.
+        Assert.Equal("common/data/x.bin", SlicePaths.Strip("common/data/x.bin", "axis/lang/de"));
+
+        // A partial segment match is not a prefix match.
+        Assert.Equal("axis/lang/de-AT/x.bin", SlicePaths.Strip("axis/lang/de-AT/x.bin", "axis/lang/de"));
+    }
+
+    [Fact]
     public void SliceRulesRejectUnknownAndDuplicateKeys()
     {
         // Rejected rather than skipped: the format looks like YAML, so silently ignoring what
