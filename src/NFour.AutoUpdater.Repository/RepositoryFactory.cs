@@ -1,7 +1,9 @@
 namespace NFour.AutoUpdater.Repository;
 
+/// <summary>Loads and validates repository bootstrap metadata.</summary>
 public static class RepositoryFactory
 {
+    /// <summary>Loads a repository descriptor and negotiates effective transport capabilities.</summary>
     public static async ValueTask<(RepositoryDescriptor Descriptor, RepositoryLayout Layout)> LoadDescriptorAsync(IReadableObjectStore store, CancellationToken cancellationToken = default)
     {
         if (!StorageCapabilityNegotiation.IsConsistent(store)) throw new FormatException("The storage backend advertises capabilities inconsistent with its implemented interfaces.");

@@ -1,15 +1,27 @@
 namespace NFour.AutoUpdater.Repository;
 
+/// <summary>Contains a verified channel pointer and its exact signed envelope.</summary>
+/// <param name="Pointer">The verified channel pointer.</param><param name="Envelope">The parsed signed envelope.</param><param name="EnvelopeBytes">The exact envelope bytes.</param>
 public sealed record VerifiedChannel(ChannelPointer Pointer, SignedEnvelope Envelope, byte[] EnvelopeBytes);
+/// <summary>Contains a verified release and the signed documents that selected it.</summary>
+/// <param name="Lock">The verified release lock.</param><param name="Envelope">The parsed release envelope.</param><param name="EnvelopeBytes">The exact release-envelope bytes.</param><param name="Bundle">The optional verified release bundle.</param><param name="Pointer">The optional channel pointer that selected the release.</param><param name="PointerEnvelope">The optional channel-pointer envelope.</param>
 public sealed record VerifiedRelease(ReleaseLock Lock, SignedEnvelope Envelope, byte[] EnvelopeBytes, ReleaseBundle? Bundle, ChannelPointer? Pointer = null, SignedEnvelope? PointerEnvelope = null);
+/// <summary>Contains a verified key manifest and its exact signed envelope.</summary>
+/// <param name="Manifest">The verified key manifest.</param><param name="Envelope">The parsed signed envelope.</param><param name="EnvelopeBytes">The exact envelope bytes.</param>
 public sealed record VerifiedKeyManifest(KeyManifest Manifest, SignedEnvelope Envelope, byte[] EnvelopeBytes);
+/// <summary>Contains verified revocations and their exact signed envelope.</summary>
+/// <param name="Document">The verified revocation document.</param><param name="Envelope">The parsed signed envelope.</param><param name="EnvelopeBytes">The exact envelope bytes.</param>
 public sealed record VerifiedRevocations(RevocationDocument Document, SignedEnvelope Envelope, byte[] EnvelopeBytes);
 
+/// <summary>Reads repository control documents while enforcing signatures, identity, and rollback rules.</summary>
+/// <param name="store">The repository object store.</param><param name="descriptor">The validated repository descriptor.</param>
 public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescriptor descriptor)
 {
     private readonly RepositoryLayout _layout = new(descriptor.Layout);
+    /// <summary>Gets the repository descriptor used for validation.</summary>
     public RepositoryDescriptor Descriptor { get; } = descriptor;
 
+    /// <summary>Reads and verifies a channel pointer.</summary>
     public async ValueTask<VerifiedChannel> ReadChannelAsync(string productId, string channel, IReadOnlyDictionary<string, byte[]> trustedKeys, CancellationToken cancellationToken = default)
     {
         var bytes = await ReadRequiredAsync(_layout.Channel(productId, channel), cancellationToken).ConfigureAwait(false);
@@ -25,12 +37,15 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
         return new VerifiedChannel(pointer, envelope, bytes);
     }
 
+    /// <summary>Reads a channel pointer and the exact release it selects.</summary>
     public ValueTask<VerifiedRelease> ReadChannelReleaseAsync(string productId, string channel, IReadOnlyDictionary<string, byte[]> trustedKeys, CancellationToken cancellationToken = default)
         => ReadChannelReleaseCoreAsync(productId, channel, trustedKeys, cancellationToken);
 
+    /// <summary>Reads a key manifest while enforcing sequence and root continuity.</summary>
     public ValueTask<VerifiedKeyManifest> ReadKeyManifestAsync(IReadOnlyDictionary<string, byte[]> trustedKeys, long? previousSequence, string? pinnedRootKeyId, DateTimeOffset? now, CancellationToken cancellationToken = default)
         => ReadKeyManifestAsync(trustedKeys, previousSequence, null, pinnedRootKeyId, now, cancellationToken);
 
+    /// <summary>Reads a key manifest while allowing byte-identity validation of an unchanged sequence.</summary>
     public async ValueTask<VerifiedKeyManifest> ReadKeyManifestAsync(IReadOnlyDictionary<string, byte[]> trustedKeys, long? previousSequence = null, ContentHash? previousEnvelopeDigest = null, string? pinnedRootKeyId = null, DateTimeOffset? now = null, CancellationToken cancellationToken = default)
     {
         var bytes = await ReadRequiredAsync(_layout.KeyManifest(), cancellationToken).ConfigureAwait(false);
@@ -57,6 +72,7 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
         return new VerifiedKeyManifest(manifest, envelope, bytes);
     }
 
+    /// <summary>Reads optional release revocations while enforcing sequence and freshness.</summary>
     public async ValueTask<VerifiedRevocations?> ReadRevocationsAsync(string productId, IReadOnlyDictionary<string, byte[]> trustedKeys, long? previousSequence = null, ContentHash? previousEnvelopeDigest = null, CancellationToken cancellationToken = default, DateTimeOffset? now = null, TimeSpan? stalenessBound = null)
     {
         var result = await store.OpenAsync(_layout.Revocations(productId), cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -88,12 +104,15 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
         }
     }
 
+    /// <summary>Reads optional release revocations without an accepted-envelope digest.</summary>
     public ValueTask<VerifiedRevocations?> ReadRevocationsAsync(string productId, IReadOnlyDictionary<string, byte[]> trustedKeys, long? previousSequence, CancellationToken cancellationToken, DateTimeOffset? now = null, TimeSpan? stalenessBound = null)
         => ReadRevocationsAsync(productId, trustedKeys, previousSequence, null, cancellationToken, now, stalenessBound);
 
+    /// <summary>Reads and verifies a published release by identity.</summary>
     public ValueTask<VerifiedRelease> ReadReleaseAsync(string productId, string releaseId, IReadOnlyDictionary<string, byte[]> trustedKeys, CancellationToken cancellationToken)
         => ReadReleaseAsync(productId, releaseId, trustedKeys, null, cancellationToken);
 
+    /// <summary>Reads and verifies a published release against an optional expected envelope digest.</summary>
     public async ValueTask<VerifiedRelease> ReadReleaseAsync(string productId, string releaseId, IReadOnlyDictionary<string, byte[]> trustedKeys, ContentHash? expectedEnvelopeDigest = null, CancellationToken cancellationToken = default)
     {
         var bytes = await ReadRequiredAsync(_layout.Release(productId, releaseId), cancellationToken).ConfigureAwait(false);

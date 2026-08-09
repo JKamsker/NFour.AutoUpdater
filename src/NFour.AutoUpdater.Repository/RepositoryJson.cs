@@ -1,11 +1,15 @@
 namespace NFour.AutoUpdater.Repository;
 
+/// <summary>Serializes and validates canonical repository JSON documents.</summary>
 public static class RepositoryJson
 {
+    /// <summary>Gets the canonical repository serializer settings.</summary>
     public static readonly JsonSerializerOptions Options = CreateOptions();
 
+    /// <summary>Serializes a repository value to UTF-8 JSON.</summary>
     public static byte[] Serialize<T>(T value) => JsonSerializer.SerializeToUtf8Bytes(value, Options);
 
+    /// <summary>Validates and deserializes UTF-8 repository JSON.</summary>
     public static T Deserialize<T>(ReadOnlySpan<byte> bytes, bool rejectUnknownFields = false)
     {
         JsonSafety.Validate(bytes);
@@ -13,6 +17,7 @@ public static class RepositoryJson
         return JsonSerializer.Deserialize<T>(bytes, options) ?? throw new FormatException("JSON document is empty.");
     }
 
+    /// <summary>Validates and deserializes a package manifest.</summary>
     public static PackageManifest DeserializeManifest(ReadOnlySpan<byte> bytes)
     {
         var dto = Deserialize<PackageManifestDocument>(bytes, rejectUnknownFields: true);
@@ -58,6 +63,7 @@ public static class RepositoryJson
         };
     }
 
+    /// <summary>Serializes a package manifest using its wire-format version representation.</summary>
     public static byte[] SerializeManifest(PackageManifest value)
     {
         var dto = new PackageManifestDocument
@@ -101,8 +107,10 @@ public static class RepositoryJson
     private sealed record ShardDocument { public required int Index { get; init; } public required string Digest { get; init; } public required int Count { get; init; } public required long Size { get; init; } }
 }
 
+/// <summary>Validates repository JSON safety and canonical-value constraints.</summary>
 public static class JsonSafety
 {
+    /// <summary>Rejects duplicate properties, nulls, non-integer numbers, and trailing data.</summary>
     public static void Validate(ReadOnlySpan<byte> bytes)
     {
         var reader = new Utf8JsonReader(bytes, new JsonReaderOptions { CommentHandling = JsonCommentHandling.Disallow, AllowTrailingCommas = false });

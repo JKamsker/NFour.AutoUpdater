@@ -2,10 +2,14 @@ using System.Security.Cryptography;
 
 namespace NFour.AutoUpdater.Repository;
 
+/// <summary>Reports the outcome of a repository mirror operation.</summary>
+/// <param name="Copied">The number of copied or refreshed objects.</param><param name="Deleted">The number of destination orphans deleted.</param><param name="Diagnostics">Mirror diagnostics.</param>
 public sealed record MirrorResult(int Copied, int Deleted, ImmutableArray<Diagnostic> Diagnostics);
 
+/// <summary>Mirrors verified repository objects between storage backends.</summary>
 public sealed class MirrorService
 {
+    /// <summary>Copies a complete repository or one channel closure to a destination.</summary>
     public async ValueTask<MirrorResult> MirrorAsync(IListableObjectStore source, IWritableObjectStore destination, bool deleteOrphans = false, string? channel = null, CancellationToken cancellationToken = default)
     {
         if (channel is not null && !Identifier.IsValid(channel, "channel", out var channelError)) throw new FormatException(channelError);

@@ -1,16 +1,25 @@
 namespace NFour.AutoUpdater.Repository;
 
+/// <summary>Configures conservative repository garbage collection.</summary>
 public sealed record GarbageCollectionOptions
 {
+    /// <summary>Gets the minimum age before an unreferenced blob is eligible.</summary>
     public TimeSpan MinimumBlobAge { get; init; } = TimeSpan.FromHours(24);
+    /// <summary>Gets whether collection reports actions without changing storage.</summary>
     public bool DryRun { get; init; }
+    /// <summary>Gets whether abandoned staging objects are included.</summary>
     public bool IncludeStaging { get; init; }
+    /// <summary>Gets the object-key prefix used for recoverable quarantine copies.</summary>
     public string QuarantinePrefix { get; init; } = "_trash";
 }
+/// <summary>Reports marked, quarantined, and deleted repository objects.</summary>
+/// <param name="Marked">Objects retained by the live set.</param><param name="Quarantined">Recoverable copies created before deletion.</param><param name="Deleted">Source objects deleted or selected by a dry run.</param><param name="Diagnostics">Collection diagnostics.</param>
 public sealed record GarbageCollectionResult(ImmutableArray<ObjectKey> Marked, ImmutableArray<ObjectKey> Quarantined, ImmutableArray<ObjectKey> Deleted, ImmutableArray<Diagnostic> Diagnostics);
 
+/// <summary>Marks live release content and quarantines aged unreferenced objects.</summary>
 public sealed class GarbageCollector
 {
+    /// <summary>Computes a live set from releases and collects objects outside it.</summary>
     public async ValueTask<GarbageCollectionResult> CollectLiveAsync(IListableObjectStore store, RepositoryLayout layout, IEnumerable<ReleaseLock> liveReleases, IPackageRepository repository, GarbageCollectionOptions? options = null, TimeProvider? timeProvider = null, CancellationToken cancellationToken = default)
     {
         var live = ImmutableHashSet.CreateBuilder<ContentHash>();
@@ -19,6 +28,7 @@ public sealed class GarbageCollector
         return await CollectAsync(store, layout, live, options, timeProvider, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Collects objects outside an explicitly supplied live content-hash set.</summary>
     public async ValueTask<GarbageCollectionResult> CollectAsync(IListableObjectStore store, RepositoryLayout layout, IEnumerable<ContentHash> liveHashes, GarbageCollectionOptions? options = null, TimeProvider? timeProvider = null, CancellationToken cancellationToken = default)
     {
         options ??= new(); timeProvider ??= TimeProvider.System;
@@ -63,6 +73,7 @@ public sealed class GarbageCollector
         return new GarbageCollectionResult(marked.ToImmutableArray(), quarantined.ToImmutable(), deleted.ToImmutable(), diagnostics.ToImmutable());
     }
 
+    /// <summary>Marks content referenced by a release and supplied package data.</summary>
     public static ImmutableHashSet<ContentHash> MarkRelease(ReleaseLock release, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<PackageId, IEnumerable<PackageFileEntry>>? fileEntries = null, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes = null)
     {
         var marked = ImmutableHashSet.CreateBuilder<ContentHash>();
@@ -84,6 +95,7 @@ public sealed class GarbageCollector
         return marked.ToImmutable();
     }
 
+    /// <summary>Reads and verifies package data to mark all content referenced by a release.</summary>
     public static async ValueTask<ImmutableHashSet<ContentHash>> MarkReleaseAsync(ReleaseLock release, IPackageRepository repository, CancellationToken cancellationToken = default)
     {
         var marked = ImmutableHashSet.CreateBuilder<ContentHash>();

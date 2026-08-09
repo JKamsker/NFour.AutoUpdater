@@ -10,9 +10,11 @@ namespace NFour.AutoUpdater.Repository;
 public sealed class StaticProjectionWriter(IWritableObjectStore store, RepositoryLayout layout)
 {
     private const int ProjectionPageSize = 1000;
+    /// <summary>Writes the derived repository descriptor.</summary>
     public ValueTask WriteRepositoryDescriptorAsync(RepositoryDescriptor descriptor, CancellationToken cancellationToken = default)
         => WriteDerivedAsync(new ObjectKey("repo.json"), RepositoryJson.Serialize(descriptor), cancellationToken);
 
+    /// <summary>Writes derived product metadata.</summary>
     public ValueTask WriteProductAsync(ProductDescriptor product, CancellationToken cancellationToken = default)
     {
         if (!Identifier.IsValid(product.ProductId, 128)) throw new FormatException("Product id must be a valid lowercase ASCII segment.");
@@ -20,9 +22,11 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
         return WriteDerivedAsync(layout.Product(product.ProductId), RepositoryJson.Serialize(product), cancellationToken);
     }
 
+    /// <summary>Writes paged package indexes from canonical manifest serialization.</summary>
     public ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
         => WritePackageIndexAsync(packageId, manifests, exactManifestBytes: null, cancellationToken);
 
+    /// <summary>Writes paged package indexes using exact manifest bytes when supplied.</summary>
     public async ValueTask WritePackageIndexAsync(PackageId packageId, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
     {
         var versions = manifests
@@ -49,6 +53,7 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
         await DeleteStalePagesAsync(page => layout.PackageIndex(packageId, page), pages.Length, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Writes paged published-release indexes.</summary>
     public async ValueTask WriteReleaseIndexAsync(string productId, IEnumerable<(ReleaseLock Lock, byte[] EnvelopeBytes)> releases, CancellationToken cancellationToken = default)
     {
         var rows = releases
@@ -74,9 +79,11 @@ public sealed class StaticProjectionWriter(IWritableObjectStore store, Repositor
         await DeleteStalePagesAsync(page => layout.ReleaseIndex(productId, page), pages.Length, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Writes a release bundle from canonical manifest serialization.</summary>
     public ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, CancellationToken cancellationToken = default)
         => WriteReleaseBundleAsync(productId, releaseId, lockEnvelopeBytes, manifests, exactManifestBytes: null, cancellationToken);
 
+    /// <summary>Writes a release bundle preserving supplied exact manifest bytes.</summary>
     public async ValueTask WriteReleaseBundleAsync(string productId, string releaseId, ReadOnlyMemory<byte> lockEnvelopeBytes, IEnumerable<PackageManifest> manifests, IReadOnlyDictionary<ManifestKey, byte[]>? exactManifestBytes, CancellationToken cancellationToken = default)
     {
         var envelope = SignedDocument.DeserializeEnvelope(lockEnvelopeBytes.Span);

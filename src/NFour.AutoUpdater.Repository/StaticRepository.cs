@@ -2,25 +2,32 @@ using System.IO.Hashing;
 
 namespace NFour.AutoUpdater.Repository;
 
+/// <summary>Reads immutable package manifests and file tables from a static object repository.</summary>
 public sealed class StaticRepository : IPackageRepository, IManifestDigestRepository, IExactManifestRepository, IAsyncDisposable
 {
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private readonly IReadableObjectStore _store;
+    /// <summary>Initializes a repository over a readable object store.</summary>
     public StaticRepository(IReadableObjectStore store, RepositoryDescriptor descriptor)
     {
         _store = store;
         Descriptor = descriptor;
         Layout = new RepositoryLayout(descriptor.Layout);
     }
+    /// <summary>Gets the repository descriptor.</summary>
     public RepositoryDescriptor Descriptor { get; }
+    /// <summary>Gets the validated object-key layout.</summary>
     public RepositoryLayout Layout { get; }
 
+    /// <inheritdoc />
     public async ValueTask<PackageManifest?> GetManifestAsync(PackageId id, PackageVersion version, CancellationToken cancellationToken = default)
         => await GetManifestCoreAsync(id, version, null, cancellationToken).ConfigureAwait(false);
 
+    /// <inheritdoc />
     public async ValueTask<PackageManifest?> GetManifestAsync(PackageId id, PackageVersion version, ContentHash expectedDigest, CancellationToken cancellationToken = default)
         => await GetManifestCoreAsync(id, version, expectedDigest, cancellationToken).ConfigureAwait(false);
 
+    /// <inheritdoc />
     public async ValueTask<byte[]?> GetManifestBytesAsync(PackageId id, PackageVersion version, CancellationToken cancellationToken = default)
     {
         var result = await _store.OpenAsync(Layout.Package(id, version), cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -51,6 +58,7 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
         }
     }
 
+    /// <inheritdoc />
     public async IAsyncEnumerable<PackageFileEntry> ReadFileTableAsync(PackageManifest manifest, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (!string.Equals(manifest.FileTable.Format, "jsonl/v1", StringComparison.Ordinal)) throw new FormatException($"Unsupported file table format '{manifest.FileTable.Format}'.");
@@ -115,6 +123,7 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
         if (totalCount != manifest.FileCount) throw new InvalidDataException("File-table entry count does not match the manifest.");
     }
 
+    /// <inheritdoc />
     public ValueTask DisposeAsync() => _store.DisposeAsync();
 
     /// <summary>Largest single file-table row this reader will materialise.</summary>
@@ -159,14 +168,17 @@ public sealed class StaticRepository : IPackageRepository, IManifestDigestReposi
     }
 }
 
+/// <summary>Assigns virtual paths to deterministic file-table shards.</summary>
 public static class FileTableSharding
 {
+    /// <summary>Gets the shard index for a path.</summary>
     public static int GetShardIndex(VirtualPath path, int shardCount)
     {
         if (shardCount < 1 || (shardCount & (shardCount - 1)) != 0) throw new ArgumentOutOfRangeException(nameof(shardCount));
         var hash = XxHash3.HashToUInt64(Encoding.UTF8.GetBytes(path.Value));
         return unchecked((int)(hash & (uint)(shardCount - 1)));
     }
+    /// <summary>Computes the digest covering an ordered set of shard descriptors.</summary>
     public static ContentHash ComputeTableDigest(IEnumerable<FileTableShardRef> shards)
     {
         using var stream = new MemoryStream();
