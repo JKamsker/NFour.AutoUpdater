@@ -23,14 +23,25 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
     private readonly Uri _baseUri;
     private readonly NetworkCredential _credentials;
     private readonly bool _enableSsl;
+    private readonly bool _allowUntrustedCertificateForTesting;
 
     public FtpObjectStore(Uri baseUri, NetworkCredential credentials, bool enableSsl = true)
+        : this(baseUri, credentials, enableSsl, allowUntrustedCertificateForTesting: false)
+    {
+    }
+
+    internal FtpObjectStore(
+        Uri baseUri,
+        NetworkCredential credentials,
+        bool enableSsl,
+        bool allowUntrustedCertificateForTesting)
     {
         if (!baseUri.IsAbsoluteUri || baseUri.Scheme is not (FtpScheme or FtpsScheme))
             throw new ArgumentException("FTP store requires an absolute ftp or ftps URI.", nameof(baseUri));
         _baseUri = baseUri;
         _credentials = credentials;
         _enableSsl = enableSsl;
+        _allowUntrustedCertificateForTesting = allowUntrustedCertificateForTesting;
     }
 
     // FTP has no conditional write or server-side copy primitive.  Rename is
@@ -175,7 +186,8 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         {
             EncryptionMode = _enableSsl ? FtpEncryptionMode.Explicit : FtpEncryptionMode.None,
             DataConnectionEncryption = _enableSsl,
-            RetryAttempts = DisabledRetryCount
+            RetryAttempts = DisabledRetryCount,
+            ValidateAnyCertificate = _allowUntrustedCertificateForTesting
         };
         var client = new AsyncFtpClient(_baseUri.Host, _credentials, _baseUri.Port > 0 ? _baseUri.Port : DefaultControlPort, config);
         try

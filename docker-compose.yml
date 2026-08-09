@@ -48,6 +48,26 @@ services:
       - ./tests/fixtures/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./tests/fixtures/http:/usr/share/nginx/html:ro
 
+  ftp-tls-init:
+    image: postgres:16
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        set -eu;
+        umask 077;
+        openssl req -x509 -newkey "rsa:$${FTP_TLS_RSA_KEY_BITS}" -sha256 -nodes
+        -days "$${FTP_TLS_CERTIFICATE_VALIDITY_DAYS}"
+        -subj "/CN=$${FTP_TLS_CERTIFICATE_COMMON_NAME}"
+        -addext "subjectAltName=IP:$${FTP_TLS_CERTIFICATE_COMMON_NAME}"
+        -keyout /tls/server.key -out /tls/server.crt
+    environment:
+      FTP_TLS_RSA_KEY_BITS: 2048
+      FTP_TLS_CERTIFICATE_VALIDITY_DAYS: 2
+      FTP_TLS_CERTIFICATE_COMMON_NAME: 127.0.0.1
+    volumes:
+      - ftp-tls:/tls
+
   vsftpd:
     image: fauria/vsftpd@sha256:6d71d7c7f1b0ab2844ec7dc7999a30aef6d758b6d8179cf5967513f87c79c177
     entrypoint:
@@ -56,7 +76,11 @@ services:
       - >-
         mkdir -p /home/vsftpd/4sup-test &&
         cp -a /seed/. /home/vsftpd/4sup-test/ &&
+        cat /fixture-config/vsftpd-tls.conf >> /etc/vsftpd/vsftpd.conf &&
         exec /usr/sbin/run-vsftpd.sh
+    depends_on:
+      ftp-tls-init:
+        condition: service_completed_successfully
     environment:
       FTP_USER: 4sup-test
       FTP_PASS: 4sup-test-password
@@ -69,8 +93,11 @@ services:
       - "21100-21110:21100-21110"
     volumes:
       - ftp-data:/home/vsftpd
+      - ftp-tls:/tls:ro
       - ./tests/fixtures/ftp-user:/seed:ro
+      - ./tests/fixtures/vsftpd-tls.conf:/fixture-config/vsftpd-tls.conf:ro
 
 volumes:
   minio-data:
   ftp-data:
+  ftp-tls:

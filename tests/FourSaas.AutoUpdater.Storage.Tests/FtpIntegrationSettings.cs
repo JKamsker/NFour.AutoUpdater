@@ -12,13 +12,14 @@ internal static class FtpIntegrationSettings
     public const string PasswordEnvironmentVariable = "FOURSUP_FTP_PASSWORD";
     public const string FixtureObjectKey = "blob";
 
-    public static FtpObjectStore CreateStore()
+    public static FtpObjectStore CreateStore(bool enableSsl = false)
         => new(
             new Uri(GetRequiredEnvironmentVariable(ServerUriEnvironmentVariable)),
             new NetworkCredential(
                 GetRequiredEnvironmentVariable(UserEnvironmentVariable),
                 GetRequiredEnvironmentVariable(PasswordEnvironmentVariable)),
-            enableSsl: false);
+            enableSsl,
+            allowUntrustedCertificateForTesting: enableSsl);
 
     public static byte[] ReadExpectedFixtureBytes()
         => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "fixtures", "ftp", "blob"));

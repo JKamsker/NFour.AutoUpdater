@@ -7,12 +7,14 @@ public sealed class FtpLifecycleTests
 {
     private const int CancellationProbeBufferLength = 1;
 
-    [Fact]
-    public async Task ReadRemainsUsableAfterOpenReturns()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReadRemainsUsableAfterOpenReturns(bool enableSsl)
     {
         SkipUnlessEnabled();
 
-        await using var store = FtpIntegrationSettings.CreateStore();
+        await using var store = FtpIntegrationSettings.CreateStore(enableSsl);
 
         var read = await store.OpenAsync(new ObjectKey(FtpIntegrationSettings.FixtureObjectKey));
         Assert.NotNull(read);
@@ -25,12 +27,14 @@ public sealed class FtpLifecycleTests
         }
     }
 
-    [Fact]
-    public async Task ReadHonorsCallerCancellation()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReadHonorsCallerCancellation(bool enableSsl)
     {
         SkipUnlessEnabled();
 
-        await using var store = FtpIntegrationSettings.CreateStore();
+        await using var store = FtpIntegrationSettings.CreateStore(enableSsl);
         var read = await store.OpenAsync(new ObjectKey(FtpIntegrationSettings.FixtureObjectKey));
         Assert.NotNull(read);
         await using (read!)
