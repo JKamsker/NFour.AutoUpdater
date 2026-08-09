@@ -61,6 +61,7 @@ jobs:
           ftp_published_port="${ftp_endpoint##*:}"
           ftp_user="$(docker compose exec -T vsftpd printenv FTP_USER | tr -d '\r')"
           ftp_password="$(docker compose exec -T vsftpd printenv FTP_PASS | tr -d '\r')"
+          printf '::add-mask::%s\n' "$ftp_user" "$ftp_password"
           printf 'FOURSUP_FTP_URI=ftp://127.0.0.1:%s/\n' "$ftp_published_port" >> "$GITHUB_ENV"
           printf 'FOURSUP_FTP_USER=%s\n' "$ftp_user" >> "$GITHUB_ENV"
           printf 'FOURSUP_FTP_PASSWORD=%s\n' "$ftp_password" >> "$GITHUB_ENV"
@@ -69,6 +70,7 @@ jobs:
           minio_published_port="${minio_endpoint##*:}"
           minio_access_key="$(docker compose exec -T minio printenv MINIO_ROOT_USER | tr -d '\r')"
           minio_secret_key="$(docker compose exec -T minio printenv MINIO_ROOT_PASSWORD | tr -d '\r')"
+          printf '::add-mask::%s\n' "$minio_access_key" "$minio_secret_key"
           printf 'FOURSUP_MINIO_URI=http://127.0.0.1:%s\n' "$minio_published_port" >> "$GITHUB_ENV"
           printf 'FOURSUP_MINIO_ACCESS_KEY=%s\n' "$minio_access_key" >> "$GITHUB_ENV"
           printf 'FOURSUP_MINIO_SECRET_KEY=%s\n' "$minio_secret_key" >> "$GITHUB_ENV"
@@ -82,6 +84,7 @@ jobs:
           postgres_database="$(docker compose exec -T postgres printenv POSTGRES_DB | tr -d '\r')"
           postgres_user="$(docker compose exec -T postgres printenv POSTGRES_USER | tr -d '\r')"
           postgres_password="$(docker compose exec -T postgres printenv POSTGRES_PASSWORD | tr -d '\r')"
+          printf '::add-mask::%s\n' "$postgres_database" "$postgres_user" "$postgres_password"
           printf 'FOURSUP_DATABASE=Host=127.0.0.1;Port=%s;Database=%s;Username=%s;Password=%s\n' "$postgres_published_port" "$postgres_database" "$postgres_user" "$postgres_password" >> "$GITHUB_ENV"
       - name: Test (all backends enabled)
         env:

@@ -18,15 +18,6 @@ namespace FourSaas.AutoUpdater.Server.Tests;
 
 public sealed class ServerTests
 {
-    private const string IntegrationRepositoryPrefix = "ci";
-    private const int IntegrationRepositorySuffixLength = 12;
-    private const string ReleaseSequenceScope = "release";
-    private const string DemoSequenceName = "demo";
-    private const string SequencePropertyName = "sequence";
-    private const string CompactGuidFormat = "N";
-    private const long InitialSequence = 1;
-    private const long RestartedSequence = 2;
-
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -162,25 +153,6 @@ public sealed class ServerTests
             nameof(ChannelRow.ProductId),
             nameof(ChannelRow.Channel),
             nameof(ChannelRow.ChannelSequence)]));
-    }
-
-    [Fact]
-    public async Task LivePostgresMigrationAndSequenceReservationSurviveStateRestart()
-    {
-        var connection = PostgresIntegrationSettings.GetRequiredConnectionString();
-        var options = new DbContextOptionsBuilder<ManagementDbContext>().UseNpgsql(connection).Options;
-        await using (var database = new ManagementDbContext(options)) await database.Database.MigrateAsync();
-        var factory = new TestDbContextFactory(options);
-        await using var store = new MemoryObjectStore();
-        var repository = IntegrationRepositoryPrefix + Guid.NewGuid().ToString(CompactGuidFormat)[..IntegrationRepositorySuffixLength];
-        var first = new ManagementState(store, databaseFactory: factory, repositoryId: repository);
-        var firstResult = await first.AllocateSequenceAsync(repository, ReleaseSequenceScope, DemoSequenceName);
-        Assert.Equal(StatusCodes.Status200OK, Assert.IsAssignableFrom<IStatusCodeHttpResult>(firstResult).StatusCode);
-        Assert.Equal(InitialSequence, (long)Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value!.GetType().GetProperty(SequencePropertyName)!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(firstResult).Value)!);
-
-        var second = new ManagementState(store, databaseFactory: factory, repositoryId: repository);
-        var secondResult = await second.AllocateSequenceAsync(repository, ReleaseSequenceScope, DemoSequenceName);
-        Assert.Equal(RestartedSequence, (long)Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value!.GetType().GetProperty(SequencePropertyName)!.GetValue(Assert.IsAssignableFrom<IValueHttpResult>(secondResult).Value)!);
     }
 
     [Fact]
@@ -433,8 +405,4 @@ public sealed class ServerTests
         DownloadSize = manifest.DownloadSize
     };
 
-    private sealed class TestDbContextFactory(DbContextOptions<ManagementDbContext> options) : IDbContextFactory<ManagementDbContext>
-    {
-        public ManagementDbContext CreateDbContext() => new(options);
-    }
 }

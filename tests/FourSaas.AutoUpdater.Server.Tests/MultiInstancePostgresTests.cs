@@ -11,6 +11,7 @@ using System.Text.Json;
 
 namespace FourSaas.AutoUpdater.Server.Tests;
 
+[Collection(PostgresIntegrationCollection.Name)]
 public sealed class MultiInstancePostgresTests
 {
     private const string RepositoryPrefix = "multi";
