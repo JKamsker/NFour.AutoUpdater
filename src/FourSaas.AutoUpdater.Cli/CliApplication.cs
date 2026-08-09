@@ -69,6 +69,8 @@ public static class CliApplication
                 return await InstallWorkflowAsync(args.Skip(1).ToArray(), apply: true, command: args[0]).ConfigureAwait(false);
             case "pkg":
                 return await PackageCommandAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
+            case SliceLintCommand.CommandName:
+                return await SliceLintCommand.RunAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
             case "release":
                 return await ReleaseCommandAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
             case "channel":
@@ -91,7 +93,7 @@ public static class CliApplication
         }
     }
 
-    private static void PrintHelp() => Console.WriteLine("4sup — content-addressed variant updater\n\nCommands: install, update, switch, rollback, plan, status, verify, explain, pkg, release, channel, gc, mirror, prune, verify-repo, config, daemon\n\nPackage helpers: pkg schema prints the slice authoring JSON Schema.\n\nTrust: first-party installs use the compiled root; self-hosted first install requires --trust-on-first-use with --trusted-key.\n\nDevelopment helpers: parse-address <address>, select --select=axis=value, verify-path <path>\n\nExit codes: 0 success, 1 validation, 2 usage, 3 backend, 4 precondition, 5 integrity, 6 concurrency, 7 cancelled.");
+    private static void PrintHelp() => Console.WriteLine("4sup — content-addressed variant updater\n\nCommands: install, update, switch, rollback, plan, status, verify, explain, pkg, slice, release, channel, gc, mirror, prune, verify-repo, config, daemon\n\nBuild layout: slice lint [build-root] [--axis <name>] [--warnings-as-errors] checks LAY001–LAY004.\n\nPackage helpers: pkg schema prints the slice authoring JSON Schema.\n\nTrust: first-party installs use the compiled root; self-hosted first install requires --trust-on-first-use with --trusted-key.\n\nDevelopment helpers: parse-address <address>, select --select=axis=value, verify-path <path>\n\nExit codes: 0 success, 1 validation, 2 usage, 3 backend, 4 precondition, 5 integrity, 6 concurrency, 7 cancelled.");
 
     private static async ValueTask<int> ConfigurationCommandAsync(string[] args)
     {

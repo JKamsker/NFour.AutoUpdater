@@ -96,6 +96,18 @@ If `lang/de` provides `data/credits.bin` and `lang/en` does not, that is usually
 did not run, and it ships a variant silently short a file. A warning rather than an error
 because a genuinely language-specific asset is legitimate.
 
+### Build invocation
+
+Run the checks directly from CI or the build with:
+
+```sh
+4sup slice lint <build-output> --axis lang --axis ui
+```
+
+Repeat `--axis` for every axis declared by the release. Omitting the build-output path checks
+the current directory. Errors return exit code 1; LAY004 remains a warning unless the build
+also passes `--warnings-as-errors`.
+
 ---
 
 ## 4. Generated slice rules
