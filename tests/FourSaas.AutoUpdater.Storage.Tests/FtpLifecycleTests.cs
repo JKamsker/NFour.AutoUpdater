@@ -13,6 +13,7 @@ public sealed class FtpLifecycleTests
     public async Task ReadRemainsUsableAfterOpenReturns(bool enableSsl)
     {
         SkipUnlessEnabled();
+        await using var fixtureLease = await FtpIntegrationSettings.AcquireFixtureAsync();
 
         await using var store = FtpIntegrationSettings.CreateStore(enableSsl);
 
@@ -33,6 +34,7 @@ public sealed class FtpLifecycleTests
     public async Task ReadHonorsCallerCancellation(bool enableSsl)
     {
         SkipUnlessEnabled();
+        await using var fixtureLease = await FtpIntegrationSettings.AcquireFixtureAsync();
 
         await using var store = FtpIntegrationSettings.CreateStore(enableSsl);
         var read = await store.OpenAsync(new ObjectKey(FtpIntegrationSettings.FixtureObjectKey));
@@ -51,6 +53,7 @@ public sealed class FtpLifecycleTests
     public async Task ServerWithoutMachineReadableListingsFailsClosed()
     {
         SkipUnlessEnabled();
+        await using var fixtureLease = await FtpIntegrationSettings.AcquireFixtureAsync();
 
         await using var store = FtpIntegrationSettings.CreateStore();
         var head = await store.HeadAsync(new ObjectKey(FtpIntegrationSettings.FixtureObjectKey));
