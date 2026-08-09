@@ -14,11 +14,12 @@ namespace NFour.AutoUpdater.Core;
 /// </summary>
 public static class CompiledTrustRoots
 {
-    /// The development anchor, used by the build guard and by the test that inspects the
-    /// shipped assembly.
+    /// <summary>Gets the identifier of the non-production development trust anchor.</summary>
     public const string DevelopmentKeyId = "4s-dev-0000";
+    /// <summary>Gets the encoded public key of the non-production development trust anchor.</summary>
     public const string DevelopmentPublicKey = "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg";
 
+    /// <summary>Gets the identifier of the trust anchor compiled into this assembly.</summary>
     public const string FirstPartyKeyId = TrustRootBuildConfiguration.KeyId;
     private const string FirstPartyPublicKey = TrustRootBuildConfiguration.PublicKey;
 
@@ -27,6 +28,7 @@ public static class CompiledTrustRoots
         => string.Equals(FirstPartyKeyId, DevelopmentKeyId, StringComparison.Ordinal)
         || string.Equals(FirstPartyPublicKey, DevelopmentPublicKey, StringComparison.Ordinal);
 
+    /// <summary>Gets the compiled bootstrap verification keys keyed by identifier.</summary>
     public static IReadOnlyDictionary<string, byte[]> FirstParty
         => new Dictionary<string, byte[]>(StringComparer.Ordinal)
         {

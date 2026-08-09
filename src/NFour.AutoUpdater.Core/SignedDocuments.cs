@@ -3,34 +3,68 @@ using Org.BouncyCastle.Crypto.Signers;
 
 namespace NFour.AutoUpdater.Core;
 
+/// <summary>Describes one detached signature attached to a signed envelope.</summary>
 public sealed record SignedSignature
 {
+    /// <summary>Gets the signing-key identifier.</summary>
     public required string KeyId { get; init; }
+    /// <summary>Gets the signature algorithm identifier.</summary>
     public required string Algorithm { get; init; }
+    /// <summary>Gets the base64url-encoded signature bytes.</summary>
     public required string Signature { get; init; }
 }
-
+/// <summary>Contains typed payload bytes and one or more detached signatures.</summary>
 public sealed record SignedEnvelope
 {
+    /// <summary>Gets the envelope format version.</summary>
     public required int Envelope { get; init; }
+    /// <summary>Gets the signed document type.</summary>
     public required string Type { get; init; }
+    /// <summary>Gets the base64url-encoded exact payload bytes.</summary>
     public required string Payload { get; init; }
+    /// <summary>Gets the signatures over the payload.</summary>
     public required ImmutableArray<SignedSignature> Signatures { get; init; }
 }
 
+/// <summary>Contains an Ed25519 verification key and its optional validity window.</summary>
+/// <param name="PublicKey">The public verification-key bytes.</param>
+/// <param name="NotBefore">The beginning of the validity window.</param>
+/// <param name="NotAfter">The end of the validity window.</param>
 public sealed record VerificationKey(byte[] PublicKey, DateTimeOffset? NotBefore = null, DateTimeOffset? NotAfter = null)
 {
-    public bool IsValidAt(DateTimeOffset now) => PublicKey.Length == 32 && (NotBefore is null || now >= NotBefore) && (NotAfter is null || now <= NotAfter);
+    private const int Ed25519PublicKeyLength = 32;
+
+    /// <summary>Determines whether the key is well formed and valid at a time.</summary>
+    /// <param name="now">The evaluation time.</param>
+    /// <returns><see langword="true"/> when the key may verify a document at that time.</returns>
+    public bool IsValidAt(DateTimeOffset now) => PublicKey.Length == Ed25519PublicKeyLength && (NotBefore is null || now >= NotBefore) && (NotAfter is null || now <= NotAfter);
 }
 
+/// <summary>Creates, verifies, and serializes signed updater control documents.</summary>
 public static class SignedDocument
 {
+    private const int CurrentEnvelopeVersion = 1;
+    private const int Ed25519PublicKeyLength = 32;
+    private const string Ed25519Algorithm = "ed25519";
+    private const string SigningDomainPrefix = "4sup-v1\0";
+
+    /// <summary>Gets the canonical serializer settings used for signed documents.</summary>
     public static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
     private static readonly ImmutableHashSet<string> KnownTypes = ["channel-pointer", "release-lock", "key-manifest", "revocation"];
 
+    /// <summary>Builds the domain-separated bytes covered by a document signature.</summary>
+    /// <param name="type">The signed document type.</param>
+    /// <param name="payload">The exact payload bytes.</param>
+    /// <returns>The bytes passed to the signature algorithm.</returns>
     public static byte[] SigningInput(string type, ReadOnlySpan<byte> payload) =>
-        Encoding.UTF8.GetBytes("4sup-v1\0" + type + "\0").Concat(payload.ToArray()).ToArray();
+        Encoding.UTF8.GetBytes(SigningDomainPrefix + type + "\0").Concat(payload.ToArray()).ToArray();
 
+    /// <summary>Signs exact payload bytes and creates a versioned envelope.</summary>
+    /// <param name="type">The registered document type.</param>
+    /// <param name="payload">The exact payload bytes.</param>
+    /// <param name="keyId">The signing-key identifier.</param>
+    /// <param name="privateKey">The Ed25519 private-key bytes.</param>
+    /// <returns>The signed envelope.</returns>
     public static SignedEnvelope Sign(string type, ReadOnlySpan<byte> payload, string keyId, ReadOnlySpan<byte> privateKey)
     {
         if (!KnownTypes.Contains(type)) throw new ArgumentException($"Unknown signed document type '{type}'.", nameof(type));
@@ -39,21 +73,27 @@ public static class SignedDocument
         var input = SigningInput(type, payload);
         signer.BlockUpdate(input, 0, input.Length);
         var signature = signer.GenerateSignature();
-        return new SignedEnvelope { Envelope = 1, Type = type, Payload = Base64Url.Encode(payload), Signatures = [new SignedSignature { KeyId = keyId, Algorithm = "ed25519", Signature = Base64Url.Encode(signature) }] };
+        return new SignedEnvelope { Envelope = CurrentEnvelopeVersion, Type = type, Payload = Base64Url.Encode(payload), Signatures = [new SignedSignature { KeyId = keyId, Algorithm = Ed25519Algorithm, Signature = Base64Url.Encode(signature) }] };
     }
 
+    /// <summary>Verifies an envelope against raw trusted Ed25519 keys.</summary>
+    /// <param name="envelope">The envelope to verify.</param>
+    /// <param name="trustedKeys">Trusted public keys keyed by identifier.</param>
+    /// <param name="payload">Receives the verified exact payload bytes.</param>
+    /// <param name="error">Receives the rejection reason.</param>
+    /// <returns><see langword="true"/> when a trusted signature and the payload are valid.</returns>
     public static bool Verify(SignedEnvelope envelope, IReadOnlyDictionary<string, byte[]> trustedKeys, out byte[] payload, out string? error)
     {
         payload = [];
         error = null;
-        if (envelope.Envelope != 1) { error = "Unknown signed-envelope version."; return false; }
+        if (envelope.Envelope != CurrentEnvelopeVersion) { error = "Unknown signed-envelope version."; return false; }
         if (!KnownTypes.Contains(envelope.Type)) { error = "Unknown signed-envelope type."; return false; }
         try { payload = Base64Url.Decode(envelope.Payload); }
         catch (FormatException ex) { error = ex.Message; return false; }
         var input = SigningInput(envelope.Type, payload);
         foreach (var signature in envelope.Signatures)
         {
-            if (!string.Equals(signature.Algorithm, "ed25519", StringComparison.Ordinal) || !trustedKeys.TryGetValue(signature.KeyId, out var publicKey)) continue;
+            if (!string.Equals(signature.Algorithm, Ed25519Algorithm, StringComparison.Ordinal) || !trustedKeys.TryGetValue(signature.KeyId, out var publicKey)) continue;
             byte[] bytes;
             try { bytes = Base64Url.Decode(signature.Signature); } catch (FormatException) { continue; }
             var verifier = new Ed25519Signer();
@@ -69,6 +109,13 @@ public static class SignedDocument
         return false;
     }
 
+    /// <summary>Verifies an envelope against time-bounded trusted keys.</summary>
+    /// <param name="envelope">The envelope to verify.</param>
+    /// <param name="trustedKeys">Trusted verification keys keyed by identifier.</param>
+    /// <param name="payload">Receives the verified exact payload bytes.</param>
+    /// <param name="error">Receives the rejection reason.</param>
+    /// <param name="now">The evaluation time, or UTC now when omitted.</param>
+    /// <returns><see langword="true"/> when a currently valid trusted key verifies the payload.</returns>
     public static bool Verify(SignedEnvelope envelope, IReadOnlyDictionary<string, VerificationKey> trustedKeys, out byte[] payload, out string? error, DateTimeOffset? now = null)
     {
         var current = now ?? DateTimeOffset.UtcNow;
@@ -90,13 +137,13 @@ public static class SignedDocument
         payload = [];
         signingKeyId = null;
         error = null;
-        if (envelope.Envelope != 1 || !KnownTypes.Contains(envelope.Type)) { error = "Unknown signed-envelope version or type."; return false; }
+        if (envelope.Envelope != CurrentEnvelopeVersion || !KnownTypes.Contains(envelope.Type)) { error = "Unknown signed-envelope version or type."; return false; }
         try { payload = Base64Url.Decode(envelope.Payload); }
         catch (FormatException ex) { error = ex.Message; return false; }
         var input = SigningInput(envelope.Type, payload);
         foreach (var signature in envelope.Signatures)
         {
-            if (!string.Equals(signature.Algorithm, "ed25519", StringComparison.Ordinal) || !trustedKeys.TryGetValue(signature.KeyId, out var key) || key.PublicKey.Length != 32) continue;
+            if (!string.Equals(signature.Algorithm, Ed25519Algorithm, StringComparison.Ordinal) || !trustedKeys.TryGetValue(signature.KeyId, out var key) || key.PublicKey.Length != Ed25519PublicKeyLength) continue;
             byte[] bytes;
             try { bytes = Base64Url.Decode(signature.Signature); } catch (FormatException) { continue; }
             var verifier = new Ed25519Signer();
@@ -113,28 +160,49 @@ public static class SignedDocument
         return false;
     }
 
+    /// <summary>Checks whether the signing key was trusted at the document timestamp.</summary>
+    /// <param name="trustedKeys">Trusted verification keys keyed by identifier.</param>
+    /// <param name="signingKeyId">The identifier returned by cryptographic verification.</param>
+    /// <param name="at">The signed document timestamp.</param>
+    /// <param name="error">Receives the rejection reason.</param>
+    /// <param name="clockSkew">The permitted clock skew.</param>
+    /// <returns><see langword="true"/> when the key was valid at the timestamp.</returns>
     public static bool IsKeyValidAt(IReadOnlyDictionary<string, VerificationKey> trustedKeys, string signingKeyId, DateTimeOffset at, out string? error, TimeSpan? clockSkew = null)
     {
         if (!trustedKeys.TryGetValue(signingKeyId, out var key)) { error = $"Signing key '{signingKeyId}' is not trusted."; return false; }
         var skew = clockSkew ?? TimeSpan.Zero;
         if (key.NotBefore is { } notBefore && notBefore > at + skew || key.NotAfter is { } notAfter && notAfter < at - skew)
         { error = $"Signing key '{signingKeyId}' was not valid at {at:O} (clock skew {skew})."; return false; }
-        if (key.PublicKey.Length != 32) { error = $"Signing key '{signingKeyId}' is not a valid Ed25519 public key."; return false; }
+        if (key.PublicKey.Length != Ed25519PublicKeyLength) { error = $"Signing key '{signingKeyId}' is not a valid Ed25519 public key."; return false; }
         error = null;
         return true;
     }
 
+    /// <summary>Serializes a signed envelope with canonical updater JSON settings.</summary>
+    /// <param name="envelope">The envelope to serialize.</param>
+    /// <returns>The UTF-8 JSON bytes.</returns>
     public static byte[] SerializeEnvelope(SignedEnvelope envelope) => JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions);
+    /// <summary>Validates and deserializes a signed envelope.</summary>
+    /// <param name="bytes">The UTF-8 JSON bytes.</param>
+    /// <returns>The parsed envelope.</returns>
     public static SignedEnvelope DeserializeEnvelope(ReadOnlySpan<byte> bytes)
     {
         JsonRules.Validate(bytes);
         var options = new JsonSerializerOptions(JsonOptions) { UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
         var envelope = JsonSerializer.Deserialize<SignedEnvelope>(bytes, options) ?? throw new FormatException("Signed envelope is empty.");
-        if (envelope.Envelope != 1 || envelope.Signatures.IsDefaultOrEmpty || !KnownTypes.Contains(envelope.Type)) throw new FormatException("Signed envelope is missing required fields or has an unknown type.");
+        if (envelope.Envelope != CurrentEnvelopeVersion || envelope.Signatures.IsDefaultOrEmpty || !KnownTypes.Contains(envelope.Type)) throw new FormatException("Signed envelope is missing required fields or has an unknown type.");
         return envelope;
     }
 
+    /// <summary>Serializes a signed-document payload with canonical updater JSON settings.</summary>
+    /// <typeparam name="T">The payload type.</typeparam>
+    /// <param name="value">The payload value.</param>
+    /// <returns>The UTF-8 JSON bytes.</returns>
     public static byte[] SerializePayload<T>(T value) => JsonSerializer.SerializeToUtf8Bytes(value, JsonOptions);
+    /// <summary>Validates and deserializes signed-document payload bytes.</summary>
+    /// <typeparam name="T">The payload type.</typeparam>
+    /// <param name="bytes">The UTF-8 JSON bytes.</param>
+    /// <returns>The parsed payload.</returns>
     public static T DeserializePayload<T>(ReadOnlySpan<byte> bytes)
     {
         JsonRules.Validate(bytes);
@@ -147,118 +215,4 @@ public static class SignedDocument
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = false, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, PropertyNamingPolicy = JsonNamingPolicy.CamelCase, Converters = { new ContentHashJsonConverter(), new PackageIdJsonConverter(), new PackageVersionJsonConverter(), new VirtualPathJsonConverter(), new UtcSecondJsonConverter(), new RevocationEffectJsonConverter(), new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) } };
         return options;
     }
-}
-
-public sealed class RevocationEffectJsonConverter : JsonConverter<RevocationEffect>
-{
-    public override RevocationEffect Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        var value = reader.GetString();
-        return value switch
-        {
-            "block-install" => RevocationEffect.BlockInstall,
-            "block-repair" => RevocationEffect.BlockRepair,
-            "force-move" => RevocationEffect.ForceMove,
-            _ => throw new JsonException($"Unknown revocation effect '{value}'.")
-        };
-    }
-
-    public override void Write(Utf8JsonWriter writer, RevocationEffect value, JsonSerializerOptions options) => writer.WriteStringValue(value switch
-    {
-        RevocationEffect.BlockInstall => "block-install",
-        RevocationEffect.BlockRepair => "block-repair",
-        RevocationEffect.ForceMove => "force-move",
-        _ => throw new JsonException($"Unknown revocation effect '{value}'.")
-    });
-}
-
-public static class JsonRules
-{
-    public static void Validate(ReadOnlySpan<byte> bytes)
-    {
-        var hasNonWhitespace = false;
-        foreach (var value in bytes)
-            if (value is not ((byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n')) { hasNonWhitespace = true; break; }
-        if (!hasNonWhitespace) throw new FormatException("Signed JSON must not be empty.");
-        var reader = new Utf8JsonReader(bytes, new JsonReaderOptions { CommentHandling = JsonCommentHandling.Disallow, AllowTrailingCommas = false });
-        var stack = new Stack<HashSet<string>>();
-        var sawToken = false;
-        while (reader.Read())
-        {
-            sawToken = true;
-            switch (reader.TokenType)
-            {
-                case JsonTokenType.StartObject: stack.Push(new HashSet<string>(StringComparer.Ordinal)); break;
-                case JsonTokenType.PropertyName:
-                    var propertyName = reader.GetString() ?? throw new FormatException("JSON property names may not be null.");
-                    ValidateString(propertyName);
-                    if (stack.Count == 0 || !stack.Peek().Add(propertyName)) throw new FormatException("Duplicate JSON object property.");
-                    break;
-                case JsonTokenType.Null: throw new FormatException("Null is not valid in a signed document.");
-                case JsonTokenType.Number: if (!reader.TryGetInt64(out _)) throw new FormatException("Signed-document numbers must be int64 integers."); break;
-                case JsonTokenType.String: ValidateString(reader.GetString()); break;
-                case JsonTokenType.EndObject: if (stack.Count > 0) stack.Pop(); break;
-            }
-        }
-        if (!sawToken || stack.Count != 0) throw new FormatException("Signed JSON is incomplete.");
-        if (reader.BytesConsumed != bytes.Length) throw new FormatException("Trailing bytes after signed JSON document.");
-    }
-
-    public static void ValidateString(string? text)
-    {
-        if (text is null) throw new FormatException("JSON strings may not be null.");
-        for (var index = 0; index < text.Length; index++)
-        {
-            if (char.IsHighSurrogate(text[index]) && (index + 1 >= text.Length || !char.IsLowSurrogate(text[index + 1]))) throw new FormatException("JSON strings may not contain lone surrogates.");
-            if (char.IsLowSurrogate(text[index]) && (index == 0 || !char.IsHighSurrogate(text[index - 1]))) throw new FormatException("JSON strings may not contain lone surrogates.");
-        }
-        if (text.Normalize(NormalizationForm.FormC) != text) throw new FormatException("JSON strings must be Unicode NFC.");
-    }
-}
-
-public static class Base64Url
-{
-    public static string Encode(ReadOnlySpan<byte> bytes) => Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-    public static byte[] Decode(string text)
-    {
-        if (text.Any(c => !(char.IsLetterOrDigit(c) || c is '-' or '_'))) throw new FormatException("Invalid base64url text.");
-        var padded = text.Replace('-', '+').Replace('_', '/') + new string('=', (4 - text.Length % 4) % 4);
-        return Convert.FromBase64String(padded);
-    }
-}
-
-public sealed class ContentHashJsonConverter : JsonConverter<ContentHash>
-{
-    public override ContentHash Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => ContentHash.Parse(reader.GetString() ?? throw new JsonException("Hash cannot be null."));
-    public override void Write(Utf8JsonWriter writer, ContentHash value, JsonSerializerOptions options) => writer.WriteStringValue(value.ToString());
-}
-public sealed class PackageIdJsonConverter : JsonConverter<PackageId>
-{
-    public override PackageId Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => new(reader.GetString() ?? throw new JsonException("Package id cannot be null."));
-    public override void Write(Utf8JsonWriter writer, PackageId value, JsonSerializerOptions options) => writer.WriteStringValue(value.Value);
-    public override PackageId ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => new(reader.GetString() ?? throw new JsonException("Package id property cannot be null."));
-    public override void WriteAsPropertyName(Utf8JsonWriter writer, PackageId value, JsonSerializerOptions options) => writer.WritePropertyName(value.Value);
-}
-public sealed class PackageVersionJsonConverter : JsonConverter<PackageVersion>
-{
-    public override PackageVersion Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => new(reader.GetString() ?? throw new JsonException("Version cannot be null."), 0);
-    public override void Write(Utf8JsonWriter writer, PackageVersion value, JsonSerializerOptions options) => writer.WriteStringValue(value.Label);
-}
-public sealed class VirtualPathJsonConverter : JsonConverter<VirtualPath>
-{
-    public override VirtualPath Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) => new(reader.GetString() ?? throw new JsonException("Path cannot be null."));
-    public override void Write(Utf8JsonWriter writer, VirtualPath value, JsonSerializerOptions options) => writer.WriteStringValue(value.Value);
-}
-
-public sealed class UtcSecondJsonConverter : JsonConverter<DateTimeOffset>
-{
-    private const string Format = "yyyy-MM-dd'T'HH:mm:ss'Z'";
-    public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-    {
-        var value = reader.GetString();
-        if (value is null || !DateTimeOffset.TryParseExact(value, Format, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
-            throw new JsonException("Timestamps must be RFC 3339 UTC with second precision and a literal Z.");
-        return parsed;
-    }
-    public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options) => writer.WriteStringValue(value.UtcDateTime.ToString(Format, CultureInfo.InvariantCulture));
 }

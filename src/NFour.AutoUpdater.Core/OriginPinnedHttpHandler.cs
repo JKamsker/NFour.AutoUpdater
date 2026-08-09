@@ -23,10 +23,13 @@ public sealed class OriginPinnedHttpHandler : DelegatingHandler
     private readonly int _maximumHops;
     private readonly bool _requireHttps;
 
+    /// <summary>Initializes a redirect handler constrained to explicitly allowed origins.</summary>
     /// <param name="allowedOrigins">
     /// Origins a redirect may target. Compared as scheme+host+port, so a redirect to a
     /// different host, a different port, or a downgraded scheme is refused.
     /// </param>
+    /// <param name="innerHandler">The transport handler, or a default HTTP handler when omitted.</param>
+    /// <param name="maximumHops">The maximum number of redirects to follow.</param>
     /// <param name="requireHttps">
     /// When true, every hop must be HTTPS. Defaults to true when the first allowed origin is
     /// HTTPS, so an HTTPS deployment cannot be silently downgraded.
@@ -56,6 +59,7 @@ public sealed class OriginPinnedHttpHandler : DelegatingHandler
     private static int DefaultPort(string scheme)
         => string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase) ? 443 : 80;
 
+    /// <inheritdoc />
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         EnsureAllowed(request.RequestUri, "request");

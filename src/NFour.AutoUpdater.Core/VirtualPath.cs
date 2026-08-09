@@ -1,5 +1,6 @@
 namespace NFour.AutoUpdater.Core;
 
+/// <summary>Represents a normalized, portable path relative to an installation root.</summary>
 public readonly record struct VirtualPath : IComparable<VirtualPath>
 {
     private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
@@ -9,17 +10,29 @@ public readonly record struct VirtualPath : IComparable<VirtualPath>
         "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
     };
 
+    /// <summary>Initializes a validated portable path.</summary>
+    /// <param name="raw">The relative path to normalize and validate.</param>
     public VirtualPath(string raw)
     {
         if (!TryCreate(raw, out var path, out var error)) throw new ArgumentException(error, nameof(raw));
         Value = path.Value;
     }
 
+    /// <summary>Gets the normalized slash-separated path.</summary>
     public string Value { get; }
+    /// <summary>Gets the comparison key used to detect portable path collisions.</summary>
     public string FoldedKey => Fold(Value);
 
+    /// <summary>Creates a validated portable path.</summary>
+    /// <param name="raw">The relative path to normalize and validate.</param>
+    /// <returns>The validated path.</returns>
     public static VirtualPath Create(string raw) => new(raw);
 
+    /// <summary>Attempts to normalize and validate a portable path.</summary>
+    /// <param name="raw">The relative path to validate.</param>
+    /// <param name="path">Receives the validated path.</param>
+    /// <param name="error">Receives the validation error when parsing fails.</param>
+    /// <returns><see langword="true"/> when the path is valid.</returns>
     public static bool TryCreate(string? raw, out VirtualPath path, out string? error)
     {
         path = default;
@@ -45,9 +58,15 @@ public readonly record struct VirtualPath : IComparable<VirtualPath>
     }
 
     private VirtualPath(string value, bool _) => Value = value;
+    /// <inheritdoc />
     public int CompareTo(VirtualPath other) => StringComparer.Ordinal.Compare(Value, other.Value);
+    /// <summary>Returns the normalized path.</summary>
+    /// <returns>The slash-separated path.</returns>
     public override string ToString() => Value;
 
+    /// <summary>Creates the platform-neutral collision-detection key for a path.</summary>
+    /// <param name="value">The normalized path.</param>
+    /// <returns>The case-folded path key.</returns>
     public static string Fold(string value)
     {
         var components = value.Normalize(NormalizationForm.FormC).Split('/');

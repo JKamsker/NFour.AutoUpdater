@@ -18,6 +18,11 @@ public static class PosixFileMode
     /// <summary>Mode applied to ordinary files when the manifest declares none.</summary>
     public const uint DefaultRegular = 0x1A4; // 0644
 
+    /// <summary>Attempts to parse an allowlisted four-digit octal file mode.</summary>
+    /// <param name="text">The canonical mode text.</param>
+    /// <param name="mode">Receives the parsed permission bits.</param>
+    /// <param name="error">Receives the rejection reason.</param>
+    /// <returns><see langword="true"/> when the mode is safe and canonical.</returns>
     public static bool TryParse(string? text, out uint mode, out string? error)
     {
         mode = 0;

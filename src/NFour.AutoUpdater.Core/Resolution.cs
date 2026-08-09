@@ -2,8 +2,10 @@ using System.Buffers;
 
 namespace NFour.AutoUpdater.Core;
 
+/// <summary>Resolves release requirements into a deterministic package selection.</summary>
 public sealed class VariantResolver : IVariantResolver
 {
+    /// <inheritdoc />
     public ResolutionResult Resolve(ReleaseLock release, VariantSelection requested)
     {
         var diagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
@@ -120,8 +122,10 @@ public sealed class VariantResolver : IVariantResolver
     }
 }
 
+/// <summary>Composes resolved package file tables using declared precedence and overrides.</summary>
 public sealed class FileSetComposer : IFileSetComposer
 {
+    /// <inheritdoc />
     public async ValueTask<ComposedFileSet> ComposeAsync(IPackageRepository repository, ResolutionResult resolution, CancellationToken cancellationToken = default)
     {
         var diagnostics = resolution.Diagnostics.ToBuilder();
@@ -187,8 +191,12 @@ public sealed class FileSetComposer : IFileSetComposer
         StringComparer.Ordinal.Compare(left.Owner.Value, right.Owner.Value);
 }
 
+/// <summary>Computes the deterministic identity of a composed install file set.</summary>
 public static class FileSetIdentity
 {
+    /// <summary>Hashes the canonical path, content, owner, and install metadata of each file.</summary>
+    /// <param name="files">The composed files keyed by path.</param>
+    /// <returns>The file-set digest.</returns>
     public static ContentHash Compute(IReadOnlyDictionary<VirtualPath, ComposedFile> files)
     {
         var buffer = new ArrayBufferWriter<byte>();
