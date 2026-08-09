@@ -438,4 +438,3 @@ public sealed class InstallApplier
 #pragma warning restore CA1416
     }
 }
-
