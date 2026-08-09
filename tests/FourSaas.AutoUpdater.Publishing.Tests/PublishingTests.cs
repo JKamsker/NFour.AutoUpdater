@@ -42,6 +42,104 @@ public sealed class PublishingTests
         Assert.Equal("base", rules.Packages.Single().Requires.Single().Id.Value);
     }
     [Fact]
+    public void BuildLayoutClassifiesCommonAndAxisTrees()
+    {
+        var common = BuildTreeLayout.Classify("common/data/world.bin");
+        Assert.NotNull(common);
+        Assert.Null(common!.Value.Axis);
+        Assert.Equal("data/world.bin", common.Value.InstallPath);
+
+        var axis = BuildTreeLayout.Classify("axis/lang/de/data/strings.bin");
+        Assert.NotNull(axis);
+        Assert.Equal("lang", axis!.Value.Axis);
+        Assert.Equal("de", axis.Value.Value);
+        Assert.Equal("data/strings.bin", axis.Value.InstallPath);
+    }
+
+    [Fact]
+    public void BuildLayoutRejectsFilesOutsideTheConvention()
+    {
+        // The check that keeps the convention true as the build changes. Without it a stray
+        // file is merely unclassified, and the first symptom is a package quietly missing
+        // content.
+        var diagnostics = BuildTreeLayout.Validate(["stray.bin", "axis/lang/orphan.bin", "common/ok.bin"]);
+        Assert.Equal(2, diagnostics.Count(x => x.Code == "LAY001"));
+        Assert.All(diagnostics.Where(x => x.Code == "LAY001"), x => Assert.True(x.IsError));
+    }
+
+    [Fact]
+    public void BuildLayoutRejectsTwoAxesClaimingOneInstallPath()
+    {
+        // Cross-axis disjointness. If lang and ui both own data/shared.bin, switching language
+        // rewrites a file ui owns, so a language change drags UI content down with it.
+        var diagnostics = BuildTreeLayout.Validate(
+        [
+            "axis/lang/de/data/shared.bin",
+            "axis/ui/classic/data/shared.bin",
+        ]);
+        var conflict = Assert.Single(diagnostics, x => x.Code == "LAY003");
+        Assert.True(conflict.IsError);
+        Assert.Contains("data/shared.bin", conflict.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildLayoutAllowsValuesOfOneAxisToShareInstallPaths()
+    {
+        // Values of the same axis are alternatives, never installed together, so sharing an
+        // install path is the normal case and must not be reported.
+        var diagnostics = BuildTreeLayout.Validate(
+        [
+            "axis/lang/de/data/strings.bin",
+            "axis/lang/en/data/strings.bin",
+        ]);
+        Assert.DoesNotContain(diagnostics, x => x.IsError);
+    }
+
+    [Fact]
+    public void BuildLayoutWarnsWhenOneAxisValueIsMissingAFile()
+    {
+        var diagnostics = BuildTreeLayout.Validate(
+        [
+            "axis/lang/de/data/strings.bin",
+            "axis/lang/de/data/credits.bin",
+            "axis/lang/en/data/strings.bin",
+        ]);
+        var missing = Assert.Single(diagnostics, x => x.Code == "LAY004");
+        Assert.False(missing.IsError);
+        Assert.Contains("credits.bin", missing.Message, StringComparison.Ordinal);
+        Assert.Contains("'en'", missing.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildLayoutRejectsAnUndeclaredAxis()
+    {
+        var diagnostics = BuildTreeLayout.Validate(["axis/langauge/de/x.bin"], declaredAxes: ["lang", "ui"]);
+        var typo = Assert.Single(diagnostics, x => x.Code == "LAY002");
+        Assert.True(typo.IsError);
+        Assert.Contains("langauge", typo.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BuildLayoutGeneratesOneRulePerAxisValuePlusBase()
+    {
+        var rules = BuildTreeLayout.GenerateRules(
+        [
+            "common/data/world.bin",
+            "axis/lang/de/data/strings.bin",
+            "axis/lang/en/data/strings.bin",
+            "axis/ui/classic/ui/main.bin",
+        ]);
+
+        Assert.Equal(["game.base", "lang.de", "lang.en", "ui.classic"], rules.Select(x => x.Id.Value).ToArray());
+        var german = rules.Single(x => x.Id.Value == "lang.de");
+        Assert.Equal("axis/lang/de", german.StripPrefix);
+        Assert.Equal(["axis/lang/de/**"], german.Include);
+        // One rule per package regardless of how many files it holds — the property that keeps
+        // this maintainable at 200k files.
+        Assert.All(rules, rule => Assert.Single(rule.Include));
+    }
+
+    [Fact]
     public void StripPrefixMapsAWholeSubtreeWithoutPerFileRules()
     {
         // The point of stripPrefix: one line relocates a subtree of any size. Expressing this
