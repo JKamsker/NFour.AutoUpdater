@@ -15,16 +15,16 @@ its authoritative record, not a discussion.
 | Q1 | Engine globs `ui/**` at startup? | **ASSUMED — globbing.** Unconfirmed, but the client is ours to change if not; see Q1 |
 | Q2 | Build-tree partitioning / `slice.yaml` ownership | **DECIDED — convention defined.** No concept existed; one is now specified and enforced ([20](20-build-tree-layout.md)) |
 | Q3 | UI packages: full subtree or thin overlay | **DECIDED — full subtree.** The two UIs do not share bulk paths today; see Q3 |
-| Q4 | Which axes are post-install switchable | **OPEN** |
+| Q4 | Which axes are post-install switchable | **DECIDED.** `language`, `ui`, and `hd`; see Q4 |
 | Q5 | Ed25519 signing in v1 | **DECIDED — yes.** Architecturally mandatory; the envelope is normative in [17](17-signed-documents.md) and is a Phase 0 exit criterion |
-| Q6 | Deployment topology and GC ownership | **OPEN** |
+| Q6 | Deployment topology and GC ownership | **DECIDED.** Deployment-configurable, retaining everything by default; see Q6 |
 | Q7 | Small-file bundling in v1 | **DEFERRED — backlog.** Out of scope for v1; see Q7 |
 | Q8 | Sub-file delta / CDC | **DEFERRED.** Reserve the `d` field; revisit in Phase 8 |
 | Q9 | Symlinks, exec bits, empty directories | **DECIDED.** Symlinks rejected at publish; `pol:"executable"` + `mode`; empty dirs via `k:"dir"` ([05](05-repository-format.md) §8) |
 | Q10 | Naming (`FourSaas.*` vs `NFour.*`) | **OPEN — cheap now, annoying later** |
 | Q11 | Re-run the third variant design | **CLOSED — no.** Nothing depends on it |
 | Q12 | Migration from an existing patcher | **OPEN** |
-| Q13 | Telemetry consent | **OPEN**, but lower stakes now — telemetry is diagnostic-only and gates nothing ([09](09-control-plane-server.md) §2.1) |
+| Q13 | Telemetry consent | **DECIDED.** Off by default and deployment-configurable; see Q13 |
 | Q14 | Who operates special servers | **DECIDED — first-party only.** Channel per realm; federated overlay explicitly out of scope; see Q14 |
 | — | At-rest compression | **DECIDED — removed.** Identity-only CAS ([18](18-normative-contract.md) §5) |
 | — | Device targeting | **DECIDED — none.** Channels only ([09](09-control-plane-server.md) §2.3) |
@@ -151,6 +151,12 @@ other axes, which constrains the slice.
 
 **Recommendation:** `language`, `ui`, `hd` switchable; `arch` and `brand` install-time only.
 
+### Answer — language, UI, and HD are switchable (2026-08-09)
+
+`language`, `ui`, and `hd` are post-install switches. `arch` and `brand` are fixed when the
+installation is created. The switchable packages must therefore remain path-disjoint from
+other axes; LAY003 enforces that constraint in the build-tree layout.
+
 ---
 
 ## Q5 — Does ed25519 signing ship in v1?
@@ -177,6 +183,19 @@ accumulates orphans forever.
 **Needs confirmation:** that this matches the intended topology, plus the retention policy —
 suggested: keep the last N releases, plus every channel-referenced release, plus a minimum blob
 age ≥ the maximum publish duration.
+
+### Answer — configurable topology with conservative retention (2026-08-09)
+
+Topology, GC scheduling, and retention are deployment configuration rather than compiled product
+policy. Every backend may participate in the role its capabilities support, but configuration
+does not manufacture capabilities: HTTP remains a read-only mirror, and FTP's listing cost makes
+it unsuitable for unattended large-repository GC. S3 and local storage can be authoritative GC
+targets.
+
+The default retains every release and performs no destructive GC. Operators may explicitly
+configure pruning, minimum blob age, and a GC owner. When deletion is enabled, every mirror must
+use delete-propagating synchronization after GC. This default makes an omitted setting retain
+data instead of silently deleting it.
 
 ---
 
@@ -336,3 +355,11 @@ Telemetry needs a consent surface, and consent requirements differ by publisher 
 **Needs:** whoever owns the privacy position.
 **Recommendation:** default off, opt-in, with the failure-rate signal that gates rollout
 collected from an anonymous aggregate that carries no device identity.
+
+### Answer — off by default, configurable per deployment (2026-08-09)
+
+Telemetry is disabled unless a deployment explicitly enables it. The setting is configurable
+per publisher/brand so the deployment can apply its own regional consent requirements. Enabling
+collection does not make telemetry authoritative: it remains diagnostic-only and does not gate
+rollout. No client silently changes from the off default because a server begins accepting
+events.
