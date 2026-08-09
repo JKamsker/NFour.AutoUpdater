@@ -1,22 +1,27 @@
 namespace NFour.AutoUpdater.Client;
 
+/// <summary>Configures side-by-side installation of an updater version.</summary>
 public sealed record SelfUpdateOptions
 {
+    /// <summary>Gets the updater installation root.</summary>
     public required string InstallRoot { get; init; }
+    /// <summary>Gets the version identifier.</summary>
     public required string Version { get; init; }
+    /// <summary>Gets the source directory containing the new updater.</summary>
     public required string SourceDirectory { get; init; }
+    /// <summary>Gets an optional state directory copied beside the updater.</summary>
     public string? StateDirectory { get; init; }
+    /// <summary>Gets whether a directory symlink is preferred for the current pointer.</summary>
     public bool PreferDirectorySymlink { get; init; } = true;
 }
 
+/// <summary>Reports the installed version directory and active pointer.</summary><param name="VersionDirectory">The installed version directory.</param><param name="CurrentPointer">The active launcher pointer.</param><param name="UsedSymlink">Whether the pointer is a directory symlink.</param>
 public sealed record SelfUpdateResult(string VersionDirectory, string CurrentPointer, bool UsedSymlink);
 
-/// Installs a new updater beside the running binary and atomically switches the launcher
-/// pointer. The running executable is never overwritten. All files copied into the
-/// versioned tree go through the same no-follow, handle-relative mutation adapter used by
-/// ordinary installs.
+/// <summary>Installs an updater beside the running binary and atomically switches the launcher pointer.</summary>
 public sealed class SelfUpdateManager
 {
+    /// <summary>Copies and activates one side-by-side updater version.</summary>
     public async ValueTask<SelfUpdateResult> InstallAsync(SelfUpdateOptions options, CancellationToken cancellationToken = default)
     {
         if (!Identifier.IsValid(options.Version, "version", out var error)) throw new FormatException(error);

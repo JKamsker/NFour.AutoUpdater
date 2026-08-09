@@ -67,11 +67,17 @@ internal static class SecureInstallOperations
         return false;
     }
 
+    /// <summary>Atomically replaces a file through platform no-follow operations.</summary>
+    /// <param name="root">The trusted install root.</param>
+    /// <param name="path">The destination path relative to the root.</param>
+    /// <param name="stagedPath">The verified staged source file.</param>
     /// <param name="mode">
     /// POSIX permission bits to apply. Resolved by the caller from the manifest-declared mode
     /// and the install policy, so an arbitrary declared mode is honoured rather than every
     /// executable silently receiving 0755.
     /// </param>
+    /// <param name="expectedParent">The parent identity captured during planning.</param>
+    /// <param name="preferHardLink">Whether an immutable install may share the staged inode.</param>
     public static bool TryReplaceFile(string root, VirtualPath path, string stagedPath, uint mode = PosixFileMode.DefaultRegular, FileIdentity? expectedParent = null, bool preferHardLink = false)
     {
         if (OperatingSystem.IsWindows()) return WindowsSecureInstallOperations.TryReplaceFile(root, path, stagedPath, expectedParent, preferHardLink);

@@ -2,48 +2,74 @@ using System.Runtime.InteropServices;
 
 namespace NFour.AutoUpdater.Client;
 
+/// <summary>Records the trusted repository, release, selection, and control-document state of an install.</summary>
 public sealed record InstallLock
 {
+    /// <summary>Gets the ledger schema version.</summary>
     public int SchemaVersion { get; init; } = 1;
+    /// <summary>Gets the repository URI.</summary>
     public required string RepositoryUri { get; init; }
+    /// <summary>Gets the product identifier.</summary>
     public required string ProductId { get; init; }
+    /// <summary>Gets the followed channel, when installed through a channel.</summary>
     public string? Channel { get; init; }
+    /// <summary>Gets the installed release identifier.</summary>
     public required string ReleaseId { get; init; }
+    /// <summary>Gets the installed release sequence.</summary>
     public long ReleaseSequence { get; init; }
+    /// <summary>Gets the exact release-envelope digest.</summary>
     public required ContentHash ReleaseDigest { get; init; }
+    /// <summary>Gets the normalized variant selection.</summary>
     public required VariantSelection Selection { get; init; }
+    /// <summary>Gets the variant-selection digest.</summary>
     public required ContentHash SelectionId { get; init; }
+    /// <summary>Gets the composed file-set digest.</summary>
     public required ContentHash FileSetId { get; init; }
+    /// <summary>Gets the last accepted channel sequence.</summary>
     public long LastChannelSequence { get; init; }
+    /// <summary>Gets the last accepted key-manifest sequence.</summary>
     public long KeySequence { get; init; }
+    /// <summary>Gets the last accepted key-manifest envelope digest.</summary>
     public ContentHash? KeyManifestDigest { get; init; }
+    /// <summary>Gets the last accepted revocation sequence.</summary>
     public long RevocationSequence { get; init; }
+    /// <summary>Gets the last accepted revocation-envelope digest.</summary>
     public ContentHash? RevocationDigest { get; init; }
+    /// <summary>Gets the last accepted release revocations.</summary>
     public ImmutableArray<RevocationEntry> KnownRevocations { get; init; } = [];
+    /// <summary>Gets trusted verification-key identifiers.</summary>
     public ImmutableArray<string> TrustedKeyIds { get; init; } = [];
     // The public-key material is persisted with the ledger so a later invocation cannot
     // silently replace the trust anchor merely by supplying a different CLI argument.
     // It is public material, not a secret; private signing keys never enter the ledger.
+    /// <summary>Gets trusted public verification keys encoded as base64url.</summary>
     public ImmutableDictionary<string, string> TrustedKeys { get; init; } = ImmutableDictionary<string, string>.Empty;
+    /// <summary>Gets when this install state was committed.</summary>
     public DateTimeOffset AppliedAt { get; init; }
+    /// <summary>Gets unrecognized fields preserved for forward compatibility.</summary>
     [JsonIgnore]
     public ImmutableDictionary<string, JsonElement> UnknownFields { get; init; } = ImmutableDictionary<string, JsonElement>.Empty;
 }
 
+/// <summary>Contains an install lock and all managed file rows.</summary><param name="Lock">The install-level state.</param><param name="Files">Managed files keyed by path.</param>
 public sealed record LedgerDocument(InstallLock Lock, ImmutableDictionary<VirtualPath, InstalledFile> Files);
 
+/// <summary>Reads and atomically commits the append-safe install ledger.</summary>
 public sealed class InstallLedger
 {
     private readonly string _root;
     private readonly string _path;
     private readonly string _historyDirectory;
+    /// <summary>Initializes a ledger beneath an install root.</summary>
     public InstallLedger(string installRoot)
     {
         _root = Path.GetFullPath(installRoot);
         _path = Path.Combine(_root, ".4sup", "state.jsonl");
         _historyDirectory = Path.Combine(_root, ".4sup", "history");
     }
+    /// <summary>Reads the current ledger document.</summary>
     public ValueTask<LedgerDocument?> ReadAsync(CancellationToken cancellationToken = default) => ReadPathAsync(_path, cancellationToken);
+    /// <summary>Reads prior ledger snapshots in chronological filename order.</summary>
     public async ValueTask<IReadOnlyList<LedgerDocument>> ReadHistoryAsync(CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(_historyDirectory)) return [];
@@ -92,6 +118,7 @@ public sealed class InstallLedger
         return new LedgerDocument(new InstallLock { RepositoryUri = lockRecord.RepositoryUri, ProductId = lockRecord.ProductId, Channel = lockRecord.Channel, ReleaseId = lockRecord.ReleaseId, ReleaseSequence = lockRecord.ReleaseSequence, ReleaseDigest = ContentHash.Parse(lockRecord.ReleaseDigest), Selection = selection, SelectionId = ContentHash.Parse(lockRecord.SelectionId), FileSetId = ContentHash.Parse(lockRecord.FileSetId), LastChannelSequence = lockRecord.LastChannelSequence, KeySequence = lockRecord.KeySequence, KeyManifestDigest = lockRecord.KeyManifestDigest is null ? null : ContentHash.Parse(lockRecord.KeyManifestDigest), RevocationSequence = lockRecord.RevocationSequence, RevocationDigest = lockRecord.RevocationDigest is null ? null : ContentHash.Parse(lockRecord.RevocationDigest), KnownRevocations = lockRecord.KnownRevocations?.ToImmutableArray() ?? [], TrustedKeyIds = lockRecord.TrustedKeyIds?.ToImmutableArray() ?? [], TrustedKeys = trustedKeys.ToImmutable(), AppliedAt = lockRecord.AppliedAt, UnknownFields = lockRecord.ExtensionData?.ToImmutableDictionary(StringComparer.Ordinal) ?? ImmutableDictionary<string, JsonElement>.Empty }, files.ToImmutable());
     }
 
+    /// <summary>Atomically commits install state and archives the previous ledger.</summary>
     public async ValueTask CommitAsync(InstallLock installLock, IReadOnlyDictionary<VirtualPath, InstalledFile> files, CancellationToken cancellationToken = default)
     {
         var options = JsonOptions();

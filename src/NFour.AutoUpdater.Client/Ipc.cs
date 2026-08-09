@@ -2,29 +2,37 @@ using System.IO.Pipes;
 
 namespace NFour.AutoUpdater.Client;
 
+/// <summary>Associates an IPC route with a handler type or method.</summary><param name="route">The route name.</param>
 [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, AllowMultiple = true)]
 public sealed class IpcRouteAttribute(string route) : Attribute
 {
+    /// <summary>Gets the normalized absolute route.</summary>
     public string Route { get; } = Normalize(route);
     private static string Normalize(string route) => route.StartsWith('/') ? route : "/" + route;
 }
 
+/// <summary>Contains one routed IPC request.</summary><param name="Route">The normalized route.</param><param name="Payload">The JSON payload.</param>
 public sealed record IpcRequest(string Route, JsonElement Payload);
+/// <summary>Contains a stable IPC error code and explanation.</summary><param name="Code">The error code.</param><param name="Message">The explanation.</param>
 public sealed record IpcError(string Code, string Message);
 
+/// <summary>Sends unary and streaming requests across a local IPC boundary.</summary>
 public interface IpcTransport : IAsyncDisposable
 {
+    /// <summary>Sends a request and returns its first response.</summary>
     ValueTask<JsonElement> RequestAsync(string route, JsonElement payload, CancellationToken cancellationToken = default);
+    /// <summary>Sends a request and streams every response.</summary>
     IAsyncEnumerable<JsonElement> StreamAsync(string route, JsonElement payload, CancellationToken cancellationToken = default);
 }
 
+/// <summary>Handles an IPC request as an asynchronous response sequence.</summary>
 public delegate IAsyncEnumerable<JsonElement> IpcRouteHandler(JsonElement payload, CancellationToken cancellationToken);
 
-/// A route table shared by the in-process and named-pipe transports. Handlers may yield
-/// multiple responses; the pipe protocol sends a terminal frame after the sequence.
+/// <summary>Stores routes shared by in-process and named-pipe transports.</summary>
 public sealed class IpcRouter
 {
     private readonly Dictionary<string, IpcRouteHandler> _routes = new(StringComparer.Ordinal);
+    /// <summary>Registers one normalized route and handler.</summary>
     public IpcRouter Register(string route, IpcRouteHandler handler)
     {
         var normalized = Normalize(route);
@@ -36,12 +44,13 @@ public sealed class IpcRouter
     private static string Normalize(string route) => route.StartsWith('/') ? route : "/" + route;
 }
 
-/// In-process transport used by launchers and tests. It exercises the same route boundary
-/// without weakening the production pipe's peer restriction.
+/// <summary>Dispatches IPC requests in process while preserving the route boundary.</summary>
 public sealed class InProcessIpcTransport : IpcTransport
 {
     private readonly IpcRouter _router;
+    /// <summary>Initializes an in-process transport over a router.</summary>
     public InProcessIpcTransport(IpcRouter router) => _router = router;
+    /// <summary>Initializes an in-process transport from unary route delegates.</summary>
     public InProcessIpcTransport(IReadOnlyDictionary<string, Func<JsonElement, CancellationToken, ValueTask<JsonElement>>> routes)
     {
         _router = new IpcRouter();
@@ -54,12 +63,15 @@ public sealed class InProcessIpcTransport : IpcTransport
         }
     }
 
+    /// <inheritdoc />
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    /// <inheritdoc />
     public async ValueTask<JsonElement> RequestAsync(string route, JsonElement payload, CancellationToken cancellationToken = default)
     {
         await foreach (var response in StreamAsync(route, payload, cancellationToken).ConfigureAwait(false)) return response;
         throw new KeyNotFoundException($"IPC route '{route}' is not registered or returned no response.");
     }
+    /// <inheritdoc />
     public IAsyncEnumerable<JsonElement> StreamAsync(string route, JsonElement payload, CancellationToken cancellationToken = default)
         => DispatchAsync(_router, route, payload, cancellationToken);
 
@@ -70,11 +82,10 @@ public sealed class InProcessIpcTransport : IpcTransport
     }
 }
 
-/// Authenticated-by-construction local IPC server. CurrentUserOnly prevents another local
-/// account from opening the pipe; route handlers remain responsible for authorization inside
-/// the updater process.
+/// <summary>Hosts current-user-only IPC routes on a named pipe.</summary><param name="pipeName">The local pipe name.</param><param name="router">The route table.</param>
 public sealed class NamedPipeIpcServer(string pipeName, IpcRouter router)
 {
+    /// <summary>Accepts and handles pipe connections until cancellation.</summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(pipeName)) throw new ArgumentException("A pipe name is required.", nameof(pipeName));
@@ -115,18 +126,20 @@ public sealed class NamedPipeIpcServer(string pipeName, IpcRouter router)
     }
 }
 
-/// Length-prefixed JSON named-pipe transport with streaming response support.
+/// <summary>Provides length-prefixed JSON named-pipe IPC with streaming responses.</summary><param name="pipeName">The local pipe name.</param><param name="direction">The pipe direction.</param>
 public sealed class NamedPipeIpcTransport(string pipeName, PipeDirection direction = PipeDirection.InOut) : IpcTransport
 {
     private readonly string _pipeName = pipeName;
     private readonly PipeDirection _direction = direction;
 
+    /// <inheritdoc />
     public async ValueTask<JsonElement> RequestAsync(string route, JsonElement payload, CancellationToken cancellationToken = default)
     {
         await foreach (var response in StreamAsync(route, payload, cancellationToken).ConfigureAwait(false)) return response;
         throw new IOException("IPC peer returned no response payload.");
     }
 
+    /// <inheritdoc />
     public async IAsyncEnumerable<JsonElement> StreamAsync(string route, JsonElement payload, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await using var pipe = new NamedPipeClientStream(".", _pipeName, _direction, PipeOptions.Asynchronous);
@@ -141,6 +154,7 @@ public sealed class NamedPipeIpcTransport(string pipeName, PipeDirection directi
         }
     }
 
+    /// <inheritdoc />
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     private static string Normalize(string route) => route.StartsWith('/') ? route : "/" + route;
 }

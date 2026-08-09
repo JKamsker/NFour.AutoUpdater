@@ -5,18 +5,27 @@ using System.Runtime.Versioning;
 
 namespace NFour.AutoUpdater.Client;
 
+/// <summary>Represents a failed safety precondition immediately before apply.</summary><param name="message">The failure explanation.</param>
 public sealed class ApplyPreconditionException(string message) : Exception(message);
 
+/// <summary>Represents failure to acquire exclusive ownership of an install root.</summary><param name="message">The failure explanation.</param>
 public sealed class InstallConcurrencyException(string message) : Exception(message);
 
+/// <summary>Defines state and resource requirements revalidated immediately before apply.</summary>
 public sealed record ApplyPreconditions
 {
+    /// <summary>Gets an explicit minimum free-space requirement.</summary>
     public long? MinimumFreeSpaceBytes { get; init; }
+    /// <summary>Gets the currently installed release sequence.</summary>
     public long? CurrentInstalledReleaseSequence { get; init; }
+    /// <summary>Gets the minimum release sequence from which the target is reachable.</summary>
     public long? MinimumInstalledReleaseSequence { get; init; }
+    /// <summary>Gets the running client version.</summary>
     public Version? ClientVersion { get; init; }
+    /// <summary>Gets the minimum client version required by the target.</summary>
     public Version? MinimumClientVersion { get; init; }
 
+    /// <summary>Validates root identity, topology, version, privilege, space, and path limits.</summary>
     public void Validate(string installRoot, InstallPlan plan)
     {
         var root = Path.GetFullPath(installRoot);
@@ -123,20 +132,24 @@ public sealed record ApplyPreconditions
     private static extern uint GetEffectiveUserId();
 }
 
+/// <summary>Acquires exclusive ownership of an install root for apply.</summary>
 public interface IInstallLockProvider
 {
+    /// <summary>Acquires an install lock or throws when another owner holds it.</summary>
     ValueTask<IInstallLockLease> AcquireAsync(string installRoot, CancellationToken cancellationToken = default);
 }
 
+/// <summary>Represents exclusive ownership of an install root.</summary>
 public interface IInstallLockLease : IAsyncDisposable
 {
+    /// <summary>Gets diagnostic text identifying the lock owner.</summary>
     string Owner { get; }
 }
 
-/// A durable lock file whose OS-level advisory lock is released automatically if the process dies.
-/// The owner text remains behind so a failed acquisition can identify the previous holder.
+/// <summary>Provides a durable OS-level advisory lock with diagnostic owner metadata.</summary>
 public sealed class FileInstallLockProvider : IInstallLockProvider
 {
+    /// <inheritdoc />
     public ValueTask<IInstallLockLease> AcquireAsync(string installRoot, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
