@@ -15,6 +15,7 @@ namespace NFour.AutoUpdater.Server.Migrations;
 [DbContext(typeof(ManagementDbContext))]
 public partial class TelemetryPartitioning : Migration
 {
+    /// <inheritdoc />
     protected override void Up(MigrationBuilder migrationBuilder)
     {
         migrationBuilder.Sql("""
@@ -44,6 +45,7 @@ public partial class TelemetryPartitioning : Migration
             """);
     }
 
+    /// <inheritdoc />
     protected override void Down(MigrationBuilder migrationBuilder)
     {
         migrationBuilder.Sql("""

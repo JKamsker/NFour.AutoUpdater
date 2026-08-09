@@ -18,6 +18,7 @@ namespace NFour.AutoUpdater.Server.Migrations;
 [DbContext(typeof(ManagementDbContext))]
 public partial class NormalizeSequenceClaims : Migration
 {
+    /// <inheritdoc />
     protected override void Up(MigrationBuilder migrationBuilder)
     {
         migrationBuilder.CreateTable(
@@ -43,6 +44,7 @@ public partial class NormalizeSequenceClaims : Migration
             """);
     }
 
+    /// <inheritdoc />
     protected override void Down(MigrationBuilder migrationBuilder)
         => migrationBuilder.DropTable(name: "SequenceClaims");
 }

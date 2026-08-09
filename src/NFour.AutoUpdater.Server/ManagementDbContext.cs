@@ -2,40 +2,61 @@ using Microsoft.EntityFrameworkCore;
 
 namespace NFour.AutoUpdater.Server;
 
-/// The control plane's durable query/index surface.  Signed artifacts and CAS bytes remain
-/// authoritative in object storage; these rows deliberately contain references, not file-table
-/// contents or a second copy of signed documents.
+/// <summary>
+/// Provides the control plane's durable query and index surface. Signed artifacts and
+/// content-addressed bytes remain authoritative in object storage.
+/// </summary>
+/// <param name="options">Entity Framework database options.</param>
 public sealed class ManagementDbContext(DbContextOptions<ManagementDbContext> options) : DbContext(options)
 {
+    private const string JsonColumnType = "jsonb";
+    private const string GeneralizedInvertedIndexMethod = "gin";
+
+    /// <summary>Gets registered products.</summary>
     public DbSet<ProductRow> Products => Set<ProductRow>();
+    /// <summary>Gets indexed package versions.</summary>
     public DbSet<PackageVersionRow> PackageVersions => Set<PackageVersionRow>();
+    /// <summary>Gets known content-addressed blobs.</summary>
     public DbSet<BlobRefRow> BlobRefs => Set<BlobRefRow>();
+    /// <summary>Gets verified blob placements.</summary>
     public DbSet<BlobPlacementRow> BlobPlacements => Set<BlobPlacementRow>();
+    /// <summary>Gets release drafts.</summary>
     public DbSet<ReleaseDraftRow> ReleaseDrafts => Set<ReleaseDraftRow>();
+    /// <summary>Gets published and staged releases.</summary>
     public DbSet<ReleaseRow> Releases => Set<ReleaseRow>();
+    /// <summary>Gets channel pointers.</summary>
     public DbSet<ChannelRow> Channels => Set<ChannelRow>();
+    /// <summary>Gets publish sessions.</summary>
     public DbSet<PublishSessionRow> PublishSessions => Set<PublishSessionRow>();
+    /// <summary>Gets append-only audit events.</summary>
     public DbSet<AuditEventRow> AuditEvents => Set<AuditEventRow>();
+    /// <summary>Gets trusted signing keys.</summary>
     public DbSet<TrustedKeyRow> TrustedKeys => Set<TrustedKeyRow>();
+    /// <summary>Gets product revocation documents.</summary>
     public DbSet<RevocationRow> Revocations => Set<RevocationRow>();
+    /// <summary>Gets publish upload grants.</summary>
     public DbSet<PublishGrantRow> PublishGrants => Set<PublishGrantRow>();
+    /// <summary>Gets consented telemetry events.</summary>
     public DbSet<TelemetryRow> Telemetry => Set<TelemetryRow>();
+    /// <summary>Gets monotonic sequence counters.</summary>
     public DbSet<SequenceReservationRow> SequenceReservations => Set<SequenceReservationRow>();
+    /// <summary>Gets individual allocated sequence claims.</summary>
     public DbSet<SequenceClaimRow> SequenceClaims => Set<SequenceClaimRow>();
 
+    /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<ProductRow>().HasKey(x => new { x.RepositoryId, x.ProductId });
         modelBuilder.Entity<PackageVersionRow>().HasKey(x => new { x.RepositoryId, x.PackageId, x.Version });
         modelBuilder.Entity<PackageVersionRow>().HasIndex(x => new { x.RepositoryId, x.PackageId, x.Sequence }).IsUnique();
-        modelBuilder.Entity<PackageVersionRow>().Property(x => x.WhenJson).HasColumnType("jsonb");
-        modelBuilder.Entity<PackageVersionRow>().HasIndex(x => x.WhenJson).HasMethod("gin");
+        modelBuilder.Entity<PackageVersionRow>().Property(x => x.WhenJson).HasColumnType(JsonColumnType);
+        modelBuilder.Entity<PackageVersionRow>().HasIndex(x => x.WhenJson).HasMethod(GeneralizedInvertedIndexMethod);
         modelBuilder.Entity<BlobRefRow>().HasKey(x => new { x.Algorithm, x.Hash });
         modelBuilder.Entity<BlobPlacementRow>().HasKey(x => new { x.RepositoryId, x.Algorithm, x.Hash, x.BackendId, x.ObjectKey });
         modelBuilder.Entity<BlobPlacementRow>().HasIndex(x => new { x.RepositoryId, x.Algorithm, x.Hash, x.VerifiedAt });
         modelBuilder.Entity<ReleaseDraftRow>().HasKey(x => new { x.RepositoryId, x.DraftId });
-        modelBuilder.Entity<ReleaseDraftRow>().Property(x => x.PayloadJson).HasColumnType("jsonb");
-        modelBuilder.Entity<ReleaseDraftRow>().HasIndex(x => x.PayloadJson).HasMethod("gin");
+        modelBuilder.Entity<ReleaseDraftRow>().Property(x => x.PayloadJson).HasColumnType(JsonColumnType);
+        modelBuilder.Entity<ReleaseDraftRow>().HasIndex(x => x.PayloadJson).HasMethod(GeneralizedInvertedIndexMethod);
         modelBuilder.Entity<ReleaseRow>().HasKey(x => new { x.RepositoryId, x.ProductId, x.ReleaseId });
         modelBuilder.Entity<ReleaseRow>().HasIndex(x => new { x.RepositoryId, x.ProductId, x.Sequence }).IsUnique();
         modelBuilder.Entity<ChannelRow>().HasKey(x => new { x.RepositoryId, x.ProductId, x.Channel });
@@ -46,7 +67,7 @@ public sealed class ManagementDbContext(DbContextOptions<ManagementDbContext> op
         modelBuilder.Entity<TrustedKeyRow>().HasKey(x => new { x.RepositoryId, x.KeyId });
         modelBuilder.Entity<RevocationRow>().HasKey(x => new { x.RepositoryId, x.ProductId });
         modelBuilder.Entity<PublishGrantRow>().HasKey(x => x.GrantId);
-        modelBuilder.Entity<PublishGrantRow>().Property(x => x.MultipartPartsJson).HasColumnType("jsonb");
+        modelBuilder.Entity<PublishGrantRow>().Property(x => x.MultipartPartsJson).HasColumnType(JsonColumnType);
         // PostgreSQL partitioned tables require a partition key in a primary key.
         // The identity remains globally unique in practice, while (Id, At) is the
         // relational key accepted by every partition.
@@ -59,74 +80,3 @@ public sealed class ManagementDbContext(DbContextOptions<ManagementDbContext> op
         modelBuilder.Entity<SequenceClaimRow>().HasKey(x => new { x.RepositoryId, x.Scope, x.Name, x.Value });
     }
 }
-
-public sealed class ProductRow { public required string RepositoryId { get; set; } public required string ProductId { get; set; } public DateTimeOffset CreatedAt { get; set; } }
-public sealed class PackageVersionRow
-{
-    public required string RepositoryId { get; set; }
-    public required string PackageId { get; set; }
-    public required string Version { get; set; }
-    public long Sequence { get; set; }
-    public required string ManifestDigest { get; set; }
-    public string? WhenJson { get; set; }
-    public string? FileTableJson { get; set; }
-    public bool Published { get; set; }
-}
-public sealed class BlobRefRow { public required string Algorithm { get; set; } public required string Hash { get; set; } public long Length { get; set; } public DateTimeOffset FirstSeenAt { get; set; } }
-public sealed class BlobPlacementRow
-{
-    public required string RepositoryId { get; set; }
-    public required string Algorithm { get; set; }
-    public required string Hash { get; set; }
-    public required string BackendId { get; set; }
-    public required string ObjectKey { get; set; }
-    public DateTimeOffset? VerifiedAt { get; set; }
-}
-public sealed class ReleaseDraftRow { public required string RepositoryId { get; set; } public required string DraftId { get; set; } public required string ProductId { get; set; } public required string PayloadJson { get; set; } public DateTimeOffset CreatedAt { get; set; } }
-public sealed class ReleaseRow { public required string RepositoryId { get; set; } public required string ProductId { get; set; } public required string ReleaseId { get; set; } public long Sequence { get; set; } public required string EnvelopeDigest { get; set; } public required string CoverageDigest { get; set; } public bool Published { get; set; } }
-public sealed class ChannelRow { public required string RepositoryId { get; set; } public required string ProductId { get; set; } public required string Channel { get; set; } public long ChannelSequence { get; set; } public required string ReleaseId { get; set; } public required string PointerDigest { get; set; } }
-public sealed class PublishSessionRow
-{
-    public required string SessionId { get; set; }
-    public required string RepositoryId { get; set; }
-    public DateTimeOffset ExpiresAt { get; set; }
-    public int MaxObjects { get; set; }
-    public long MaxTotalBytes { get; set; }
-    public int ObjectCount { get; set; }
-    public long TotalBytes { get; set; }
-    public bool Sealed { get; set; }
-}
-public sealed class AuditEventRow { public long Id { get; set; } public DateTimeOffset At { get; set; } public required string Actor { get; set; } public required string Action { get; set; } public required string Resource { get; set; } public required string Outcome { get; set; } }
-public sealed class TrustedKeyRow { public required string RepositoryId { get; set; } public required string KeyId { get; set; } public required string PublicKey { get; set; } public DateTimeOffset UpdatedAt { get; set; } }
-public sealed class RevocationRow { public required string RepositoryId { get; set; } public required string ProductId { get; set; } public required string EnvelopeJson { get; set; } public DateTimeOffset UpdatedAt { get; set; } }
-public sealed class PublishGrantRow
-{
-    public required string GrantId { get; set; }
-    public required string SessionId { get; set; }
-    public required string RepositoryId { get; set; }
-    public required string StagingKey { get; set; }
-    public required string Digest { get; set; }
-    public long Length { get; set; }
-    public DateTimeOffset ExpiresAt { get; set; }
-    public bool Used { get; set; }
-    public string Status { get; set; } = "issued";
-    public DateTimeOffset? ClaimedAt { get; set; }
-    public DateTimeOffset? ConsumedAt { get; set; }
-    public DateTimeOffset? InvalidatedAt { get; set; }
-    public string? MultipartUploadId { get; set; }
-    public long? MultipartPartSize { get; set; }
-    public bool MultipartCompleted { get; set; }
-    public bool MultipartCompleting { get; set; }
-    public string? MultipartPartsJson { get; set; }
-}
-public sealed class TelemetryRow { public long Id { get; set; } public DateTimeOffset At { get; set; } public string? ProductId { get; set; } public string? ReleaseId { get; set; } public string? PayloadJson { get; set; } }
-public sealed class SequenceReservationRow { public required string RepositoryId { get; set; } public required string Scope { get; set; } public required string Name { get; set; } public long NextValue { get; set; } public string? AllocatedSequencesJson { get; set; } }
-
-/// <summary>
-/// A single allocated sequence value.
-///
-/// Replaces the AllocatedSequencesJson array, which was deserialized, appended to, sorted and
-/// rewritten on every allocation and linearly scanned on every placement — quadratic work and
-/// an unboundedly growing row.
-/// </summary>
-public sealed class SequenceClaimRow { public required string RepositoryId { get; set; } public required string Scope { get; set; } public required string Name { get; set; } public long Value { get; set; } public DateTimeOffset AllocatedAt { get; set; } }

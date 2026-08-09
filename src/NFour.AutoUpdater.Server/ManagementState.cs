@@ -1,11 +1,10 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
-using System.Buffers.Binary;
+using System.Data;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Security.Cryptography;
-using System.Data;
 using NFour.AutoUpdater.Core;
 using NFour.AutoUpdater.Storage;
 using NFour.AutoUpdater.Storage.Local;
@@ -14,18 +13,17 @@ using NFour.AutoUpdater.Storage.Ftp;
 using NFour.AutoUpdater.Repository;
 using NFour.AutoUpdater.Publishing;
 using Microsoft.EntityFrameworkCore;
-using Npgsql;
 
 namespace NFour.AutoUpdater.Server;
 
+/// <summary>Coordinates repository publication, durable management state, and maintenance operations.</summary>
 public sealed class ManagementState
 {
-    private const string GrantIssued = "issued";
-    private const string GrantClaimed = "claimed";
-    private const string GrantConsumed = "consumed";
-    private const string GrantInvalidated = "invalidated";
+    private const string GrantIssued = GrantLifecycleStatus.Issued;
+    private const string GrantClaimed = GrantLifecycleStatus.Claimed;
+    private const string GrantConsumed = GrantLifecycleStatus.Consumed;
+    private const string GrantInvalidated = GrantLifecycleStatus.Invalidated;
     private const string GrantMultipartCompleting = "multipart-completing";
-    private const char SequenceKeySeparator = '\0';
     private const long S3SinglePutLimit = 5L * 1024 * 1024 * 1024;
     private static readonly TimeSpan GrantClaimLease = TimeSpan.FromMinutes(2);
 
@@ -74,18 +72,20 @@ public sealed class ManagementState
     // performed while holding any of them; per-grant exclusion during promotion comes from
     // the durable claim in TryClaimGrantAsync, not from a process lock.
     private readonly SemaphoreSlim _placementGate = new(1, 1);
-    private readonly SemaphoreSlim _sequenceGate = new(1, 1);
     private readonly SemaphoreSlim _packageGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionGates = new(StringComparer.Ordinal);
     private readonly string? _persistencePath;
     private readonly IDbContextFactory<ManagementDbContext>? _databaseFactory;
     private readonly string? _repositoryId;
+    private readonly SequenceAllocator _sequenceAllocator;
     private readonly ConcurrentDictionary<string, long> _sequenceCounters = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<long, byte>> _allocatedSequences = new(StringComparer.Ordinal);
     // A release lock or CAS digest mismatch is corruption, not ordinary projection
     // drift. Keep this state across restarts when the lightweight persistence store is
     // enabled so anonymous reads fail closed until reconciliation is clean again.
     private int _repositoryUnavailable;
+    /// <summary>Initializes management state over optional served, staging, file, and database persistence.</summary>
+    /// <param name="store">Authoritative served object store.</param><param name="persistencePath">Optional lightweight state-file path.</param><param name="stagingStore">Isolated staging object store.</param><param name="databaseFactory">Optional durable database-context factory.</param><param name="repositoryId">Optional repository scope.</param>
     public ManagementState(IWritableObjectStore? store = null, string? persistencePath = null, IWritableObjectStore? stagingStore = null, IDbContextFactory<ManagementDbContext>? databaseFactory = null, string? repositoryId = null)
     {
         if (stagingStore is null && store is LocalObjectStore or S3ObjectStore or FtpObjectStore)
@@ -94,12 +94,23 @@ public sealed class ManagementState
         _stagingStore = stagingStore ?? store;
         _persistencePath = string.IsNullOrWhiteSpace(persistencePath) ? null : Path.GetFullPath(persistencePath);
         _databaseFactory = databaseFactory;
+        _sequenceAllocator = new SequenceAllocator(
+            databaseFactory,
+            PackageVersions,
+            Releases,
+            Channels,
+            Revocations,
+            _sequenceCounters,
+            _allocatedSequences);
         if (!string.IsNullOrWhiteSpace(repositoryId) && !Identifier.IsValid(repositoryId, "repositoryId", out var repositoryError)) throw new FormatException(repositoryError);
         _repositoryId = string.IsNullOrWhiteSpace(repositoryId) ? null : repositoryId;
         Load();
     }
 
+    /// <summary>Determines whether the control plane serves a repository.</summary>
+    /// <param name="repository">Repository identifier.</param><returns><see langword="true"/> when the repository is in scope.</returns>
     public bool IsConfiguredRepository(string repository) => _repositoryId is null || string.Equals(_repositoryId, repository, StringComparison.Ordinal);
+    /// <summary>Gets whether detected corruption has made repository reads unavailable.</summary>
     public bool IsRepositoryUnavailable => Volatile.Read(ref _repositoryUnavailable) != 0;
     private string DatabaseRepositoryId => _repositoryId ?? "default";
     private static string IntegrityGuaranteeFor(IReadableObjectStore store) => store switch
@@ -109,6 +120,8 @@ public sealed class ManagementState
         _ => "verified"
     };
 
+    /// <summary>Loads durable projections and validates their authoritative stored objects.</summary>
+    /// <param name="cancellationToken">Token used to cancel database and storage access.</param>
     public async Task LoadDatabaseAsync(CancellationToken cancellationToken = default)
     {
         if (_databaseFactory is null) return;
@@ -222,21 +235,35 @@ public sealed class ManagementState
                     NormalizeGrantStatus(row.Status, row.Used), row.ClaimedAt, row.ConsumedAt, row.InvalidatedAt, row.MultipartUploadId, row.MultipartPartSize,
                     row.MultipartCompleted, row.MultipartCompleting, row.MultipartPartsJson);
     }
+    /// <summary>Gets the public repository base URL advertised by generated descriptors.</summary>
     public string RepositoryBaseUrl { get; init; } = "";
+    /// <summary>Gets registered products keyed by product identifier.</summary>
     public ConcurrentDictionary<string, object> Products { get; } = new(StringComparer.Ordinal);
+    /// <summary>Gets accepted package manifests keyed by repository, package, and version.</summary>
     public ConcurrentDictionary<(string Repository, string Package, string Version), byte[]> PackageVersions { get; } = new();
+    /// <summary>Gets registered file tables keyed by repository, package, and version.</summary>
     public ConcurrentDictionary<(string Repository, string Package, string Version), byte[]> PackageFileTableRegistrations { get; } = new();
+    /// <summary>Gets publication state keyed by repository, package, and version.</summary>
     public ConcurrentDictionary<(string Repository, string Package, string Version), bool> PublishedPackageVersions { get; } = new();
+    /// <summary>Gets release-draft payloads keyed by draft identifier.</summary>
     public ConcurrentDictionary<string, byte[]> ReleaseDrafts { get; } = new(StringComparer.Ordinal);
+    /// <summary>Gets each release draft's owning product.</summary>
     public ConcurrentDictionary<string, string> ReleaseDraftProducts { get; } = new(StringComparer.Ordinal);
+    /// <summary>Gets signed yank documents keyed by identifier.</summary>
     public ConcurrentDictionary<string, string> Yanks { get; } = new(StringComparer.Ordinal);
+    /// <summary>Gets signed revocation envelopes keyed by product and document name.</summary>
     public ConcurrentDictionary<(string Product, string Name), byte[]> Revocations { get; } = new();
+    /// <summary>Gets signed channel pointers keyed by product and channel.</summary>
     public ConcurrentDictionary<(string Product, string Channel), byte[]> Channels { get; } = new();
+    /// <summary>Gets signed release envelopes keyed by product and release.</summary>
     public ConcurrentDictionary<(string Product, string Release), byte[]> Releases { get; } = new();
+    /// <summary>Gets active publish-session markers keyed by session identifier.</summary>
     public ConcurrentDictionary<string, object> Sessions { get; } = new(StringComparer.Ordinal);
     private ConcurrentDictionary<string, SessionState> PublishSessions { get; } = new(StringComparer.Ordinal);
     private ConcurrentDictionary<string, GrantState> Grants { get; } = new(StringComparer.Ordinal);
+    /// <summary>Gets verified blob timestamps keyed by repository-scoped digest.</summary>
     public ConcurrentDictionary<string, DateTimeOffset> VerifiedBlobs { get; } = new(StringComparer.Ordinal);
+    /// <summary>Gets currently trusted public keys keyed by signing-key identifier.</summary>
     public ConcurrentDictionary<string, byte[]> TrustedKeys { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
@@ -256,7 +283,10 @@ public sealed class ManagementState
         foreach (var (keyId, value) in HistoricalKeys) keys.TryAdd(keyId, value);
         return keys;
     }
+    /// <summary>Describes one auditable management action.</summary>
+    /// <param name="At">Event time.</param><param name="Actor">Authenticated actor.</param><param name="Action">Action name.</param><param name="Resource">Affected resource.</param><param name="Outcome">Action outcome.</param>
     public sealed record AuditEvent(DateTimeOffset At, string Actor, string Action, string Resource, string Outcome);
+    /// <summary>Gets management audit events in append order.</summary>
     public ConcurrentQueue<AuditEvent> AuditEvents { get; } = new();
 
     /// <summary>Reads public signed artifacts from the authoritative store.</summary>
@@ -305,6 +335,8 @@ public sealed class ManagementState
             await projections.WriteProductAsync(new ProductDescriptor { ProductId = product }, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Replaces or adds trusted public signing keys and persists them.</summary>
+    /// <param name="keys">Validated key identifiers and Ed25519 public keys.</param>
     public void ConfigureTrustedKeys(IEnumerable<(string KeyId, byte[] PublicKey)> keys)
     {
         foreach (var (keyId, publicKey) in keys)
@@ -316,6 +348,8 @@ public sealed class ManagementState
         Persist();
         PersistTrustedKeysAsync().GetAwaiter().GetResult();
     }
+    /// <summary>Opens a bounded publish session for a repository.</summary>
+    /// <param name="repository">Repository identifier.</param><returns>The publish-session descriptor.</returns>
     public object OpenSession(string repository)
     {
         if (!Identifier.IsValid(repository, "repository", out var repositoryError)) throw new FormatException(repositoryError);
@@ -330,6 +364,8 @@ public sealed class ManagementState
         return new { sessionId = id, repository, backendId = "configured", maxObjects = 100_000, maxTotalBytes = 1_000_000_000_000L, expiresAt = expires };
     }
 
+    /// <summary>Returns requested SHA-256 digests with verified repository placements.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="requested">Candidate digest strings.</param><param name="cancellationToken">Token used to cancel lookup.</param><returns>Verified digest strings.</returns>
     public async ValueTask<string[]> QueryBlobsAsync(string repository, IEnumerable<string> requested, CancellationToken cancellationToken = default)
     {
         if (!IsValidConfiguredRepository(repository) || Volatile.Read(ref _repositoryUnavailable) != 0) return [];
@@ -364,158 +400,22 @@ public sealed class ManagementState
     private static string MultipartGrantPath(string repository, string sessionId, string grantId, string operation)
         => $"/api/v1/repositories/{Uri.EscapeDataString(repository)}/publish/sessions/{Uri.EscapeDataString(sessionId)}/grants/{Uri.EscapeDataString(grantId)}/{operation}";
 
+    /// <summary>Allocates the next durable monotonic value for a named sequence.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="scope">Sequence scope.</param><param name="name">Name within the scope.</param><param name="cancellationToken">Token used to cancel allocation.</param><returns>An HTTP result containing the allocated value.</returns>
     public async Task<IResult> AllocateSequenceAsync(string repository, string scope, string name, CancellationToken cancellationToken = default)
     {
         if (!IsConfiguredRepository(repository) || !Identifier.IsValid(repository, "repository", out var repositoryError)) return Results.NotFound();
-        if (scope is not ("package" or "release" or "channel" or "revocation") || string.IsNullOrWhiteSpace(name) || name.Any(char.IsControl)) return Results.BadRequest(new { error = "invalid_sequence_scope" });
-        long allocated;
-        await _sequenceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var key = CreateSequenceKey(repository, scope, name);
-            if (_databaseFactory is not null)
-            {
-                allocated = await AllocateSequenceFromDatabaseAsync(repository, scope, name, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                // AddOrUpdate already returns the value it stored. Assigning allocated + 1
-                // afterwards advanced the counter a second time, so allocations ran 1, 3, 5, …
-                // and every intervening value was permanently unusable.
-                allocated = _sequenceCounters.AddOrUpdate(key, _ => NextInMemorySequence(repository, scope, name), (_, value) => checked(value + 1));
-                _allocatedSequences.GetOrAdd(key, _ => new ConcurrentDictionary<long, byte>())[allocated] = 0;
-            }
-        }
-        finally { _sequenceGate.Release(); }
+        if (!SequenceAllocator.IsSupportedScope(scope) || string.IsNullOrWhiteSpace(name) || name.Any(char.IsControl)) return Results.BadRequest(new { error = "invalid_sequence_scope" });
+        var allocated = await _sequenceAllocator.AllocateAsync(repository, scope, name, cancellationToken).ConfigureAwait(false);
         RecordAudit("publisher", "sequence.allocate", $"{repository}/{scope}/{name}", "accepted");
         return Results.Ok(new { repository, scope, name, sequence = allocated });
     }
 
-    private long NextInMemorySequence(string repository, string scope, string name)
-    {
-        var maximum = scope switch
-        {
-            "package" => PackageVersions.Where(x => x.Key.Repository == repository && x.Key.Package == name).Select(x => RepositoryJson.DeserializeManifest(x.Value).Sequence).DefaultIfEmpty(0).Max(),
-            "release" => Releases.Where(x => x.Key.Product == name).Select(x => SignedDocument.DeserializePayload<ReleaseLock>(Base64Url.Decode(SignedDocument.DeserializeEnvelope(x.Value).Payload)).Sequence).DefaultIfEmpty(0).Max(),
-            "channel" => Channels.Where(x => x.Key.Product + ":" + x.Key.Channel == name).Select(x => SignedDocument.DeserializePayload<ChannelPointer>(Base64Url.Decode(SignedDocument.DeserializeEnvelope(x.Value).Payload)).ChannelSequence).DefaultIfEmpty(0).Max(),
-            "revocation" => Revocations.Where(x => x.Key.Product == name && x.Key.Name == "revocations").Select(x => SignedDocument.DeserializePayload<RevocationDocument>(Base64Url.Decode(SignedDocument.DeserializeEnvelope(x.Value).Payload)).RevocationSequence).DefaultIfEmpty(0).Max(),
-            _ => 0
-        };
-        return checked(maximum + 1);
-    }
-
-    /// <summary>
-    /// Allocates the next sequence for a scope inside a serializable transaction.
-    ///
-    /// Serializable isolation means a concurrent allocator can legitimately abort this
-    /// transaction; without a retry that surfaces to the publisher as a hard failure the
-    /// moment two instances allocate at once, which is precisely the deployment the isolation
-    /// level exists to support. Conflicts are therefore retried a bounded number of times.
-    /// </summary>
-    private async Task<long> AllocateSequenceFromDatabaseAsync(string repository, string scope, string name, CancellationToken cancellationToken)
-    {
-        for (var attempt = 0; ; attempt++)
-        {
-            try
-            {
-                await using var database = await _databaseFactory!.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-                await using var transaction = await database.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
-                // Serializable isolation alone does not lock a missing reservation row. Two
-                // instances can therefore both observe the initial absence, allocate the
-                // same first value, and then repeatedly collide in lockstep while retrying.
-                // A transaction-scoped advisory lock serializes one logical sequence even
-                // before its row exists. Hash collisions only serialize unrelated scopes;
-                // they cannot compromise allocation correctness.
-                var sequenceLockId = CreateSequenceLockId(repository, scope, name);
-                await database.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({sequenceLockId})", cancellationToken).ConfigureAwait(false);
-                var row = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
-                long allocated;
-                if (row is null)
-                {
-                    var current = scope switch
-                    {
-                        "package" => await database.PackageVersions.Where(x => x.RepositoryId == repository && x.PackageId == name).Select(x => (long?)x.Sequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
-                        "release" => await database.Releases.Where(x => x.RepositoryId == repository && x.ProductId == name).Select(x => (long?)x.Sequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
-                        "channel" => await database.Channels.Where(x => x.RepositoryId == repository && x.ProductId + ":" + x.Channel == name).Select(x => (long?)x.ChannelSequence).MaxAsync(cancellationToken).ConfigureAwait(false) ?? 0,
-                        "revocation" => 0,
-                        _ => 0
-                    };
-                    allocated = checked(current + 1);
-                    database.SequenceReservations.Add(new SequenceReservationRow { RepositoryId = repository, Scope = scope, Name = name, NextValue = checked(allocated + 1) });
-                }
-                else
-                {
-                    allocated = row.NextValue;
-                    row.NextValue = checked(allocated + 1);
-                }
-
-                // One row per claim. The composite key rejects a duplicate on insert instead of
-                // silently absorbing it into a rewritten array.
-                database.SequenceClaims.Add(new SequenceClaimRow { RepositoryId = repository, Scope = scope, Name = name, Value = allocated, AllocatedAt = DateTimeOffset.UtcNow });
-                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return allocated;
-            }
-            catch (Exception ex) when (attempt < DatabaseConcurrencyRetries && IsTransientConcurrencyFailure(ex))
-            {
-                await DelayForDatabaseConcurrencyRetryAsync(attempt, cancellationToken).ConfigureAwait(false);
-            }
-        }
-    }
-
-    private const int DatabaseConcurrencyRetries = 5;
-    private const int DatabaseConcurrencyRetryBaseDelayMilliseconds = 20;
-
-    /// <summary>
-    /// True for a database failure that a retry can plausibly resolve: PostgreSQL
-    /// serialization failure, deadlock detected, and the unique violation produced when two
-    /// idempotent transactions both observe that a reservation, blob reference, or placement
-    /// row is absent and race to create it. Callers use this only around sequence allocation
-    /// and promotion, where re-reading and retrying is the intended upsert behavior.
-    /// </summary>
-    private static bool IsTransientConcurrencyFailure(Exception exception)
-    {
-        for (var current = exception; current is not null; current = current.InnerException)
-        {
-            if (current is PostgresException { SqlState: PostgresErrorCodes.SerializationFailure
-                or PostgresErrorCodes.DeadlockDetected
-                or PostgresErrorCodes.UniqueViolation }) return true;
-        }
-        return false;
-    }
-
-    private static Task DelayForDatabaseConcurrencyRetryAsync(int attempt, CancellationToken cancellationToken)
-        => Task.Delay(TimeSpan.FromMilliseconds(DatabaseConcurrencyRetryBaseDelayMilliseconds * (attempt + 1)), cancellationToken);
-
-    private static string CreateSequenceKey(string repository, string scope, string name)
-        => string.Concat(repository, SequenceKeySeparator, scope, SequenceKeySeparator, name);
-
-    private static long CreateSequenceLockId(string repository, string scope, string name)
-    {
-        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(CreateSequenceKey(repository, scope, name)));
-        return BinaryPrimitives.ReadInt64LittleEndian(digest);
-    }
-
     private async ValueTask<bool> WasSequenceAllocatedAsync(string repository, string scope, string name, long sequence, CancellationToken cancellationToken)
-    {
-        if (sequence < 1) return false;
-        if (_databaseFactory is not null)
-        {
-            await using var database = await _databaseFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-            // Primary-key lookup rather than deserializing and scanning an array that grew
-            // with every allocation ever made for this scope.
-            if (await database.SequenceClaims.AnyAsync(x => x.RepositoryId == repository && x.Scope == scope && x.Name == name && x.Value == sequence, cancellationToken).ConfigureAwait(false))
-                return true;
+        => await _sequenceAllocator.WasAllocatedAsync(repository, scope, name, sequence, cancellationToken).ConfigureAwait(false);
 
-            // Reservations created before claims were tracked have no claim rows. Their
-            // monotonic counter is the only durable evidence, so already-issued values stay
-            // valid while every new value must come from an explicit claim.
-            var reservation = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
-            return reservation is not null && reservation.AllocatedSequencesJson is null && sequence < reservation.NextValue;
-        }
-        return _allocatedSequences.TryGetValue(CreateSequenceKey(repository, scope, name), out var allocatedSequences) && allocatedSequences.ContainsKey(sequence);
-    }
-
+    /// <summary>Validates and records a consented telemetry request.</summary>
+    /// <param name="request">Request carrying the telemetry JSON.</param><param name="cancellationToken">Token used to cancel ingestion.</param><returns>The ingestion result.</returns>
     public async Task<IResult> RecordTelemetryAsync(HttpRequest request, CancellationToken cancellationToken = default)
     {
         byte[] bytes;
@@ -530,6 +430,8 @@ public sealed class ManagementState
         return Results.Accepted();
     }
 
+    /// <summary>Mints bounded upload grants for a publish session.</summary>
+    /// <param name="sessionId">Publish-session identifier.</param><param name="request">Request describing intended blobs.</param><param name="repository">Optional explicit repository scope.</param><returns>The grant-minting result.</returns>
     public async Task<IResult> CreateGrantsAsync(string sessionId, HttpRequest request, string? repository = null)
     {
         await RefreshPublishStateAsync(request.HttpContext.RequestAborted).ConfigureAwait(false);
@@ -662,6 +564,8 @@ public sealed class ManagementState
         finally { _placementGate.Release(); }
     }
 
+    /// <summary>Lists provider-confirmed parts for a multipart upload grant.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="sessionId">Publish-session identifier.</param><param name="grantId">Upload-grant identifier.</param><param name="cancellationToken">Token used to cancel provider access.</param><returns>The multipart-part listing result.</returns>
     public async Task<IResult> ListMultipartGrantPartsAsync(string repository, string sessionId, string grantId, CancellationToken cancellationToken = default)
     {
         if (!IsValidConfiguredRepository(repository) || !Grants.TryGetValue(grantId, out var grant) || !string.Equals(grant.Repository, repository, StringComparison.Ordinal) || !string.Equals(grant.SessionId, sessionId, StringComparison.Ordinal))
@@ -674,6 +578,8 @@ public sealed class ManagementState
         return Results.Json(new { parts = parts.OrderBy(part => part.Number).Select(part => new { number = part.Number, etag = part.ETag, length = part.Length }).ToArray() });
     }
 
+    /// <summary>Completes a multipart grant using a validated, resumable part list.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="sessionId">Publish-session identifier.</param><param name="grantId">Upload-grant identifier.</param><param name="request">Request carrying completed parts.</param><param name="cancellationToken">Token used to cancel completion.</param><returns>The completion result.</returns>
     public async Task<IResult> CompleteMultipartGrantAsync(string repository, string sessionId, string grantId, HttpRequest request, CancellationToken cancellationToken = default)
     {
         await _placementGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -771,6 +677,8 @@ public sealed class ManagementState
         finally { _placementGate.Release(); }
     }
 
+    /// <summary>Aborts and invalidates a multipart upload grant.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="sessionId">Publish-session identifier.</param><param name="grantId">Upload-grant identifier.</param><param name="cancellationToken">Token used to cancel the abort.</param><returns>The abort result.</returns>
     public async Task<IResult> AbortMultipartGrantAsync(string repository, string sessionId, string grantId, CancellationToken cancellationToken = default)
     {
         await _placementGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1109,8 +1017,12 @@ public sealed class ManagementState
         }
     }
 
+    /// <summary>Synchronously seals a publish session and promotes its staged objects.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="sessionId">Publish-session identifier.</param><returns>The seal result.</returns>
     public IResult SealSession(string repository, string sessionId) => SealSessionAsync(repository, sessionId).GetAwaiter().GetResult();
 
+    /// <summary>Validates and atomically places a monotonic signed key manifest.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="request">Request carrying the signed manifest.</param><param name="cancellationToken">Token used to cancel placement.</param><returns>The placement result.</returns>
     public async Task<IResult> PlaceSignedKeyManifestAsync(string repository, HttpRequest request, CancellationToken cancellationToken = default)
     {
         if (!IsConfiguredRepository(repository) || !Identifier.IsValid(repository, "repository", out var repositoryError)) return Results.NotFound();
@@ -1181,6 +1093,8 @@ public sealed class ManagementState
         finally { _placementGate.Release(); }
     }
 
+    /// <summary>Validates and registers a package-version manifest.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="package">Package identifier.</param><param name="request">Request carrying the manifest.</param><param name="cancellationToken">Token used to cancel registration.</param><returns>The registration result.</returns>
     public async Task<IResult> RegisterPackageVersionAsync(string repository, string package, HttpRequest request, CancellationToken cancellationToken = default)
     {
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
@@ -1226,6 +1140,8 @@ public sealed class ManagementState
         finally { _packageGate.Release(); }
     }
 
+    /// <summary>Registers the file table matching a package-version manifest.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="package">Package identifier.</param><param name="version">Package version label.</param><param name="request">Request carrying the file table.</param><param name="cancellationToken">Token used to cancel registration.</param><returns>The registration result.</returns>
     public async Task<IResult> RegisterFileTableAsync(string repository, string package, string version, HttpRequest request, CancellationToken cancellationToken = default)
     {
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
@@ -1257,6 +1173,8 @@ public sealed class ManagementState
         catch (Exception ex) when (ex is JsonException or FormatException or InvalidDataException) { return Results.BadRequest(new { error = "invalid_file_table", detail = ex.Message }); }
     }
 
+    /// <summary>Marks a fully registered package version as published.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="package">Package identifier.</param><param name="version">Package version label.</param><returns>The publication result.</returns>
     public async Task<IResult> PublishPackageVersion(string repository, string package, string version)
     {
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
@@ -1276,6 +1194,8 @@ public sealed class ManagementState
         return Results.Ok(new { package, version, state = "published" });
     }
 
+    /// <summary>Creates a validated release draft for a product.</summary>
+    /// <param name="product">Product identifier.</param><param name="request">Request carrying the draft payload.</param><param name="cancellationToken">Token used to cancel creation.</param><returns>The draft-creation result.</returns>
     public async Task<IResult> CreateReleaseDraftAsync(string product, HttpRequest request, CancellationToken cancellationToken = default)
     {
         if (!Identifier.IsValid(product, "productId", out var error)) return Results.BadRequest(new { error });
@@ -1293,6 +1213,8 @@ public sealed class ManagementState
         return Results.Created($"/api/v1/products/{product}/releases/drafts/{id}", new { draftId = id, product });
     }
 
+    /// <summary>Runs publish-gate validation over a release draft.</summary>
+    /// <param name="product">Product identifier.</param><param name="draft">Draft identifier.</param><returns>The validation result and diagnostics.</returns>
     public IResult CheckReleaseDraft(string product, string draft)
     {
         if (!ReleaseDrafts.ContainsKey(draft)) return Results.NotFound();
@@ -1335,6 +1257,8 @@ public sealed class ManagementState
         }
     }
 
+    /// <summary>Registers the coverage document bound to a release draft.</summary>
+    /// <param name="product">Product identifier.</param><param name="draft">Draft identifier.</param><param name="request">Request carrying coverage JSON.</param><param name="cancellationToken">Token used to cancel registration.</param><returns>The registration result.</returns>
     public async Task<IResult> RegisterReleaseDraftCoverageAsync(string product, string draft, HttpRequest request, CancellationToken cancellationToken = default)
     {
         if (!ReleaseDrafts.TryGetValue(draft, out var draftBytes) || !ReleaseDraftProducts.TryGetValue(draft, out var storedProduct) || !string.Equals(storedProduct, product, StringComparison.Ordinal)) return Results.NotFound();
@@ -1351,6 +1275,8 @@ public sealed class ManagementState
         catch (Exception ex) when (ex is FormatException or JsonException or InvalidDataException) { return Results.BadRequest(new { error = "invalid_coverage", detail = ex.Message }); }
     }
 
+    /// <summary>Moves a verified blob to quarantine and removes its placement records.</summary>
+    /// <param name="hash">Content digest to quarantine.</param><param name="cancellationToken">Token used to cancel storage access.</param><returns>The quarantine result.</returns>
     public async Task<IResult> QuarantineBlobAsync(string hash, CancellationToken cancellationToken = default)
     {
         if (!ContentHash.TryParse(hash, out var digest) || digest.Algorithm != HashAlgorithmId.Sha256) return Results.BadRequest(new { error = "invalid_hash" });
@@ -1409,6 +1335,8 @@ public sealed class ManagementState
         return Results.Accepted(value: new { hash, quarantined = true });
     }
 
+    /// <summary>Collects unreachable served objects while preserving unverifiable release graphs.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="dryRun">Whether to report without mutating storage.</param><param name="cancellationToken">Token used to cancel collection.</param><returns>The collection report.</returns>
     public async Task<IResult> CollectGcAsync(string repository, bool dryRun, CancellationToken cancellationToken = default)
     {
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
@@ -1448,6 +1376,8 @@ public sealed class ManagementState
         catch (Exception ex) when (ex is FormatException or InvalidDataException or CryptographicException) { return Results.BadRequest(new { error = ex.Message }); }
     }
 
+    /// <summary>Collects expired staging objects without racing active sessions on other instances.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="dryRun">Whether to report without mutating staging.</param><param name="cancellationToken">Token used to cancel collection.</param><returns>The staging-collection report.</returns>
     public async Task<IResult> CollectStagingGcAsync(string repository, bool dryRun, CancellationToken cancellationToken = default)
     {
         if (!IsValidConfiguredRepository(repository)) return Results.NotFound();
@@ -1490,6 +1420,8 @@ public sealed class ManagementState
         return Results.Ok(new { dryRun, deleted = deleted.ToArray(), count = deleted.Count, abortedMultipart });
     }
 
+    /// <summary>Reconciles durable projections against authoritative repository objects.</summary>
+    /// <param name="repository">Repository identifier.</param><param name="cancellationToken">Token used to cancel reconciliation.</param><returns>The reconciliation report.</returns>
     public async Task<IResult> ReconcileAsync(string repository, CancellationToken cancellationToken = default)
     {
         if (!IsConfiguredRepository(repository)) return Results.NotFound();
@@ -1623,6 +1555,8 @@ public sealed class ManagementState
         return Results.Ok(new { repaired = repaired.ToArray(), alerts = alerts.ToArray(), scanned = seen.Count, unavailable = false });
     }
 
+    /// <summary>Validates and places a signed product control document.</summary>
+    /// <param name="expectedType">Required signed-document type.</param><param name="product">Product identifier.</param><param name="name">Document name.</param><param name="request">Request carrying the signed envelope.</param><param name="target">In-memory projection updated after placement.</param><returns>The placement result.</returns>
     public async Task<IResult> PlaceSignedAsync(string expectedType, string product, string name, HttpRequest request, ConcurrentDictionary<(string, string), byte[]> target)
     {
         byte[] bytes;
@@ -2047,6 +1981,8 @@ public sealed class ManagementState
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <param name="repository">Repository whose public package projection is rebuilt.</param>
+    /// <param name="package">Package whose public version index is rebuilt.</param>
     /// <param name="alsoPublished">
     /// A version that is about to be committed as published.  Passing it lets the projection
     /// be written before the publication flag is durable, so a projection failure aborts the
@@ -2243,9 +2179,9 @@ public sealed class ManagementState
                 await PersistPromotionAttemptAsync(databaseFactory, grant, repository, verifiedAt, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (Exception ex) when (attempt < DatabaseConcurrencyRetries && IsTransientConcurrencyFailure(ex))
+            catch (Exception ex) when (attempt < DatabaseConcurrencyPolicy.MaximumRetries && DatabaseConcurrencyPolicy.IsTransient(ex))
             {
-                await DelayForDatabaseConcurrencyRetryAsync(attempt, cancellationToken).ConfigureAwait(false);
+                await DatabaseConcurrencyPolicy.DelayBeforeRetryAsync(attempt, cancellationToken).ConfigureAwait(false);
             }
         }
     }

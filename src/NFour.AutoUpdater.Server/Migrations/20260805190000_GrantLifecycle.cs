@@ -5,10 +5,12 @@ using Microsoft.EntityFrameworkCore.Migrations;
 
 namespace NFour.AutoUpdater.Server.Migrations;
 
+/// <summary>Adds durable grant lifecycle and multipart-upload state.</summary>
 [Migration("20260805190000_GrantLifecycle")]
 [DbContext(typeof(ManagementDbContext))]
 public partial class GrantLifecycle : Migration
 {
+    /// <inheritdoc />
     protected override void Up(MigrationBuilder migrationBuilder)
     {
         migrationBuilder.AddColumn<string>(name: "Status", table: "PublishGrants", type: "text", nullable: false, defaultValue: "issued");
@@ -22,6 +24,7 @@ public partial class GrantLifecycle : Migration
         migrationBuilder.AddColumn<string>(name: "MultipartPartsJson", table: "PublishGrants", type: "jsonb", nullable: true);
     }
 
+    /// <inheritdoc />
     protected override void Down(MigrationBuilder migrationBuilder)
     {
         migrationBuilder.DropColumn(name: "Status", table: "PublishGrants");
