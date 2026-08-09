@@ -4,6 +4,8 @@ Design documents for the NFour AutoUpdater: a content-addressed, multi-backend p
 distribution and installation system for the 4Story client, NFour server artifacts, and
 general-purpose deployment.
 
+For current build and command usage, start with the maintained [documentation index](../README.md).
+
 **Status:** implementation baseline. The repository is being reconciled against this normative
 document set; deferred features remain explicitly listed in [14-open-questions.md](14-open-questions.md).
 
