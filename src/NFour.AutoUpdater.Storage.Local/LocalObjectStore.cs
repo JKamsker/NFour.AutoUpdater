@@ -3,14 +3,21 @@ using NFour.AutoUpdater.Storage;
 
 namespace NFour.AutoUpdater.Storage.Local;
 
+/// <summary>Stores repository objects beneath a link-safe local filesystem root.</summary>
 public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideTransferStore, IServerSideVerifier
 {
     private readonly string _root;
+    /// <summary>Initializes a local store rooted at an absolute filesystem path.</summary>
+    /// <param name="root">The directory that contains repository objects.</param>
     public LocalObjectStore(string root) => _root = Path.GetFullPath(root);
+    /// <summary>Gets the absolute storage root.</summary>
     public string Root => _root;
+    /// <inheritdoc />
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ConditionalWrite | StorageCapabilities.ServerSideCopy | StorageCapabilities.Delete;
+    /// <inheritdoc />
     public int RecommendedParallelism => 16;
 
+    /// <inheritdoc />
     public ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
         var path = Resolve(key);
@@ -29,11 +36,13 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         stream.Position = offset;
         return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = stream, ActualStartOffset = offset, StatusCode = offset == 0 ? 200 : 206, Validator = validator });
     }
+    /// <inheritdoc />
     public ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
         var info = new FileInfo(Resolve(key));
         return ValueTask.FromResult(info.Exists ? new ObjectHead(info.Length, Validator(info), LastModified: info.LastWriteTimeUtc) : null);
     }
+    /// <inheritdoc />
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(_root)) yield break;
@@ -49,6 +58,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
             await Task.Yield();
         }
     }
+    /// <inheritdoc />
     public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
@@ -62,6 +72,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
             else if (prefixes.Add(key.Value[..(root.Length + separator + delimiter.Length)])) yield return new ObjectListing(null, key.Value[..(root.Length + separator + delimiter.Length)]);
         }
     }
+    /// <inheritdoc />
     public async ValueTask PutAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         var destination = Resolve(key);
@@ -75,6 +86,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
+    /// <inheritdoc />
     public async ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
         await using var keyLock = await AcquireKeyLockAsync(key, cancellationToken).ConfigureAwait(false);
@@ -85,6 +97,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
             FlushContainingDirectory(path);
         }
     }
+    /// <inheritdoc />
     public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         var destination = Resolve(key);
@@ -99,6 +112,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
+    /// <inheritdoc />
     public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         ValidateCasKey(key, expectedDigest);
@@ -123,6 +137,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
+    /// <inheritdoc />
     public async ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         var destination = Resolve(key);
@@ -134,6 +149,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         try { File.Move(temporary, destination, overwrite: true); FlushContainingDirectory(destination); return true; }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
+    /// <inheritdoc />
     public async ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
         await using var keyLock = await AcquireKeyLockAsync(destination, cancellationToken).ConfigureAwait(false);
@@ -154,6 +170,7 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
+    /// <inheritdoc />
     public async ValueTask<bool> TryCopyFromAsync(IReadableObjectStore sourceStore, ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
         if (sourceStore is not LocalObjectStore local) return false;
@@ -179,12 +196,14 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
         return true;
     }
+    /// <inheritdoc />
     public async ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expected, CancellationToken cancellationToken = default)
     {
         var path = Resolve(key); if (!File.Exists(path)) return false;
         await using var stream = File.OpenRead(path);
         return await ContentHash.ComputeAsync(stream, expected.Algorithm, cancellationToken).ConfigureAwait(false) == expected;
     }
+    /// <inheritdoc />
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
     /// <summary>

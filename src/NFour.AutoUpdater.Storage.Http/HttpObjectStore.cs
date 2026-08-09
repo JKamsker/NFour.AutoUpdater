@@ -3,11 +3,15 @@ using NFour.AutoUpdater.Storage;
 
 namespace NFour.AutoUpdater.Storage.Http;
 
+/// <summary>Reads repository objects over origin-pinned HTTP or HTTPS.</summary>
 public sealed class HttpObjectStore : IRangeReadableObjectStore
 {
     private readonly HttpClient _client;
     private readonly Uri _baseUri;
 
+    /// <summary>Initializes an origin-pinned HTTP object store.</summary>
+    /// <param name="baseUri">The absolute repository base URI.</param>
+    /// <param name="handler">The underlying HTTP transport handler.</param>
     /// <param name="additionalAllowedOrigins">
     /// Extra origins a redirect may target, for deployments that legitimately redirect blob
     /// reads to a CDN or storage endpoint. The base URI's own origin is always permitted.
@@ -31,9 +35,12 @@ public sealed class HttpObjectStore : IRangeReadableObjectStore
             origins,
             handler ?? new HttpClientHandler { AutomaticDecompression = System.Net.DecompressionMethods.None, AllowAutoRedirect = false }));
     }
+    /// <inheritdoc />
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range;
+    /// <inheritdoc />
     public int RecommendedParallelism => 32;
 
+    /// <inheritdoc />
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
         if (offset > 0 && ifMatch is not { IsStrong: true }) offset = 0;
@@ -66,6 +73,7 @@ public sealed class HttpObjectStore : IRangeReadableObjectStore
             ContentEncoding = null
         };
     }
+    /// <inheritdoc />
     public async ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
         using var response = await _client.SendAsync(new HttpRequestMessage(HttpMethod.Head, new Uri(_baseUri, key.Value)), HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
@@ -77,6 +85,7 @@ public sealed class HttpObjectStore : IRangeReadableObjectStore
             throw new InvalidDataException($"HEAD response for blob '{key}' did not include Content-Length.");
         return new ObjectHead(length, ReadValidator(response), null, response.Content.Headers.ContentType?.MediaType, response.Headers.AcceptRanges.Contains("bytes"), response.Content.Headers.LastModified?.ToUniversalTime(), response.Headers.CacheControl?.ToString());
     }
+    /// <inheritdoc />
     public ValueTask DisposeAsync() { _client.Dispose(); return ValueTask.CompletedTask; }
     private static ObjectValidator? ReadValidator(HttpResponseMessage response) => response.Headers.ETag is { } etag ? new(ObjectValidatorKind.ETag, etag.Tag, !etag.IsWeak) : response.Content.Headers.LastModified is { } modified ? new(ObjectValidatorKind.LastModified, modified.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture), false) : null;
 

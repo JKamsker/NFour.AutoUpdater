@@ -25,6 +25,10 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
     private readonly bool _enableSsl;
     private readonly bool _allowUntrustedCertificateForTesting;
 
+    /// <summary>Initializes an FTP or explicit-FTPS object store.</summary>
+    /// <param name="baseUri">The absolute FTP repository base URI.</param>
+    /// <param name="credentials">The credentials supplied to the FTP server.</param>
+    /// <param name="enableSsl">Whether explicit TLS is required.</param>
     public FtpObjectStore(Uri baseUri, NetworkCredential credentials, bool enableSsl = true)
         : this(baseUri, credentials, enableSsl, allowUntrustedCertificateForTesting: false)
     {
@@ -52,9 +56,12 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
     // only validator this protocol offers and it is weak, so OpenAsync refuses every ranged
     // request a normal caller could construct.  Advertising a capability no caller can
     // safely exercise would only produce silent restarts.
+    /// <inheritdoc />
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.Delete;
+    /// <inheritdoc />
     public int RecommendedParallelism => TransportParallelism;
 
+    /// <inheritdoc />
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
         // Ownership of the client transfers to the returned ClientResponseStream on the
@@ -87,6 +94,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         }
     }
 
+    /// <inheritdoc />
     public async ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
         await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -97,6 +105,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         return new ObjectHead(size, new(ObjectValidatorKind.SizeAndMtime, $"{size}{ValidatorFieldSeparator}{modified.ToUniversalTime().Ticks}", false), LastModified: modified.ToUniversalTime());
     }
 
+    /// <inheritdoc />
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -112,6 +121,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
             if (prefix is null || value.StartsWith(prefix.Trim('/'), StringComparison.Ordinal)) yield return new ObjectKey(value);
         }
     }
+    /// <inheritdoc />
     public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
@@ -126,6 +136,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         }
     }
 
+    /// <inheritdoc />
     public async ValueTask PutAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -146,6 +157,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         }
     }
 
+    /// <inheritdoc />
     public async ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
         await using var client = await ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -153,6 +165,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         if (await client.FileExists(path, cancellationToken).ConfigureAwait(false)) await client.DeleteFile(path, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
     public async ValueTask<bool> TryCopyFromAsync(IReadableObjectStore sourceStore, ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
         // When staging and served content share this FTP tree, promotion is an
@@ -178,6 +191,7 @@ public sealed class FtpObjectStore : IDelimitedObjectStore, IWritableObjectStore
         return true;
     }
 
+    /// <inheritdoc />
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
     private async ValueTask<AsyncFtpClient> ConnectAsync(CancellationToken cancellationToken)

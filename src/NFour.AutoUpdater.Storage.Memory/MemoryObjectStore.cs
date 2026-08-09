@@ -3,15 +3,19 @@ using NFour.AutoUpdater.Storage;
 
 namespace NFour.AutoUpdater.Storage.Memory;
 
+/// <summary>Provides a concurrent, process-local object store for tests and ephemeral workflows.</summary>
 public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IConditionalWriteStore, IContentAddressedWriteStore, IServerSideCopyStore, IServerSideVerifier
 {
     private sealed record Entry(byte[] Bytes, DateTimeOffset LastModified, string ETag);
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private static readonly StringComparer Comparer = StringComparer.Ordinal;
 
+    /// <inheritdoc />
     public StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ConditionalWrite | StorageCapabilities.ServerSideCopy | StorageCapabilities.Delete;
+    /// <inheritdoc />
     public int RecommendedParallelism => 32;
 
+    /// <inheritdoc />
     public ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
         if (!_entries.TryGetValue(key.Value, out var entry)) return ValueTask.FromResult<ReadResult?>(null);
@@ -25,7 +29,9 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
         // ETag and validator continue to describe the original bytes.
         return ValueTask.FromResult<ReadResult?>(new ReadResult { Content = new MemoryStream(entry.Bytes, (int)offset, entry.Bytes.Length - (int)offset, writable: false, publiclyVisible: false), ActualStartOffset = offset, StatusCode = offset == 0 ? 200 : 206, Validator = new(ObjectValidatorKind.ETag, entry.ETag) });
     }
+    /// <inheritdoc />
     public ValueTask<ObjectHead?> HeadAsync(ObjectKey key, CancellationToken cancellationToken = default) => ValueTask.FromResult(_entries.TryGetValue(key.Value, out var entry) ? new ObjectHead(entry.Bytes.LongLength, new(ObjectValidatorKind.ETag, entry.ETag), LastModified: entry.LastModified) : null);
+    /// <inheritdoc />
     public async IAsyncEnumerable<ObjectKey> ListAsync(string? prefix = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         foreach (var key in _entries.Keys.OrderBy(static x => x, Comparer))
@@ -35,6 +41,7 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
             await Task.Yield();
         }
     }
+    /// <inheritdoc />
     public async IAsyncEnumerable<ObjectListing> ListAsync(string? prefix, string delimiter, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(delimiter)) throw new ArgumentException("A delimiter is required.", nameof(delimiter));
@@ -51,13 +58,17 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
             await Task.Yield();
         }
     }
+    /// <inheritdoc />
     public async ValueTask PutAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default) => _entries[key.Value] = await CreateEntryAsync(content, cancellationToken).ConfigureAwait(false);
+    /// <inheritdoc />
     public ValueTask DeleteAsync(ObjectKey key, CancellationToken cancellationToken = default) { _entries.TryRemove(key.Value, out _); return ValueTask.CompletedTask; }
+    /// <inheritdoc />
     public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         var entry = await CreateEntryAsync(content, cancellationToken).ConfigureAwait(false);
         return _entries.TryAdd(key.Value, entry);
     }
+    /// <inheritdoc />
     public async ValueTask<bool> CompareAndSwapAsync(ObjectKey key, ObjectValidator expected, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         if (expected.Kind != ObjectValidatorKind.ETag || !expected.IsStrong) return false;
@@ -69,6 +80,7 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
         }
         return false;
     }
+    /// <inheritdoc />
     public async ValueTask<bool> PutIfAbsentAsync(ObjectKey key, ContentHash expectedDigest, Stream content, long? length = null, CancellationToken cancellationToken = default)
     {
         if (expectedDigest.Algorithm != HashAlgorithmId.Sha256 || !string.Equals(key.Value.Split('/').Last(), Convert.ToHexString(expectedDigest.Span).ToLowerInvariant(), StringComparison.Ordinal))
@@ -77,6 +89,7 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
         if (ContentHash.Compute(entry.Bytes, HashAlgorithmId.Sha256) != expectedDigest) throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
         return _entries.TryAdd(key.Value, entry);
     }
+    /// <inheritdoc />
     public ValueTask CopyAsync(ObjectKey source, ObjectKey destination, bool overwrite = false, CancellationToken cancellationToken = default)
     {
         if (!_entries.TryGetValue(source.Value, out var entry)) throw new FileNotFoundException(source.Value);
@@ -85,12 +98,14 @@ public sealed class MemoryObjectStore : IDelimitedObjectStore, IRangeReadableObj
         if (overwrite) _entries[destination.Value] = copy;
         return ValueTask.CompletedTask;
     }
+    /// <inheritdoc />
     public async ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expected, CancellationToken cancellationToken = default)
     {
         await using var result = await OpenAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
         if (result is null) return false;
         return ContentHash.Compute(await ReadAllAsync(result.Content, cancellationToken).ConfigureAwait(false), expected.Algorithm) == expected;
     }
+    /// <inheritdoc />
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
     private static async ValueTask<Entry> CreateEntryAsync(Stream content, CancellationToken cancellationToken)
