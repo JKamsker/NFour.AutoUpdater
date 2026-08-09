@@ -11,7 +11,6 @@ namespace FourSaas.AutoUpdater.Storage.Tests;
 
 public sealed class StorageTests
 {
-    private const int HttpFixtureLength = 11;
     private const string UnreachableFtpsServerUri = "ftps://example.invalid/";
     private const string PlaceholderCredential = "test";
 
@@ -162,21 +161,23 @@ public sealed class StorageTests
     [Fact]
     public async Task LiveNginxCharacterizationHonorsRawBytesAndRanges()
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("FOURSUP_HTTP"), "1", StringComparison.Ordinal)) Assert.Skip("Set FOURSUP_HTTP=1 after starting docker compose to run nginx integration tests.");
-        await using var store = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("http://localhost:8080/"));
-        var head = await store.HeadAsync(new ObjectKey("blob"));
+        if (!string.Equals(Environment.GetEnvironmentVariable(HttpIntegrationSettings.GateEnvironmentVariable), HttpIntegrationSettings.EnabledEnvironmentValue, StringComparison.Ordinal))
+            Assert.Skip($"Set {HttpIntegrationSettings.GateEnvironmentVariable}={HttpIntegrationSettings.EnabledEnvironmentValue} after starting docker compose to run nginx integration tests.");
+        var expectedBytes = HttpIntegrationSettings.ReadExpectedFixtureBytes();
+        await using var store = HttpIntegrationSettings.CreateStore();
+        var head = await store.HeadAsync(new ObjectKey(HttpIntegrationSettings.FixtureObjectKey));
         Assert.NotNull(head);
-        Assert.Equal(HttpFixtureLength, head!.Length);
-        var read = await store.OpenAsync(new ObjectKey("blob"), 4, head.Validator);
+        Assert.Equal(expectedBytes.LongLength, head!.Length);
+        var read = await store.OpenAsync(new ObjectKey(HttpIntegrationSettings.FixtureObjectKey), HttpIntegrationSettings.RangeStartOffset, head.Validator);
         Assert.NotNull(read);
         await using (read!)
         {
             using var bytes = new MemoryStream();
             await read.Content.CopyToAsync(bytes);
-            Assert.Equal("456789\n", Encoding.UTF8.GetString(bytes.ToArray()));
+            Assert.Equal(expectedBytes[HttpIntegrationSettings.RangeStartOffset..], bytes.ToArray());
         }
-        await using var encoded = new FourSaas.AutoUpdater.Storage.Http.HttpObjectStore(new Uri("http://localhost:8080/"), new GzipRequestHandler());
-        await Assert.ThrowsAsync<InvalidDataException>(async () => await encoded.OpenAsync(new ObjectKey("blob")));
+        await using var encoded = HttpIntegrationSettings.CreateStore(new GzipRequestHandler());
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await encoded.OpenAsync(new ObjectKey(HttpIntegrationSettings.FixtureObjectKey)));
     }
 
     private static async Task<string[]> ToArrayAsync(IAsyncEnumerable<ObjectKey> keys) { var result = new List<string>(); await foreach (var key in keys) result.Add(key.Value); return result.ToArray(); }

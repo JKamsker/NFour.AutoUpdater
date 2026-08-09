@@ -78,6 +78,10 @@ jobs:
           printf 'FOURSUP_MINIO_URI=http://127.0.0.1:%s\n' "$minio_published_port" >> "$GITHUB_ENV"
           printf 'FOURSUP_MINIO_ACCESS_KEY=%s\n' "$minio_access_key" >> "$GITHUB_ENV"
           printf 'FOURSUP_MINIO_SECRET_KEY=%s\n' "$minio_secret_key" >> "$GITHUB_ENV"
+          nginx_http_port=80
+          nginx_endpoint="$(docker compose port nginx "$nginx_http_port")"
+          nginx_published_port="${nginx_endpoint##*:}"
+          printf 'FOURSUP_HTTP_URI=http://127.0.0.1:%s/\n' "$nginx_published_port" >> "$GITHUB_ENV"
       - name: Test (all backends enabled)
         run: FOURSUP_MINIO=1 FOURSUP_HTTP=1 FOURSUP_FTP=1 FOURSUP_POSTGRES=1 FOURSUP_DATABASE='Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password' dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
 
