@@ -1,4 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Storage.S3</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Storage.S3</AssemblyName></PropertyGroup>
-  <ItemGroup><ProjectReference Include="../FourSaas.AutoUpdater.Storage/FourSaas.AutoUpdater.Storage.csproj" /><PackageReference Include="AWSSDK.S3" /></ItemGroup>
-</Project>

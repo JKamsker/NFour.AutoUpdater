@@ -49,29 +49,29 @@ Four rules define the whole architecture:
 
 ```
 src/
-  FourSaas.AutoUpdater.Core/            # identity, axes, manifests, resolution, composition
-  FourSaas.AutoUpdater.Storage/         # IObjectStore ports + RepositoryLayout + capabilities
-  FourSaas.AutoUpdater.Storage.Brokering/ # UploadGrant, IStagedObjectVerifier, promotion
-  FourSaas.AutoUpdater.Storage.Local/
-  FourSaas.AutoUpdater.Storage.S3/
-  FourSaas.AutoUpdater.Storage.Ftp/
-  FourSaas.AutoUpdater.Storage.Http/    # read-only
-  FourSaas.AutoUpdater.Storage.Memory/  # in-memory; ships in the main solution, used by tests
-  FourSaas.AutoUpdater.Repository/      # IPackageRepository over IObjectStore; GC, prune, mirror
-  FourSaas.AutoUpdater.Publishing/      # slicing, hashing, packing, validation, release building
-  FourSaas.AutoUpdater.Client/          # planner, applier, install ledger, verify/repair
-  FourSaas.AutoUpdater.Cli/             # `4sup`
-  FourSaas.AutoUpdater.Server/          # management API (ASP.NET Core + EF Core/Npgsql)
-  FourSaas.AutoUpdater.Gateway/         # OPTIONAL read-path content gateway; separate deployable
+  NFour.AutoUpdater.Core/            # identity, axes, manifests, resolution, composition
+  NFour.AutoUpdater.Storage/         # IObjectStore ports + RepositoryLayout + capabilities
+  NFour.AutoUpdater.Storage.Brokering/ # UploadGrant, IStagedObjectVerifier, promotion
+  NFour.AutoUpdater.Storage.Local/
+  NFour.AutoUpdater.Storage.S3/
+  NFour.AutoUpdater.Storage.Ftp/
+  NFour.AutoUpdater.Storage.Http/    # read-only
+  NFour.AutoUpdater.Storage.Memory/  # in-memory; ships in the main solution, used by tests
+  NFour.AutoUpdater.Repository/      # IPackageRepository over IObjectStore; GC, prune, mirror
+  NFour.AutoUpdater.Publishing/      # slicing, hashing, packing, validation, release building
+  NFour.AutoUpdater.Client/          # planner, applier, install ledger, verify/repair
+  NFour.AutoUpdater.Cli/             # `4sup`
+  NFour.AutoUpdater.Server/          # management API (ASP.NET Core + EF Core/Npgsql)
+  NFour.AutoUpdater.Gateway/         # OPTIONAL read-path content gateway; separate deployable
 tests/
-  FourSaas.AutoUpdater.Core.Tests/            # pure; no I/O, no temp directories
-  FourSaas.AutoUpdater.Storage.Tests/         # ONE conformance suite, run against ALL backends
-  FourSaas.AutoUpdater.Repository.Tests/
-  FourSaas.AutoUpdater.Publishing.Tests/
-  FourSaas.AutoUpdater.Client.Tests/
-  FourSaas.AutoUpdater.GoldenRepo.Tests/      # checked-in v1 repository tree; forward-compat gate
-  FourSaas.AutoUpdater.Server.Tests/
-  FourSaas.AutoUpdater.Architecture.Tests/    # NetArchTest; enforces §3
+  NFour.AutoUpdater.Core.Tests/            # pure; no I/O, no temp directories
+  NFour.AutoUpdater.Storage.Tests/         # ONE conformance suite, run against ALL backends
+  NFour.AutoUpdater.Repository.Tests/
+  NFour.AutoUpdater.Publishing.Tests/
+  NFour.AutoUpdater.Client.Tests/
+  NFour.AutoUpdater.GoldenRepo.Tests/      # checked-in v1 repository tree; forward-compat gate
+  NFour.AutoUpdater.Server.Tests/
+  NFour.AutoUpdater.Architecture.Tests/    # NetArchTest; enforces §3
 ```
 
 `Core` has **zero project references and does no I/O**. This is the direct antidote to the
@@ -82,7 +82,7 @@ pure functions over literals.
 ## 3. Layering rules
 
 Dependencies flow left-to-right only. Enforced by `NetArchTest.Rules` in
-`FourSaas.AutoUpdater.Architecture.Tests`, not by convention.
+`NFour.AutoUpdater.Architecture.Tests`, not by convention.
 
 ```
 Core ◀── Storage ◀── Storage.{Local,S3,Ftp,Http,Memory}
@@ -116,7 +116,7 @@ shape and the reasoning.
 ### 4.1 Identity
 
 ```csharp
-namespace FourSaas.AutoUpdater.Core;
+namespace NFour.AutoUpdater.Core;
 
 public enum HashAlgorithmId { Sha256 = 1, Sha512 = 2, Md5 = 3, Blake3 = 4 }
 

@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup><RootNamespace>NFour.AutoUpdater.Gateway</RootNamespace><AssemblyName>NFour.AutoUpdater.Gateway</AssemblyName><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../NFour.AutoUpdater.Core/NFour.AutoUpdater.Core.csproj" /></ItemGroup>
+</Project>

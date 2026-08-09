@@ -8,19 +8,19 @@ readonly usage_error_exit_code=64
 readonly output_creation_error_exit_code=73
 readonly configuration_error_exit_code=78
 readonly package_name="4sup"
-readonly package_supplier="FourSaas"
+readonly package_supplier="NFour"
 readonly manifest_format="SPDX:2.2"
 readonly namespace_base="https://github.com/JKamsker/AutoUpdater/sbom"
 readonly release_configuration="Release"
-readonly development_trust_root_acknowledgement="-p:FourSaasAllowDevelopmentTrustRoot=true"
-readonly metadata_project="src/FourSaas.AutoUpdater.Cli/FourSaas.AutoUpdater.Cli.csproj"
+readonly development_trust_root_acknowledgement="-p:NFourAllowDevelopmentTrustRoot=true"
+readonly metadata_project="src/NFour.AutoUpdater.Cli/NFour.AutoUpdater.Cli.csproj"
 readonly manifest_relative_path="_manifest/spdx_2.2/manifest.spdx.json"
 readonly validation_report_name="validation.json"
 readonly -a publish_names=("cli" "server" "gateway")
 readonly -a publish_projects=(
   "$metadata_project"
-  "src/FourSaas.AutoUpdater.Server/FourSaas.AutoUpdater.Server.csproj"
-  "src/FourSaas.AutoUpdater.Gateway/FourSaas.AutoUpdater.Gateway.csproj"
+  "src/NFour.AutoUpdater.Server/NFour.AutoUpdater.Server.csproj"
+  "src/NFour.AutoUpdater.Gateway/NFour.AutoUpdater.Gateway.csproj"
 )
 
 if (( $# != expected_argument_count )); then

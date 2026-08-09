@@ -10,7 +10,7 @@ on:
 # build impossible, and quietly removing it here would defeat the point. The release-guard
 # job below proves the guard still fires.
 env:
-  DOTNET_BUILD_ARGS: "-p:FourSaasAllowDevelopmentTrustRoot=true"
+  DOTNET_BUILD_ARGS: "-p:NFourAllowDevelopmentTrustRoot=true"
 
 jobs:
   # Cross-platform correctness. The client's install path is almost entirely platform-specific
@@ -141,11 +141,11 @@ jobs:
           dotnet-version: '10.0.x'
       - name: A Release build carrying the development trust root must fail
         run: |
-          if dotnet build src/FourSaas.AutoUpdater.Core -c Release -t:Rebuild > guard.log 2>&1; then
+          if dotnet build src/NFour.AutoUpdater.Core -c Release -t:Rebuild > guard.log 2>&1; then
             echo "Release build succeeded with the development trust root; FS4SUP001 is not enforcing."
             cat guard.log
             exit 1
           fi
           grep -q FS4SUP001 guard.log || { echo "Build failed for an unrelated reason:"; cat guard.log; exit 1; }
       - name: A Release build with a supplied root must succeed
-        run: dotnet build src/FourSaas.AutoUpdater.Core -c Release -t:Rebuild -p:FourSaasTrustRootKeyId=ci-root -p:FourSaasTrustRootPublicKey=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo
+        run: dotnet build src/NFour.AutoUpdater.Core -c Release -t:Rebuild -p:NFourTrustRootKeyId=ci-root -p:NFourTrustRootPublicKey=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo

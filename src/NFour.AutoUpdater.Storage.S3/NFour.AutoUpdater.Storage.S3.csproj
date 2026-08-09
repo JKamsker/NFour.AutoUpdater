@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>NFour.AutoUpdater.Storage.S3</RootNamespace><AssemblyName>NFour.AutoUpdater.Storage.S3</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../NFour.AutoUpdater.Storage/NFour.AutoUpdater.Storage.csproj" /><PackageReference Include="AWSSDK.S3" /></ItemGroup>
+</Project>

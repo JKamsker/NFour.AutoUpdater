@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>NFour.AutoUpdater.Repository</RootNamespace><AssemblyName>NFour.AutoUpdater.Repository</AssemblyName></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NFour.AutoUpdater.Core/NFour.AutoUpdater.Core.csproj" />
+    <ProjectReference Include="../NFour.AutoUpdater.Storage/NFour.AutoUpdater.Storage.csproj" />
+    <PackageReference Include="System.IO.Hashing" />
+  </ItemGroup>
+</Project>

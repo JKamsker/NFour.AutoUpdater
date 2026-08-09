@@ -27,7 +27,7 @@ streamed JSONL file tables, resumable verified downloads, and an atomic client l
 The CLI is currently usable for the format-focused helpers:
 
 ```bash
-dotnet run --project src/FourSaas.AutoUpdater.Cli -- parse-address 'https://host/product@live'
-dotnet run --project src/FourSaas.AutoUpdater.Cli -- select --select=language=de --select=ui=classic
-dotnet run --project src/FourSaas.AutoUpdater.Cli -- verify-path 'bin/game.exe'
+dotnet run --project src/NFour.AutoUpdater.Cli -- parse-address 'https://host/product@live'
+dotnet run --project src/NFour.AutoUpdater.Cli -- select --select=language=de --select=ui=classic
+dotnet run --project src/NFour.AutoUpdater.Cli -- verify-path 'bin/game.exe'
 ```

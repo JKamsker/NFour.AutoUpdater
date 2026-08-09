@@ -1,8 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Publishing</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Publishing</AssemblyName></PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="../FourSaas.AutoUpdater.Core/FourSaas.AutoUpdater.Core.csproj" />
-    <ProjectReference Include="../FourSaas.AutoUpdater.Repository/FourSaas.AutoUpdater.Repository.csproj" />
-    <ProjectReference Include="../FourSaas.AutoUpdater.Storage/FourSaas.AutoUpdater.Storage.csproj" />
-  </ItemGroup>
-</Project>

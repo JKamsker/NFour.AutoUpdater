@@ -17,7 +17,7 @@ supporting cast.
 
 ## 2. Backend conformance suite — written before any backend
 
-`FourSaas.AutoUpdater.Storage.Tests` is **one** xUnit theory suite, parameterised over every
+`NFour.AutoUpdater.Storage.Tests` is **one** xUnit theory suite, parameterised over every
 backend, asserting identical observable behaviour.
 
 | Backend | Harness |
@@ -67,7 +67,7 @@ where they passed.
 
 ## 3. Golden repository
 
-`FourSaas.AutoUpdater.GoldenRepo.Tests` carries a **checked-in v1 repository tree**: real
+`NFour.AutoUpdater.GoldenRepo.Tests` carries a **checked-in v1 repository tree**: real
 manifests, a handful of small blobs, two products, three releases, and five variant axes.
 
 It asserts:

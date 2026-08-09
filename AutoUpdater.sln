@@ -5,53 +5,53 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72D-47B6-A68D-7590B98EB39B}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Cli", "src\FourSaas.AutoUpdater.Cli\FourSaas.AutoUpdater.Cli.csproj", "{47298D3F-301B-472C-85BF-0A1A186744F2}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Cli", "src\NFour.AutoUpdater.Cli\NFour.AutoUpdater.Cli.csproj", "{47298D3F-301B-472C-85BF-0A1A186744F2}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Core", "src\FourSaas.AutoUpdater.Core\FourSaas.AutoUpdater.Core.csproj", "{97092A5F-FA68-4099-AAC8-8F1472E41619}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Core", "src\NFour.AutoUpdater.Core\NFour.AutoUpdater.Core.csproj", "{97092A5F-FA68-4099-AAC8-8F1472E41619}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Client", "src\FourSaas.AutoUpdater.Client\FourSaas.AutoUpdater.Client.csproj", "{217720D1-FF09-4AC5-B25C-E016D61B22AE}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Client", "src\NFour.AutoUpdater.Client\NFour.AutoUpdater.Client.csproj", "{217720D1-FF09-4AC5-B25C-E016D61B22AE}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage", "src\FourSaas.AutoUpdater.Storage\FourSaas.AutoUpdater.Storage.csproj", "{6CAFED6B-8E7A-4AC4-84DC-7A2AA2C43891}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage", "src\NFour.AutoUpdater.Storage\NFour.AutoUpdater.Storage.csproj", "{6CAFED6B-8E7A-4AC4-84DC-7A2AA2C43891}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Repository", "src\FourSaas.AutoUpdater.Repository\FourSaas.AutoUpdater.Repository.csproj", "{356CC608-8600-4D34-9BCB-E722E28B0318}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Repository", "src\NFour.AutoUpdater.Repository\NFour.AutoUpdater.Repository.csproj", "{356CC608-8600-4D34-9BCB-E722E28B0318}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.Local", "src\FourSaas.AutoUpdater.Storage.Local\FourSaas.AutoUpdater.Storage.Local.csproj", "{08CE57F8-667A-46FD-AA9C-96A286BBF247}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.Local", "src\NFour.AutoUpdater.Storage.Local\NFour.AutoUpdater.Storage.Local.csproj", "{08CE57F8-667A-46FD-AA9C-96A286BBF247}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.Http", "src\FourSaas.AutoUpdater.Storage.Http\FourSaas.AutoUpdater.Storage.Http.csproj", "{D896A0BC-0C3B-42D3-8C05-A4FA0CB4603A}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.Http", "src\NFour.AutoUpdater.Storage.Http\NFour.AutoUpdater.Storage.Http.csproj", "{D896A0BC-0C3B-42D3-8C05-A4FA0CB4603A}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Gateway", "src\FourSaas.AutoUpdater.Gateway\FourSaas.AutoUpdater.Gateway.csproj", "{26902195-DC3C-4F87-86C2-EC49AF97AF32}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Gateway", "src\NFour.AutoUpdater.Gateway\NFour.AutoUpdater.Gateway.csproj", "{26902195-DC3C-4F87-86C2-EC49AF97AF32}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Publishing", "src\FourSaas.AutoUpdater.Publishing\FourSaas.AutoUpdater.Publishing.csproj", "{6A2E8766-A74D-4867-9B63-F32A7DD0921D}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Publishing", "src\NFour.AutoUpdater.Publishing\NFour.AutoUpdater.Publishing.csproj", "{6A2E8766-A74D-4867-9B63-F32A7DD0921D}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Server", "src\FourSaas.AutoUpdater.Server\FourSaas.AutoUpdater.Server.csproj", "{B5C786AD-505E-4D0B-BD15-676BF0FF21F4}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Server", "src\NFour.AutoUpdater.Server\NFour.AutoUpdater.Server.csproj", "{B5C786AD-505E-4D0B-BD15-676BF0FF21F4}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.Brokering", "src\FourSaas.AutoUpdater.Storage.Brokering\FourSaas.AutoUpdater.Storage.Brokering.csproj", "{84CC59A6-285A-49B5-A75F-2EF45AB7E3C2}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.Brokering", "src\NFour.AutoUpdater.Storage.Brokering\NFour.AutoUpdater.Storage.Brokering.csproj", "{84CC59A6-285A-49B5-A75F-2EF45AB7E3C2}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.Ftp", "src\FourSaas.AutoUpdater.Storage.Ftp\FourSaas.AutoUpdater.Storage.Ftp.csproj", "{DEC5A758-3A2C-433A-BD37-2ED9BAF7996E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.Ftp", "src\NFour.AutoUpdater.Storage.Ftp\NFour.AutoUpdater.Storage.Ftp.csproj", "{DEC5A758-3A2C-433A-BD37-2ED9BAF7996E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.Memory", "src\FourSaas.AutoUpdater.Storage.Memory\FourSaas.AutoUpdater.Storage.Memory.csproj", "{170A7A33-318A-45B1-8D20-CB122EA8D503}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.Memory", "src\NFour.AutoUpdater.Storage.Memory\NFour.AutoUpdater.Storage.Memory.csproj", "{170A7A33-318A-45B1-8D20-CB122EA8D503}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.S3", "src\FourSaas.AutoUpdater.Storage.S3\FourSaas.AutoUpdater.Storage.S3.csproj", "{0180A1BA-29CC-4232-8D68-1DE2FD651685}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.S3", "src\NFour.AutoUpdater.Storage.S3\NFour.AutoUpdater.Storage.S3.csproj", "{0180A1BA-29CC-4232-8D68-1DE2FD651685}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Client.Tests", "tests\FourSaas.AutoUpdater.Client.Tests\FourSaas.AutoUpdater.Client.Tests.csproj", "{42A05290-5818-482C-96F4-6D89D9793FF9}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Client.Tests", "tests\NFour.AutoUpdater.Client.Tests\NFour.AutoUpdater.Client.Tests.csproj", "{42A05290-5818-482C-96F4-6D89D9793FF9}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Core.Tests", "tests\FourSaas.AutoUpdater.Core.Tests\FourSaas.AutoUpdater.Core.Tests.csproj", "{9200D81A-501F-4C5A-A294-A828264A9A71}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Core.Tests", "tests\NFour.AutoUpdater.Core.Tests\NFour.AutoUpdater.Core.Tests.csproj", "{9200D81A-501F-4C5A-A294-A828264A9A71}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Publishing.Tests", "tests\FourSaas.AutoUpdater.Publishing.Tests\FourSaas.AutoUpdater.Publishing.Tests.csproj", "{C6FD3A60-5E84-432E-884D-28319E677F1C}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Publishing.Tests", "tests\NFour.AutoUpdater.Publishing.Tests\NFour.AutoUpdater.Publishing.Tests.csproj", "{C6FD3A60-5E84-432E-884D-28319E677F1C}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.S3.Tests", "tests\FourSaas.AutoUpdater.Storage.S3.Tests\FourSaas.AutoUpdater.Storage.S3.Tests.csproj", "{A046F15C-93C3-48C7-83EA-B77C58A7B66E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.S3.Tests", "tests\NFour.AutoUpdater.Storage.S3.Tests\NFour.AutoUpdater.Storage.S3.Tests.csproj", "{A046F15C-93C3-48C7-83EA-B77C58A7B66E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Storage.Tests", "tests\FourSaas.AutoUpdater.Storage.Tests\FourSaas.AutoUpdater.Storage.Tests.csproj", "{958B657F-64DF-4D53-84DD-3788A3A1EF06}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Storage.Tests", "tests\NFour.AutoUpdater.Storage.Tests\NFour.AutoUpdater.Storage.Tests.csproj", "{958B657F-64DF-4D53-84DD-3788A3A1EF06}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Server.Tests", "tests\FourSaas.AutoUpdater.Server.Tests\FourSaas.AutoUpdater.Server.Tests.csproj", "{5D7B4CA9-0B13-43B9-8D7D-1A6A1BCF4B39}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Server.Tests", "tests\NFour.AutoUpdater.Server.Tests\NFour.AutoUpdater.Server.Tests.csproj", "{5D7B4CA9-0B13-43B9-8D7D-1A6A1BCF4B39}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.GoldenRepo.Tests", "tests\FourSaas.AutoUpdater.GoldenRepo.Tests\FourSaas.AutoUpdater.GoldenRepo.Tests.csproj", "{A4BDEB0F-1640-4FDE-9E24-2FD3D3B8F8A2}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.GoldenRepo.Tests", "tests\NFour.AutoUpdater.GoldenRepo.Tests\NFour.AutoUpdater.GoldenRepo.Tests.csproj", "{A4BDEB0F-1640-4FDE-9E24-2FD3D3B8F8A2}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Architecture.Tests", "tests\FourSaas.AutoUpdater.Architecture.Tests\FourSaas.AutoUpdater.Architecture.Tests.csproj", "{E4E0C9C9-6AF4-46BD-B2BE-37A4681D5EE6}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Architecture.Tests", "tests\NFour.AutoUpdater.Architecture.Tests\NFour.AutoUpdater.Architecture.Tests.csproj", "{E4E0C9C9-6AF4-46BD-B2BE-37A4681D5EE6}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FourSaas.AutoUpdater.Cli.Tests", "tests\FourSaas.AutoUpdater.Cli.Tests\FourSaas.AutoUpdater.Cli.Tests.csproj", "{11A54B54-C817-4C4C-8463-6D6BD8E63B5F}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NFour.AutoUpdater.Cli.Tests", "tests\NFour.AutoUpdater.Cli.Tests\NFour.AutoUpdater.Cli.Tests.csproj", "{11A54B54-C817-4C4C-8463-6D6BD8E63B5F}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

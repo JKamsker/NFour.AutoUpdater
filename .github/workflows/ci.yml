@@ -7,7 +7,7 @@ on:
 # Release configuration refuses to build with the development trust root compiled in
 # (FS4SUP001). CI is not producing a shippable client, so it acknowledges that explicitly.
 env:
-  DOTNET_BUILD_ARGS: "-p:FourSaasAllowDevelopmentTrustRoot=true"
+  DOTNET_BUILD_ARGS: "-p:NFourAllowDevelopmentTrustRoot=true"
 
 jobs:
   # Exercise both Darwin ABIs explicitly. macos-15-intel is x64; macos-15 is arm64.
@@ -133,11 +133,11 @@ jobs:
           dotnet-version: '10.0.x'
       - name: A Release build carrying the development trust root must fail
         run: |
-          if dotnet build src/FourSaas.AutoUpdater.Core -c Release -t:Rebuild > guard.log 2>&1; then
+          if dotnet build src/NFour.AutoUpdater.Core -c Release -t:Rebuild > guard.log 2>&1; then
             echo "Release build succeeded with the development trust root; FS4SUP001 is not enforcing."
             cat guard.log
             exit 1
           fi
           grep -q FS4SUP001 guard.log || { echo "Build failed for an unrelated reason:"; cat guard.log; exit 1; }
       - name: A Release build with a supplied root must succeed
-        run: dotnet build src/FourSaas.AutoUpdater.Core -c Release -t:Rebuild -p:FourSaasTrustRootKeyId=ci-root -p:FourSaasTrustRootPublicKey=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo
+        run: dotnet build src/NFour.AutoUpdater.Core -c Release -t:Rebuild -p:NFourTrustRootKeyId=ci-root -p:NFourTrustRootPublicKey=Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2RlZmdoaWo

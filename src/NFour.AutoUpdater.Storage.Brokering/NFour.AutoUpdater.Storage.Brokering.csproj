@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>NFour.AutoUpdater.Storage.Brokering</RootNamespace><AssemblyName>NFour.AutoUpdater.Storage.Brokering</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../NFour.AutoUpdater.Core/NFour.AutoUpdater.Core.csproj" /><ProjectReference Include="../NFour.AutoUpdater.Storage/NFour.AutoUpdater.Storage.csproj" /></ItemGroup>
+</Project>

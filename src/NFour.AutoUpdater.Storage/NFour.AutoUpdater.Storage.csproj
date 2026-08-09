@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>NFour.AutoUpdater.Storage</RootNamespace><AssemblyName>NFour.AutoUpdater.Storage</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../NFour.AutoUpdater.Core/NFour.AutoUpdater.Core.csproj" /></ItemGroup>
+</Project>

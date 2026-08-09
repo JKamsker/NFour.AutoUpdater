@@ -21,7 +21,7 @@ its authoritative record, not a discussion.
 | Q7 | Small-file bundling in v1 | **DEFERRED — backlog.** Out of scope for v1; see Q7 |
 | Q8 | Sub-file delta / CDC | **DEFERRED.** Reserve the `d` field; revisit in Phase 8 |
 | Q9 | Symlinks, exec bits, empty directories | **DECIDED.** Symlinks rejected at publish; `pol:"executable"` + `mode`; empty dirs via `k:"dir"` ([05](05-repository-format.md) §8) |
-| Q10 | Naming (`FourSaas.*` vs `NFour.*`) | **OPEN — cheap now, annoying later** |
+| Q10 | Naming (`FourSaas.*` vs `NFour.*`) | **DECIDED — `NFour.AutoUpdater.*`; see Q10** |
 | Q11 | Re-run the third variant design | **CLOSED — no.** Nothing depends on it |
 | Q12 | Migration from an existing patcher | **OPEN** |
 | Q13 | Telemetry consent | **DECIDED.** Off by default and deployment-configurable; see Q13 |
@@ -267,11 +267,16 @@ outside the install root is an arbitrary-write primitive.
 
 ## Q10 — Naming
 
-Documents use `FourSaas.AutoUpdater.*` and a `4sup` CLI. The sibling repo prefixes with
+The original draft used `FourSaas.AutoUpdater.*` and a `4sup` CLI. The sibling repo prefixes with
 `NFour` (`NFourServer`, `FourSer.Gen`). A trivial rename now; annoying later.
 
 **Recommendation:** decide before the first commit. `NFour.AutoUpdater.*` is more consistent
 with the sibling repo; `4sup` is a good CLI name either way.
+
+### Answer — NFour namespace, 4sup CLI (2026-08-09)
+
+Projects, namespaces, assemblies, and MSBuild properties use `NFour.AutoUpdater.*`. The command
+name remains `4sup`; it is a product-facing executable name rather than a .NET namespace.
 
 ---
 

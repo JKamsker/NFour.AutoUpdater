@@ -6,7 +6,7 @@ diff it against the ledger, apply the diff. There is no separate "update" code p
 ## 1. Types
 
 ```csharp
-namespace FourSaas.AutoUpdater.Client;
+namespace NFour.AutoUpdater.Client;
 
 public sealed record InstalledFile(
     VirtualPath Path, ContentHash Content, long Size, PackageId Owner,

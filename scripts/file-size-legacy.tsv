@@ -1,5 +1,5 @@
 # path	maximum lines	justification
-src/FourSaas.AutoUpdater.Server/ManagementState.cs	2308	Legacy state facade; split through durable-state and publishing collaborators, not partial classes.
-src/FourSaas.AutoUpdater.Cli/CliApplication.cs	1930	Legacy command dispatcher; move commands into composed command handlers as they are changed.
-src/FourSaas.AutoUpdater.Client/Apply.cs	710	Legacy apply engine; separate planning, durable transitions, and platform operations through composition.
-src/FourSaas.AutoUpdater.Storage.S3/S3ObjectStore.cs	667	Legacy backend adapter; separate transfer, multipart, and metadata policies through composition.
+src/NFour.AutoUpdater.Server/ManagementState.cs	2308	Legacy state facade; split through durable-state and publishing collaborators, not partial classes.
+src/NFour.AutoUpdater.Cli/CliApplication.cs	1930	Legacy command dispatcher; move commands into composed command handlers as they are changed.
+src/NFour.AutoUpdater.Client/Apply.cs	710	Legacy apply engine; separate planning, durable transitions, and platform operations through composition.
+src/NFour.AutoUpdater.Storage.S3/S3ObjectStore.cs	667	Legacy backend adapter; separate transfer, multipart, and metadata policies through composition.

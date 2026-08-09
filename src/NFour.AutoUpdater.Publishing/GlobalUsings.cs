@@ -1,0 +1,11 @@
+global using System.Collections.Concurrent;
+global using System.Collections.Immutable;
+global using System.Globalization;
+global using System.Runtime.CompilerServices;
+global using System.Text;
+global using System.Text.Json;
+global using System.Text.Json.Serialization;
+global using System.Security.Cryptography;
+global using NFour.AutoUpdater.Core;
+global using NFour.AutoUpdater.Repository;
+global using NFour.AutoUpdater.Storage;

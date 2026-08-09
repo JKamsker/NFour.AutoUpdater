@@ -4,7 +4,7 @@ Answers **Q2** ([14-open-questions.md](14-open-questions.md)). There is no parti
 in the build today, so this defines the one to build toward rather than describing an existing
 tree.
 
-Enforced by `BuildTreeLayout` in `FourSaas.AutoUpdater.Publishing`.
+Enforced by `BuildTreeLayout` in `NFour.AutoUpdater.Publishing`.
 
 ---
 
