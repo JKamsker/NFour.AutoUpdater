@@ -1,9 +1,12 @@
 namespace NFour.AutoUpdater.Publishing;
 
+/// <summary>Contains a built package manifest, exact bytes, and published blob identities.</summary><param name="Manifest">The parsed package manifest.</param><param name="ManifestBytes">The exact canonical manifest bytes.</param><param name="Blobs">Blob digests keyed by install path.</param>
 public sealed record PublishedPackage(PackageManifest Manifest, byte[] ManifestBytes, ImmutableDictionary<VirtualPath, ContentHash> Blobs);
 
+/// <summary>Hashes, validates, uploads, and manifests a sliced package.</summary>
 public sealed class PackageBuilder
 {
+    /// <summary>Builds one immutable package version into an object store.</summary>
     public async ValueTask<PublishedPackage> BuildAsync(SlicedPackage package, PackageVersion version, RepositoryLayout layout, IWritableObjectStore destination, TimeProvider? timeProvider = null, CancellationToken cancellationToken = default, PackageBuildOptions? options = null)
     {
         timeProvider ??= TimeProvider.System;

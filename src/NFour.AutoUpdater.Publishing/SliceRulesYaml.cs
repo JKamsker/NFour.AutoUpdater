@@ -16,6 +16,7 @@ namespace NFour.AutoUpdater.Publishing;
 /// </summary>
 public static class SliceRulesYaml
 {
+    /// <summary>Gets the JSON Schema describing accepted slice-rule documents.</summary>
     public static string JsonSchema => """
         {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -58,8 +59,10 @@ public static class SliceRulesYaml
         }
         """;
 
+    /// <summary>Adds a YAML language-server schema directive.</summary>
     public static string WithSchemaHeader(string yaml, Uri schemaUri) => $"# yaml-language-server: $schema={schemaUri}\n{yaml}";
 
+    /// <summary>Parses strict slice rules from the supported YAML subset or JSON.</summary>
     public static SliceRules Parse(string yaml)
     {
         if (yaml.TrimStart().StartsWith('{')) return JsonSerializer.Deserialize<SliceRules>(yaml, RepositoryJson.Options) ?? throw new FormatException("Slice rules JSON is empty.");

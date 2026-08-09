@@ -31,7 +31,9 @@ public readonly record struct ClassifiedBuildFile(string SourcePath, string? Axi
 /// </summary>
 public static class BuildTreeLayout
 {
+    /// <summary>Gets the directory containing axis-independent build content.</summary>
     public const string CommonRoot = "common";
+    /// <summary>Gets the directory containing axis-selected build content.</summary>
     public const string AxisRoot = "axis";
 
     /// <summary>

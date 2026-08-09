@@ -1,10 +1,13 @@
 namespace NFour.AutoUpdater.Publishing;
 
+/// <summary>Runs release-wide validation before publication.</summary>
 public sealed class PublishGate
 {
+    /// <summary>Checks release structure and optional composition using in-memory manifests.</summary>
     public async ValueTask<ImmutableArray<Diagnostic>> CheckAsync(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, IFileSetComposer? composer = null, CancellationToken cancellationToken = default)
         => await CheckCoreAsync(release, manifests, composer, null, cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Checks release structure and composes variants through a repository.</summary>
     public async ValueTask<ImmutableArray<Diagnostic>> CheckAsync(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests, IFileSetComposer composer, IPackageRepository repository, CancellationToken cancellationToken = default)
         => await CheckCoreAsync(release, manifests, composer, repository, cancellationToken).ConfigureAwait(false);
 
@@ -238,8 +241,10 @@ public sealed class PublishGate
     }
 }
 
+/// <summary>Estimates and deterministically enumerates release variant selections.</summary>
 public static class SelectionEnumerator
 {
+    /// <summary>Estimates the complete selection count, saturating at a supplied cap.</summary>
     public static long EstimatedCount(ImmutableArray<AxisDefinition> axes, long cap = long.MaxValue)
     {
         if (cap < 0) throw new ArgumentOutOfRangeException(nameof(cap));
@@ -353,6 +358,7 @@ public static class SelectionEnumerator
         }
     }
 
+    /// <summary>Enumerates complete selections up to a maximum count.</summary>
     public static ImmutableArray<VariantSelection> Enumerate(ImmutableArray<AxisDefinition> axes, int maximum = int.MaxValue)
     {
         var results = new List<VariantSelection>();

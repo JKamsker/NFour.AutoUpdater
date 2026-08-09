@@ -1,7 +1,9 @@
 namespace NFour.AutoUpdater.Publishing;
 
+/// <summary>Builds, covers, and publishes immutable release locks.</summary>
 public sealed class ReleaseBuilder
 {
+    /// <summary>Builds a draft release lock from package manifests.</summary>
     public ReleaseLock Build(string productId, string releaseId, long sequence, ImmutableArray<AxisDefinition> axes, ImmutableArray<PackageRequirement> requirements, IReadOnlyDictionary<PackageId, PackageManifest> manifests, RepositoryLayout layout, DateTimeOffset createdAt, long? minimumInstalledRelease = null, ContentHash? coverageDigest = null)
     {
         if (!Identifier.IsValid(productId, 128) || !Identifier.IsValid(releaseId, 64)) throw new FormatException("Product and release identifiers must be safe path segments.");
@@ -30,6 +32,7 @@ public sealed class ReleaseBuilder
         return new ReleaseLock { SchemaVersion = 1, ProductId = productId, ReleaseId = releaseId, Sequence = sequence, State = ReleaseState.Draft, CreatedAt = createdAt.ToUniversalTime(), Axes = normalizedAxes, Requirements = requirements, Packages = pins.ToImmutable(), MinimumInstalledRelease = minimumInstalledRelease, CoverageDigest = coverageDigest.Value };
     }
 
+    /// <summary>Builds a draft release and generates its coverage proof.</summary>
     public async ValueTask<(ReleaseLock Release, CoverageDocument Coverage, ContentHash CoverageDigest)> BuildAsync(string productId, string releaseId, long sequence, ImmutableArray<AxisDefinition> axes, ImmutableArray<PackageRequirement> requirements, IReadOnlyDictionary<PackageId, PackageManifest> manifests, RepositoryLayout layout, DateTimeOffset createdAt, IPackageRepository repository, long? minimumInstalledRelease = null, CancellationToken cancellationToken = default)
     {
         var provisional = Build(productId, releaseId, sequence, axes, requirements, manifests, layout, createdAt, minimumInstalledRelease, ContentHash.Compute([]));
@@ -37,6 +40,7 @@ public sealed class ReleaseBuilder
         return (provisional with { CoverageDigest = generated.Digest }, generated.Document, generated.Digest);
     }
 
+    /// <summary>Validates and writes a release coverage document.</summary>
     public async ValueTask WriteCoverageAsync(ReleaseLock release, CoverageDocument coverage, RepositoryLayout layout, IWritableObjectStore destination, CancellationToken cancellationToken = default)
     {
         if (!string.Equals(release.ReleaseId, coverage.ReleaseId, StringComparison.Ordinal)) throw new InvalidDataException("Coverage releaseId does not match the release lock.");
@@ -77,6 +81,7 @@ public sealed class ReleaseBuilder
         return memory.ToArray();
     }
 
+    /// <summary>Transitions a valid draft release to the published state.</summary>
     public ReleaseLock Publish(ReleaseLock draft)
     {
         if (draft.State != ReleaseState.Draft) throw new InvalidDataException("Only draft releases can be published.");
@@ -84,17 +89,21 @@ public sealed class ReleaseBuilder
         return draft with { State = ReleaseState.Published, Axes = draft.Axes.Select(static axis => axis.NormalizeRetiredMappings()).ToImmutableArray() };
     }
 
+    /// <summary>Creates a bundle containing manifests pinned by a release.</summary>
     public ReleaseBundle Bundle(ReleaseLock release, IReadOnlyDictionary<PackageId, PackageManifest> manifests) => new() { Lock = release, Inline = manifests.Where(x => release.Packages.Any(p => p.Id == x.Key)).ToImmutableDictionary(x => x.Key, x => x.Value) };
 }
 
+/// <summary>Signs canonical updater control documents with Ed25519.</summary>
 public sealed class ReleaseSigner
 {
+    /// <summary>Signs a key manifest.</summary>
     public (SignedEnvelope Envelope, byte[] EnvelopeBytes) SignKeyManifest(KeyManifest manifest, string keyId, ReadOnlySpan<byte> privateKey)
     {
         var envelope = SignedDocument.Sign("key-manifest", SignedDocument.SerializePayload(manifest), keyId, privateKey);
         return (envelope, SignedDocument.SerializeEnvelope(envelope));
     }
 
+    /// <summary>Signs a release lock and returns its exact envelope digest.</summary>
     public (SignedEnvelope Envelope, byte[] EnvelopeBytes, ContentHash Digest) SignRelease(ReleaseLock release, string keyId, ReadOnlySpan<byte> privateKey)
     {
         if (release.State != ReleaseState.Published) throw new InvalidDataException("Only a published release lock may be signed for distribution.");
@@ -103,12 +112,14 @@ public sealed class ReleaseSigner
         var bytes = SignedDocument.SerializeEnvelope(envelope);
         return (envelope, bytes, ContentHash.Compute(bytes));
     }
+    /// <summary>Signs a channel pointer.</summary>
     public (SignedEnvelope Envelope, byte[] EnvelopeBytes) SignChannel(ChannelPointer pointer, string keyId, ReadOnlySpan<byte> privateKey)
     {
         var payload = SignedDocument.SerializePayload(pointer);
         var envelope = SignedDocument.Sign("channel-pointer", payload, keyId, privateKey);
         return (envelope, SignedDocument.SerializeEnvelope(envelope));
     }
+    /// <summary>Signs a revocation document.</summary>
     public (SignedEnvelope Envelope, byte[] EnvelopeBytes) SignRevocations(RevocationDocument document, string keyId, ReadOnlySpan<byte> privateKey)
     {
         var envelope = SignedDocument.Sign("revocation", SignedDocument.SerializePayload(document), keyId, privateKey);
@@ -116,8 +127,11 @@ public sealed class ReleaseSigner
     }
 }
 
+/// <summary>Authors monotonic channel promotions and explicit rollbacks.</summary>
 public sealed class ChannelAuthoring
 {
+    /// <summary>Creates a channel pointer for a release promotion.</summary>
     public ChannelPointer Promote(string productId, string channel, long channelSequence, long previousChannelSequence, string releaseId, long releaseSequence, ContentHash releaseDigest, DateTimeOffset updatedAt, string? minimumClientVersion = null) => new() { SchemaVersion = 1, ProductId = productId, Channel = channel, ChannelSequence = channelSequence, SupersedesChannelSequence = previousChannelSequence, ReleaseId = releaseId, ReleaseSequence = releaseSequence, ReleaseDigest = releaseDigest, MinimumClientVersion = minimumClientVersion, UpdatedAt = updatedAt.ToUniversalTime() };
+    /// <summary>Creates the next channel pointer as an explicit rollback.</summary>
     public ChannelPointer Rollback(ChannelPointer current, string releaseId, long releaseSequence, ContentHash releaseDigest, DateTimeOffset updatedAt) => Promote(current.ProductId, current.Channel, current.ChannelSequence + 1, current.ChannelSequence, releaseId, releaseSequence, releaseDigest, updatedAt, current.MinimumClientVersion) with { Reason = "rollback" };
 }

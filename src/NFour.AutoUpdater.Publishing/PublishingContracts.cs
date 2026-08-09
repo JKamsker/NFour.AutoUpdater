@@ -2,22 +2,31 @@ using NFour.AutoUpdater.Core;
 
 namespace NFour.AutoUpdater.Publishing;
 
+/// <summary>Reports whether package content passed a specialized validator.</summary><param name="IsValid">Whether validation succeeded.</param><param name="Error">The failure explanation.</param>
 public sealed record ContentValidationResult(bool IsValid, string? Error = null)
 {
+    /// <summary>Gets the shared successful result.</summary>
     public static ContentValidationResult Success { get; } = new(true);
+    /// <summary>Creates a failed validation result.</summary>
     public static ContentValidationResult Failure(string error) => new(false, error);
 }
 
+/// <summary>Validates supported package file content before publication.</summary>
 public interface IContentValidator
 {
+    /// <summary>Determines whether the validator applies to an entry.</summary>
     bool CanValidate(PackageFileEntry entry);
+    /// <summary>Validates a supported entry's content stream.</summary>
     ValueTask<ContentValidationResult> ValidateAsync(PackageFileEntry entry, Stream content, CancellationToken cancellationToken = default);
 }
 
+/// <summary>Runs every applicable validator over package content.</summary><param name="validators">The validators to compose.</param>
 public sealed class CompositeContentValidator(IEnumerable<IContentValidator> validators) : IContentValidator
 {
     private readonly ImmutableArray<IContentValidator> _validators = validators.ToImmutableArray();
+    /// <inheritdoc />
     public bool CanValidate(PackageFileEntry entry) => _validators.Any(x => x.CanValidate(entry));
+    /// <inheritdoc />
     public async ValueTask<ContentValidationResult> ValidateAsync(PackageFileEntry entry, Stream content, CancellationToken cancellationToken = default)
     {
         foreach (var validator in _validators.Where(x => x.CanValidate(entry)))
@@ -30,9 +39,12 @@ public sealed class CompositeContentValidator(IEnumerable<IContentValidator> val
     }
 }
 
+/// <summary>Validates files whose names identify them as JSON.</summary>
 public sealed class JsonContentValidator : IContentValidator
 {
+    /// <inheritdoc />
     public bool CanValidate(PackageFileEntry entry) => entry.Kind == FileEntryKind.File && entry.Path.Value.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
+    /// <inheritdoc />
     public async ValueTask<ContentValidationResult> ValidateAsync(PackageFileEntry entry, Stream content, CancellationToken cancellationToken = default)
     {
         try { using var document = await JsonDocument.ParseAsync(content, cancellationToken: cancellationToken).ConfigureAwait(false); return ContentValidationResult.Success; }
@@ -40,9 +52,12 @@ public sealed class JsonContentValidator : IContentValidator
     }
 }
 
+/// <summary>Validates Windows executables and libraries by their PE signature.</summary>
 public sealed class PeHeaderValidator : IContentValidator
 {
+    /// <inheritdoc />
     public bool CanValidate(PackageFileEntry entry) => entry.Kind == FileEntryKind.File && entry.Path.Value.StartsWith("bin/", StringComparison.OrdinalIgnoreCase) && (entry.Path.Value.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || entry.Path.Value.EndsWith(".dll", StringComparison.OrdinalIgnoreCase));
+    /// <inheritdoc />
     public async ValueTask<ContentValidationResult> ValidateAsync(PackageFileEntry entry, Stream content, CancellationToken cancellationToken = default)
     {
         var header = new byte[2];
@@ -51,22 +66,35 @@ public sealed class PeHeaderValidator : IContentValidator
     }
 }
 
+/// <summary>Configures package hashing and content validation.</summary>
 public sealed record PackageBuildOptions
 {
+    /// <summary>Gets the optional persisted hash-cache path.</summary>
     public string? HashCachePath { get; init; }
+    /// <summary>Gets whether every file must be rehashed.</summary>
     public bool RehashAll { get; init; }
+    /// <summary>Gets whether cache hits are forbidden for a release-signing build.</summary>
     public bool ReleaseSigningBuild { get; init; }
+    /// <summary>Gets additional content validators.</summary>
     public ImmutableArray<IContentValidator> Validators { get; init; } = [];
 }
 
+/// <summary>Stores file identity and dual digests for one hash-cache entry.</summary>
 public sealed record PublishHashCacheEntry
 {
+    /// <summary>Gets the normalized source path.</summary>
     public required string Path { get; init; }
+    /// <summary>Gets the source length.</summary>
     public required long Length { get; init; }
+    /// <summary>Gets the source last-write timestamp ticks.</summary>
     public required long LastWriteTimeUtcTicks { get; init; }
+    /// <summary>Gets the source change timestamp ticks.</summary>
     public required long ChangeTimeUtcTicks { get; init; }
+    /// <summary>Gets the filesystem identity used to reject replaced files.</summary>
     public required string FileIdentity { get; init; }
+    /// <summary>Gets the SHA-256 digest.</summary>
     public required ContentHash Sha256 { get; init; }
+    /// <summary>Gets the MD5 digest used for storage interoperability.</summary>
     public required ContentHash Md5 { get; init; }
 }
 
@@ -76,6 +104,7 @@ public sealed class PublishHashCache
     private readonly Dictionary<string, PublishHashCacheEntry> _entries = new(StringComparer.Ordinal);
     private static readonly JsonSerializerOptions Options = new(RepositoryJson.Options) { WriteIndented = true };
 
+    /// <summary>Loads a persisted cache, returning an empty cache when absent or invalid.</summary>
     public static async ValueTask<PublishHashCache> LoadAsync(string path, CancellationToken cancellationToken = default)
     {
         var cache = new PublishHashCache();
@@ -90,6 +119,7 @@ public sealed class PublishHashCache
         return cache;
     }
 
+    /// <summary>Atomically saves the cache.</summary>
     public async ValueTask SaveAsync(string path, CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
@@ -98,6 +128,7 @@ public sealed class PublishHashCache
         File.Move(temporary, path, overwrite: true);
     }
 
+    /// <summary>Attempts to reuse digests for an unchanged filesystem object.</summary>
     public bool TryGet(string path, FileInfo info, bool rehashAll, out (ContentHash Sha256, ContentHash Md5) digests)
     {
         digests = default;
@@ -108,6 +139,7 @@ public sealed class PublishHashCache
         return true;
     }
 
+    /// <summary>Records digests for a filesystem object.</summary>
     public void Set(string path, FileInfo info, ContentHash sha256, ContentHash md5)
     {
         var metadata = FileMetadata(path, info);

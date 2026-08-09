@@ -1,11 +1,17 @@
 namespace NFour.AutoUpdater.Publishing;
 
+/// <summary>Assigns an install policy to source paths matching a glob.</summary><param name="Pattern">The source-path glob.</param><param name="Policy">The install policy.</param>
 public sealed record SlicePolicy(string Pattern, FileInstallPolicy Policy);
+/// <summary>Defines how one package is sliced from a build tree.</summary>
 public sealed record SlicePackageDefinition
 {
+    /// <summary>Gets the output package identifier.</summary>
     public required PackageId Id { get; init; }
+    /// <summary>Gets source-path globs included in the package.</summary>
     public ImmutableArray<string> Include { get; init; } = [];
+    /// <summary>Gets source-path globs excluded from the package.</summary>
     public ImmutableArray<string> Exclude { get; init; } = [];
+    /// <summary>Gets exact destination-path rewrites.</summary>
     public ImmutableDictionary<string, string> Rewrite { get; init; } = ImmutableDictionary<string, string>.Empty;
 
     /// <summary>
@@ -22,25 +28,38 @@ public sealed record SlicePackageDefinition
     /// afterwards.
     /// </remarks>
     public string? StripPrefix { get; init; }
+    /// <summary>Gets ordered install-policy rules.</summary>
     public ImmutableArray<SlicePolicy> Policies { get; init; } = [];
+    /// <summary>Gets package dependencies copied into the manifest.</summary>
     public ImmutableArray<PackageDependency> Requires { get; init; } = [];
 }
+/// <summary>Contains build-tree slicing configuration.</summary>
 public sealed record SliceRules
 {
+    /// <summary>Gets the rules schema version.</summary>
     public int SchemaVersion { get; init; } = 1;
+    /// <summary>Gets the source build-tree root.</summary>
     public required string Source { get; init; }
+    /// <summary>Gets package slicing definitions.</summary>
     public ImmutableArray<SlicePackageDefinition> Packages { get; init; } = [];
+    /// <summary>Gets whether unmatched source entries produce errors.</summary>
     public bool UnmatchedIsError { get; init; } = true;
 }
+/// <summary>Represents one source entry assigned to a package.</summary><param name="SourcePath">The filesystem source path.</param><param name="Destination">The portable install path.</param><param name="Policy">The install policy.</param><param name="Kind">The entry kind.</param><param name="Mode">The optional POSIX mode.</param>
 public sealed record SlicedFile(string SourcePath, VirtualPath Destination, FileInstallPolicy Policy, FileEntryKind Kind = FileEntryKind.File, string? Mode = null);
+/// <summary>Contains files and dependencies assigned to one package.</summary><param name="Id">The package identifier.</param><param name="Files">The sliced entries.</param><param name="Requires">The package dependencies.</param>
 public sealed record SlicedPackage(PackageId Id, ImmutableArray<SlicedFile> Files, ImmutableArray<PackageDependency> Requires);
+/// <summary>Reports packages and diagnostics produced by slicing.</summary><param name="Packages">The sliced packages.</param><param name="Diagnostics">Slicing diagnostics.</param>
 public sealed record SliceResult(ImmutableArray<SlicedPackage> Packages, ImmutableArray<Diagnostic> Diagnostics)
 {
+    /// <summary>Gets whether slicing completed without errors.</summary>
     public bool IsValid => !Diagnostics.Any(static x => x.IsError);
 }
 
+/// <summary>Safely classifies a build tree into package file sets.</summary>
 public sealed class SliceEngine
 {
+    /// <summary>Slices a build tree according to validated rules.</summary>
     public async ValueTask<SliceResult> SliceAsync(SliceRules rules, CancellationToken cancellationToken = default)
     {
         var diagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
@@ -129,6 +148,7 @@ public sealed class SliceEngine
     }
 }
 
+/// <summary>Transforms source paths into install paths.</summary>
 public static class SlicePaths
 {
     /// <summary>
@@ -147,6 +167,7 @@ public static class SlicePaths
     }
 }
 
+/// <summary>Matches portable paths against cached package globs.</summary>
 public static class Glob
 {
     // Patterns are few and reused across every file in the build; paths number in the
@@ -154,6 +175,7 @@ public static class Glob
     // matching the dominant cost of slicing a large tree.
     private static readonly ConcurrentDictionary<string, System.Text.RegularExpressions.Regex> Compiled = new(StringComparer.Ordinal);
 
+    /// <summary>Determines whether a path matches a glob pattern.</summary>
     public static bool IsMatch(string path, string pattern)
         => Compiled.GetOrAdd(pattern, Build).IsMatch(path);
 
