@@ -17,7 +17,7 @@ Every step is idempotent and every step except `promote` writes only immutable o
 
 ```yaml
 schemaVersion: 1
-source: D:\build\4story
+source: <build-root>
 packages:
   - id: fourstory.client.core
     include: ["**/*"]

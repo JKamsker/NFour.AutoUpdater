@@ -305,7 +305,7 @@ Output: an exact `path → blob` map plus an exact delete set.
 
 **1 — Address.** `PathParser` yields `RepositoryAddress(Backend, BaseUri, ProductId, ReleaseRef)`
 from `remote/fourstory.client@live`, `https://patch.4story.com/live/fourstory.client@release:2026.02.15-a`,
-or `C:\mirror\fourstory.client@live`. Backend comes from the URI scheme or an explicit alias
+or the configured `local` repository alias. Backend comes from the URI scheme or an explicit alias
 table **only** — never a DNS probe, which is what made the reference's parsing
 network-dependent and non-deterministic offline (`PatchRepositoryFactory.cs:289-316`). Variant
 coordinates are **never positional**: always `--select axis=value[,value]`.
@@ -458,7 +458,7 @@ the CAS.
 
 ### 7.2 A variant switch, concretely
 
-`4sup switch "C:\Games\4Story" --select ui=modern` on a live install:
+`4sup switch "<install-root>" --select ui=modern` on a live install:
 
 | Step | Cost |
 |---|---|

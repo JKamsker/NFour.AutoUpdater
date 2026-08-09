@@ -4,7 +4,7 @@
 
 4Story ships a large native game client (order of 10^5 files, tens of GB) that must be kept
 current on player machines over unreliable consumer connections. The same distribution
-machinery is also wanted for 4SaaS server artifacts and as a general-purpose deployment
+machinery is also wanted for NFour server artifacts and as a general-purpose deployment
 tool. Three properties make this harder than a conventional updater:
 
 1. **The content is served from storage we do not control the semantics of.** A patch mirror
@@ -158,7 +158,7 @@ see [14-open-questions.md](14-open-questions.md) Q7 and Q8.
 
 ## 7. Technology decisions
 
-Settled, matching the 4SaaS sibling repo (`D:\File\repos\4Story\4SaaS\4SaaS`):
+Settled, matching the sibling repository's NFour naming convention:
 
 | Decision | Value | Rationale |
 |---|---|---|
