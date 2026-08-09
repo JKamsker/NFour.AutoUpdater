@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -13,6 +14,7 @@ using FourSaas.AutoUpdater.Storage.Ftp;
 using FourSaas.AutoUpdater.Repository;
 using FourSaas.AutoUpdater.Publishing;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace FourSaas.AutoUpdater.Server;
 
@@ -23,6 +25,7 @@ public sealed class ManagementState
     private const string GrantConsumed = "consumed";
     private const string GrantInvalidated = "invalidated";
     private const string GrantMultipartCompleting = "multipart-completing";
+    private const char SequenceKeySeparator = '\0';
     private const long S3SinglePutLimit = 5L * 1024 * 1024 * 1024;
     private static readonly TimeSpan GrantClaimLease = TimeSpan.FromMinutes(2);
 
@@ -369,7 +372,7 @@ public sealed class ManagementState
         await _sequenceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var key = repository + "\0" + scope + "\0" + name;
+            var key = CreateSequenceKey(repository, scope, name);
             if (_databaseFactory is not null)
             {
                 allocated = await AllocateSequenceFromDatabaseAsync(repository, scope, name, cancellationToken).ConfigureAwait(false);
@@ -417,6 +420,14 @@ public sealed class ManagementState
             {
                 await using var database = await _databaseFactory!.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
                 await using var transaction = await database.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
+                // Serializable isolation alone does not lock a missing reservation row. Two
+                // instances can therefore both observe the initial absence, allocate the
+                // same first value, and then repeatedly collide in lockstep while retrying.
+                // A transaction-scoped advisory lock serializes one logical sequence even
+                // before its row exists. Hash collisions only serialize unrelated scopes;
+                // they cannot compromise allocation correctness.
+                var sequenceLockId = CreateSequenceLockId(repository, scope, name);
+                await database.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({sequenceLockId})", cancellationToken).ConfigureAwait(false);
                 var row = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
                 long allocated;
                 if (row is null)
@@ -445,27 +456,44 @@ public sealed class ManagementState
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return allocated;
             }
-            catch (Exception ex) when (attempt < SequenceAllocationRetries && IsTransientConcurrencyFailure(ex))
+            catch (Exception ex) when (attempt < DatabaseConcurrencyRetries && IsTransientConcurrencyFailure(ex))
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(20 * (attempt + 1)), cancellationToken).ConfigureAwait(false);
+                await DelayForDatabaseConcurrencyRetryAsync(attempt, cancellationToken).ConfigureAwait(false);
             }
         }
     }
 
-    private const int SequenceAllocationRetries = 5;
+    private const int DatabaseConcurrencyRetries = 5;
+    private const int DatabaseConcurrencyRetryBaseDelayMilliseconds = 20;
 
     /// <summary>
     /// True for a database failure that a retry can plausibly resolve: PostgreSQL
-    /// serialization failure (40001) and deadlock detected (40P01).
+    /// serialization failure, deadlock detected, and the unique violation produced when two
+    /// idempotent transactions both observe that a reservation, blob reference, or placement
+    /// row is absent and race to create it. Callers use this only around sequence allocation
+    /// and promotion, where re-reading and retrying is the intended upsert behavior.
     /// </summary>
     private static bool IsTransientConcurrencyFailure(Exception exception)
     {
         for (var current = exception; current is not null; current = current.InnerException)
         {
-            var sqlState = current.GetType().GetProperty("SqlState")?.GetValue(current) as string;
-            if (sqlState is "40001" or "40P01") return true;
+            if (current is PostgresException { SqlState: PostgresErrorCodes.SerializationFailure
+                or PostgresErrorCodes.DeadlockDetected
+                or PostgresErrorCodes.UniqueViolation }) return true;
         }
         return false;
+    }
+
+    private static Task DelayForDatabaseConcurrencyRetryAsync(int attempt, CancellationToken cancellationToken)
+        => Task.Delay(TimeSpan.FromMilliseconds(DatabaseConcurrencyRetryBaseDelayMilliseconds * (attempt + 1)), cancellationToken);
+
+    private static string CreateSequenceKey(string repository, string scope, string name)
+        => string.Concat(repository, SequenceKeySeparator, scope, SequenceKeySeparator, name);
+
+    private static long CreateSequenceLockId(string repository, string scope, string name)
+    {
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(CreateSequenceKey(repository, scope, name)));
+        return BinaryPrimitives.ReadInt64LittleEndian(digest);
     }
 
     private async ValueTask<bool> WasSequenceAllocatedAsync(string repository, string scope, string name, long sequence, CancellationToken cancellationToken)
@@ -485,7 +513,7 @@ public sealed class ManagementState
             var reservation = await database.SequenceReservations.FindAsync([repository, scope, name], cancellationToken).ConfigureAwait(false);
             return reservation is not null && reservation.AllocatedSequencesJson is null && sequence < reservation.NextValue;
         }
-        return _allocatedSequences.TryGetValue(repository + "\0" + scope + "\0" + name, out var allocatedSequences) && allocatedSequences.ContainsKey(sequence);
+        return _allocatedSequences.TryGetValue(CreateSequenceKey(repository, scope, name), out var allocatedSequences) && allocatedSequences.ContainsKey(sequence);
     }
 
     public async Task<IResult> RecordTelemetryAsync(HttpRequest request, CancellationToken cancellationToken = default)
@@ -2206,8 +2234,25 @@ public sealed class ManagementState
 
     private async Task PersistPromotionAsync(GrantState grant, string repository, DateTimeOffset verifiedAt, CancellationToken cancellationToken)
     {
-        if (_databaseFactory is null) return;
-        await using var database = await _databaseFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var databaseFactory = _databaseFactory;
+        if (databaseFactory is null) return;
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await PersistPromotionAttemptAsync(databaseFactory, grant, repository, verifiedAt, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex) when (attempt < DatabaseConcurrencyRetries && IsTransientConcurrencyFailure(ex))
+            {
+                await DelayForDatabaseConcurrencyRetryAsync(attempt, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task PersistPromotionAttemptAsync(IDbContextFactory<ManagementDbContext> databaseFactory, GrantState grant, string repository, DateTimeOffset verifiedAt, CancellationToken cancellationToken)
+    {
+        await using var database = await databaseFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await database.Database.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
         var row = await database.PublishGrants.FindAsync([grant.Id], cancellationToken).ConfigureAwait(false)
                   ?? new PublishGrantRow { GrantId = grant.Id, SessionId = grant.SessionId, RepositoryId = grant.Repository, StagingKey = grant.StagingKey.Value, Digest = grant.Digest.ToString() };
