@@ -101,7 +101,12 @@ internal static class SecureInstallOperations
             using (var destination = new FileStream(new SafeFileHandle((IntPtr)descriptor, ownsHandle: true), FileAccess.Write, 128 * 1024, isAsync: false))
             {
                 var cloned = OperatingSystem.IsLinux() && TryReflink(descriptor, stagedPath);
-                if (mode != Mode0644 && Fchmod(descriptor, mode) != 0)
+                // open/openat take the creation mode as a C variadic argument. On Apple
+                // arm64 that argument follows the platform's variadic ABI, which a fixed
+                // P/Invoke declaration does not reliably populate. Always set the final
+                // mode through the non-variadic descriptor API instead of assuming the
+                // create call (or the process umask) produced the requested permissions.
+                if (Fchmod(descriptor, mode) != 0)
                     ThrowLastError($"set mode {PosixFileMode.Format(mode)} for '{path}'");
                 if (!cloned) awaitCopy(stagedPath, destination);
             }

@@ -307,10 +307,12 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
     {
         const int ErrorSharingViolation = 32;
         const int ErrorLockViolation = 33;
-        const int Ewouldblock = 11;
+        const int EwouldblockLinux = 11;
+        const int EwouldblockDarwin = 35;
         if (exception is FileNotFoundException or DirectoryNotFoundException or PathTooLongException) return false;
         var code = exception.HResult & 0xFFFF;
-        return code is ErrorSharingViolation or ErrorLockViolation or Ewouldblock;
+        return code is ErrorSharingViolation or ErrorLockViolation or EwouldblockLinux
+            || (OperatingSystem.IsMacOS() && code == EwouldblockDarwin);
     }
 
     private bool IsInternalPath(string path)
