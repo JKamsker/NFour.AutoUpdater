@@ -10,7 +10,7 @@ readonly configuration_error_exit_code=78
 readonly package_name="4sup"
 readonly package_supplier="NFour"
 readonly manifest_format="SPDX:2.2"
-readonly namespace_base="https://github.com/JKamsker/AutoUpdater/sbom"
+readonly namespace_base="https://github.com/JKamsker/NFour.AutoUpdater/sbom"
 readonly release_configuration="Release"
 readonly development_trust_root_acknowledgement="-p:NFourAllowDevelopmentTrustRoot=true"
 readonly metadata_project="src/NFour.AutoUpdater.Cli/NFour.AutoUpdater.Cli.csproj"
