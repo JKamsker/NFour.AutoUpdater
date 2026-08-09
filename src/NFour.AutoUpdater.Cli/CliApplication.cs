@@ -15,8 +15,12 @@ using System.Text;
 
 namespace NFour.AutoUpdater.Cli;
 
+/// <summary>Dispatches command-line operations for the NFour updater toolchain.</summary>
 public static class CliApplication
 {
+    /// <summary>Runs the command-line application.</summary>
+    /// <param name="args">Command-line arguments excluding the executable name.</param>
+    /// <returns>The process exit code.</returns>
     public static async ValueTask<int> RunAsync(string[] args)
     {
         if (GetOptionValue(args, "--config") is { } configPath) Environment.SetEnvironmentVariable("FOURSUP_CONFIG_PATH", Path.GetFullPath(configPath));
@@ -1873,58 +1877,5 @@ public static class CliApplication
     {
         if (json) Console.WriteLine(JsonSerializer.Serialize(new { operations = plan.Operations.Length, blobs = plan.BlobsToFetch.Length, plan.BytesToDownload, plan.BytesToWrite, plan.NetInstallDelta, plan.PeakFreeSpaceRequiredByVolume }));
         else Console.WriteLine($"operations={plan.Operations.Length} blobs={plan.BlobsToFetch.Length} download={plan.BytesToDownload} write={plan.BytesToWrite} net={plan.NetInstallDelta}");
-    }
-}
-
-public sealed record RepositoryAddress(string Backend, Uri BaseUri, string ProductId, string ReleaseRef)
-{
-    public static RepositoryAddress Parse(string value)
-    {
-        var at = value.LastIndexOf('@'); if (at <= 0 || at == value.Length - 1) throw new FormatException("address must end in @channel or @release:id.");
-        var coordinate = value[(at + 1)..]; var release = coordinate.StartsWith("release:", StringComparison.Ordinal) || coordinate.StartsWith("channel:", StringComparison.Ordinal) ? coordinate : "channel:" + coordinate;
-        var left = value[..at]; string backend; Uri baseUri; string product;
-        if (Uri.TryCreate(left, UriKind.Absolute, out var absolute))
-        {
-            if (absolute.Scheme is not ("http" or "https" or "s3" or "ftp" or "file")) throw new FormatException($"Unsupported repository backend '{absolute.Scheme}'.");
-            backend = absolute.Scheme; var path = absolute.AbsolutePath.Trim('/'); product = path.Split('/').LastOrDefault() ?? throw new FormatException("product id is missing."); baseUri = new UriBuilder(absolute) { Path = absolute.AbsolutePath[..(absolute.AbsolutePath.LastIndexOf(product, StringComparison.Ordinal))] }.Uri;
-        }
-        else
-        {
-            var normalized = left.Replace('\\', '/');
-            var slash = normalized.LastIndexOf('/');
-            product = slash > 0 ? normalized[(slash + 1)..] : normalized;
-            if (normalized.Length >= 3 && char.IsLetter(normalized[0]) && normalized[1] == ':' && normalized[2] == '/')
-            {
-                backend = "file";
-                var directory = normalized[..slash].TrimEnd('/');
-                baseUri = new Uri("file:///" + directory, UriKind.Absolute);
-            }
-            else if (normalized.StartsWith("/", StringComparison.Ordinal))
-            {
-                backend = "file";
-                baseUri = new Uri("file://" + normalized[..slash].TrimEnd('/'), UriKind.Absolute);
-            }
-            else
-            {
-                backend = slash > 0 ? normalized[..slash] : "local";
-                baseUri = new Uri("file:///");
-            }
-        }
-        if (!Identifier.IsValid(product)) throw new FormatException("product id is invalid."); return new RepositoryAddress(backend, baseUri, product, release);
-    }
-}
-
-public static class SelectionParser
-{
-    public static VariantSelection Parse(IEnumerable<string> values)
-    {
-        var builder = ImmutableSortedDictionary.CreateBuilder<string, ImmutableSortedSet<string>>(StringComparer.Ordinal);
-        foreach (var item in values)
-        {
-            var split = item.IndexOf('='); if (split <= 0 || split == item.Length - 1) throw new FormatException("--select must use axis=value.");
-            var axis = item[..split]; var value = item[(split + 1)..]; if (!Identifier.IsValid(axis, "axis", out var error) || !Identifier.IsValid(value, "value", out error)) throw new FormatException(error);
-            builder[axis] = builder.TryGetValue(axis, out var existing) ? existing.Add(value) : ImmutableSortedSet.Create(StringComparer.Ordinal, value);
-        }
-        return new VariantSelection { Axes = builder.ToImmutable() };
     }
 }

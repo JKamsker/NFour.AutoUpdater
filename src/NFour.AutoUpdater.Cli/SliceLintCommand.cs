@@ -3,11 +3,16 @@ using NFour.AutoUpdater.Publishing;
 
 namespace NFour.AutoUpdater.Cli;
 
+/// <summary>Validates a build tree against the slice-layout convention.</summary>
 public static class SliceLintCommand
 {
+    /// <summary>Gets the top-level slice command name.</summary>
     public const string CommandName = "slice";
+    /// <summary>Gets the layout-validation subcommand name.</summary>
     public const string LintSubcommandName = "lint";
+    /// <summary>Gets the option used to declare a variant axis.</summary>
     public const string AxisOption = "--axis";
+    /// <summary>Gets the option that promotes layout warnings to errors.</summary>
     public const string WarningsAsErrorsOption = "--warnings-as-errors";
 
     private const int SuccessExitCode = 0;
@@ -17,6 +22,9 @@ public static class SliceLintCommand
     private const string OptionAssignmentSeparator = "=";
     private const string AllFilesSearchPattern = "*";
 
+    /// <summary>Runs build-tree layout validation.</summary>
+    /// <param name="args">Arguments following the <c>slice</c> command.</param>
+    /// <returns>The process exit code.</returns>
     public static ValueTask<int> RunAsync(string[] args)
     {
         if (!string.Equals(args.FirstOrDefault(), LintSubcommandName, StringComparison.Ordinal))

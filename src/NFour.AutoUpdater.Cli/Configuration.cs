@@ -2,41 +2,84 @@ using System.Text.Json.Serialization;
 
 namespace NFour.AutoUpdater.Cli;
 
+/// <summary>Describes a named storage backend available to the CLI.</summary>
 public sealed record StorageConfiguration
 {
+    /// <summary>Gets the configuration-local storage name.</summary>
     public required string Name { get; init; }
+    /// <summary>Gets the storage provider type.</summary>
     public required string Type { get; init; }
+    /// <summary>Gets the order in which the storage should be considered.</summary>
     public int Priority { get; init; }
+    /// <summary>Gets whether write operations are disabled for the storage.</summary>
     public bool ReadOnly { get; init; }
+    /// <summary>Gets the optional read endpoint.</summary>
     public string? ReadUrl { get; init; }
+    /// <summary>Gets the optional write endpoint.</summary>
     public string? WriteUrl { get; init; }
 }
+
+/// <summary>Associates a short repository name with its repository address.</summary>
 public sealed record RepositoryAlias
 {
+    /// <summary>Gets the alias name.</summary>
     public required string Name { get; init; }
+    /// <summary>Gets the repository address resolved by the alias.</summary>
     public required string Address { get; init; }
 }
+
+/// <summary>Represents the merged configuration consumed by the CLI.</summary>
 public sealed record FourSupConfiguration
 {
+    /// <summary>Gets the legacy default local repository address.</summary>
     public string? DefaultLocalRepository { get; init; }
+    /// <summary>Gets the legacy default management-server address.</summary>
     public string? DefaultServer { get; init; }
+    /// <summary>Gets the configured storage backends.</summary>
     public ImmutableArray<StorageConfiguration> Storages { get; init; } = [];
+    /// <summary>Gets the configured repository aliases.</summary>
     public ImmutableArray<RepositoryAlias> Aliases { get; init; } = [];
-    [JsonExtensionData] public Dictionary<string, JsonElement>? Extensions { get; init; }
+    /// <summary>Gets unrecognized configuration values preserved for forward compatibility.</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extensions { get; init; }
 }
 
+/// <summary>Loads and updates the CLI's layered JSON configuration.</summary>
 public sealed class ConfigurationLoader
 {
+    private const string ContentRootEnvironmentVariable = "FOURSUP_CONTENT_ROOT";
+    private const string ConfigurationPathEnvironmentVariable = "FOURSUP_CONFIG_PATH";
+    private const string RootConfigurationFileName = "4sup.json";
+    private const string VendorDirectoryName = "4Story";
+    private const string ProductDirectoryName = "4sup";
+    private const string UserConfigurationFileName = "config.json";
+    private const string LocalRepositoryAlias = "local";
+    private const string RemoteRepositoryAlias = "remote";
+    private const string ReservedDefaultAlias = "default";
+
     private readonly JsonSerializerOptions _options = new(JsonSerializerDefaults.Web) { WriteIndented = true };
+
+    /// <summary>Gets configuration files in descending precedence order.</summary>
     public IReadOnlyList<string> Layers { get; }
+
+    /// <summary>Initializes a loader rooted at the supplied content directory.</summary>
+    /// <param name="contentRoot">Optional content root used for the repository-local layer.</param>
     public ConfigurationLoader(string? contentRoot = null)
     {
-        var root = contentRoot ?? Environment.GetEnvironmentVariable("FOURSUP_CONTENT_ROOT") ?? Directory.GetCurrentDirectory();
+        var root = contentRoot ?? Environment.GetEnvironmentVariable(ContentRootEnvironmentVariable) ?? Directory.GetCurrentDirectory();
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         var common = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-        var configuredPath = Environment.GetEnvironmentVariable("FOURSUP_CONFIG_PATH");
-        Layers = configuredPath is null ? [Path.Combine(root, "4sup.json"), Path.Combine(appData, "4Story", "4sup", "config.json"), Path.Combine(common, "4Story", "4sup", "config.json")] : [Path.GetFullPath(configuredPath), Path.Combine(root, "4sup.json"), Path.Combine(appData, "4Story", "4sup", "config.json"), Path.Combine(common, "4Story", "4sup", "config.json")];
+        var configuredPath = Environment.GetEnvironmentVariable(ConfigurationPathEnvironmentVariable);
+        var rootLayer = Path.Combine(root, RootConfigurationFileName);
+        var userLayer = Path.Combine(appData, VendorDirectoryName, ProductDirectoryName, UserConfigurationFileName);
+        var machineLayer = Path.Combine(common, VendorDirectoryName, ProductDirectoryName, UserConfigurationFileName);
+        Layers = configuredPath is null
+            ? [rootLayer, userLayer, machineLayer]
+            : [Path.GetFullPath(configuredPath), rootLayer, userLayer, machineLayer];
     }
+
+    /// <summary>Loads and merges all existing configuration layers.</summary>
+    /// <returns>The merged configuration.</returns>
     public FourSupConfiguration Load()
     {
         var values = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
@@ -48,11 +91,16 @@ public sealed class ConfigurationLoader
         }
         var json = JsonSerializer.Serialize(values); var configuration = JsonSerializer.Deserialize<FourSupConfiguration>(json, _options) ?? new FourSupConfiguration();
         var aliases = configuration.Aliases.ToBuilder();
-        if (!aliases.Any(x => x.Name == "local") && configuration.DefaultLocalRepository is not null) aliases.Add(new RepositoryAlias { Name = "local", Address = configuration.DefaultLocalRepository });
-        if (!aliases.Any(x => x.Name == "remote") && configuration.DefaultServer is not null) aliases.Add(new RepositoryAlias { Name = "remote", Address = configuration.DefaultServer });
-        if (aliases.Any(x => x.Name == "default")) throw new FormatException("The alias 'default' is reserved.");
+        if (!aliases.Any(x => x.Name == LocalRepositoryAlias) && configuration.DefaultLocalRepository is not null) aliases.Add(new RepositoryAlias { Name = LocalRepositoryAlias, Address = configuration.DefaultLocalRepository });
+        if (!aliases.Any(x => x.Name == RemoteRepositoryAlias) && configuration.DefaultServer is not null) aliases.Add(new RepositoryAlias { Name = RemoteRepositoryAlias, Address = configuration.DefaultServer });
+        if (aliases.Any(x => x.Name == ReservedDefaultAlias)) throw new FormatException($"The alias '{ReservedDefaultAlias}' is reserved.");
         return configuration with { Aliases = aliases.ToImmutable() };
     }
+
+    /// <summary>Writes one setting to the highest-precedence owning layer.</summary>
+    /// <param name="key">Configuration property name.</param>
+    /// <param name="value">JSON value to store.</param>
+    /// <param name="cancellationToken">Token used to cancel asynchronous file access.</param>
     public async ValueTask SaveAsync(string key, JsonElement value, CancellationToken cancellationToken = default)
     {
         // Update the highest-precedence layer that already owns this key. New keys
