@@ -60,7 +60,7 @@ jobs:
         run: dotnet restore AutoUpdater.sln
       - name: Build
         run: dotnet build AutoUpdater.sln --no-restore --configuration Release $DOTNET_BUILD_ARGS
-      - name: Configure FTP test client
+      - name: Configure storage test clients
         run: |
           ftp_control_port=21
           ftp_endpoint="$(docker compose port vsftpd "$ftp_control_port")"
@@ -70,6 +70,14 @@ jobs:
           printf 'FOURSUP_FTP_URI=ftp://127.0.0.1:%s/\n' "$ftp_published_port" >> "$GITHUB_ENV"
           printf 'FOURSUP_FTP_USER=%s\n' "$ftp_user" >> "$GITHUB_ENV"
           printf 'FOURSUP_FTP_PASSWORD=%s\n' "$ftp_password" >> "$GITHUB_ENV"
+          minio_api_port=9000
+          minio_endpoint="$(docker compose port minio "$minio_api_port")"
+          minio_published_port="${minio_endpoint##*:}"
+          minio_access_key="$(docker compose exec -T minio printenv MINIO_ROOT_USER | tr -d '\r')"
+          minio_secret_key="$(docker compose exec -T minio printenv MINIO_ROOT_PASSWORD | tr -d '\r')"
+          printf 'FOURSUP_MINIO_URI=http://127.0.0.1:%s\n' "$minio_published_port" >> "$GITHUB_ENV"
+          printf 'FOURSUP_MINIO_ACCESS_KEY=%s\n' "$minio_access_key" >> "$GITHUB_ENV"
+          printf 'FOURSUP_MINIO_SECRET_KEY=%s\n' "$minio_secret_key" >> "$GITHUB_ENV"
       - name: Test (all backends enabled)
         run: FOURSUP_MINIO=1 FOURSUP_HTTP=1 FOURSUP_FTP=1 FOURSUP_POSTGRES=1 FOURSUP_DATABASE='Host=localhost;Port=5432;Database=4sup;Username=4sup;Password=4sup-test-password' dotnet test AutoUpdater.sln --no-build --no-restore --configuration Release
 

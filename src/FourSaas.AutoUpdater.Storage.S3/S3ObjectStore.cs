@@ -18,6 +18,14 @@ public enum S3ProviderProfile
 
 public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, IServerSideCopyStore, IServerSideTransferStore, IMultipartUploadStore, IMultipartGrantStore, IMultipartGarbageCollector, IPresigningStore, IUploadHeaderProvider, IUploadIntegrityEnforcement, IServerSideVerifier
 {
+    private const long BytesPerKibibyte = 1024;
+    private const long BytesPerMebibyte = BytesPerKibibyte * BytesPerKibibyte;
+    private const long BytesPerGibibyte = BytesPerMebibyte * BytesPerKibibyte;
+    private const long S3SingleRequestCopyLimit = 5 * BytesPerGibibyte;
+    private const long DefaultMultipartCopyPartSize = 16 * BytesPerMebibyte;
+    private const int TransportParallelism = 32;
+    private const int UncontendedGateCount = 1;
+
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
@@ -44,10 +52,12 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
         }
     }
     public S3ProviderProfile ProviderProfile => _providerProfile;
+    protected virtual long SingleRequestCopyLimit => S3SingleRequestCopyLimit;
+    protected virtual long MultipartCopyPartSize => DefaultMultipartCopyPartSize;
     protected bool SupportsConditionalWrites => _providerProfile is S3ProviderProfile.Aws or S3ProviderProfile.Minio or S3ProviderProfile.R2;
     public bool UploadDigestIsStorageEnforced => SupportsConditionalWrites;
     public virtual StorageCapabilities Capabilities => StorageCapabilities.Read | StorageCapabilities.Range | StorageCapabilities.List | StorageCapabilities.Write | StorageCapabilities.ServerSideCopy | StorageCapabilities.Presigning | StorageCapabilities.Multipart | StorageCapabilities.Delete;
-    public int RecommendedParallelism => 32;
+    public int RecommendedParallelism => TransportParallelism;
     public async ValueTask<ReadResult?> OpenAsync(ObjectKey key, long offset = 0, ObjectValidator? ifMatch = null, CancellationToken cancellationToken = default)
     {
         try
@@ -65,7 +75,13 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
                     return await OpenAsync(key, 0, null, cancellationToken).ConfigureAwait(false);
                 }
             }
-            return new ReadResult { Content = new ResponseStream(response), ActualStartOffset = offset, StatusCode = offset > 0 ? 206 : 200, Validator = new(ObjectValidatorKind.ETag, response.ETag) };
+            return new ReadResult
+            {
+                Content = new ResponseStream(response),
+                ActualStartOffset = offset,
+                StatusCode = (int)(offset > 0 ? System.Net.HttpStatusCode.PartialContent : System.Net.HttpStatusCode.OK),
+                Validator = new(ObjectValidatorKind.ETag, response.ETag)
+            };
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) { return null; }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.PreconditionFailed && offset > 0)
@@ -235,8 +251,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
             if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
             var sourceHead = await HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
             var sourceETag = sourceHead.Validator?.Value;
-            const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
-            if (sourceHead.Length <= copyObjectLimit)
+            if (sourceHead.Length <= SingleRequestCopyLimit)
             {
                 var copy = new CopyObjectRequest { SourceBucket = _bucket, SourceKey = FullKey(source), DestinationBucket = _bucket, DestinationKey = destinationKey, MetadataDirective = S3MetadataDirective.REPLACE };
                 copy.Headers["Cache-Control"] = CacheControlFor(destination);
@@ -258,7 +273,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
             {
                 var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
                     .ToDictionary(part => part.Number);
-                var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
+                var partSize = Math.Max(upload.PartSize, MultipartCopyPartSize);
                 var partNumber = 1;
                 for (long first = 0; first < sourceHead.Length; first += partSize)
                 {
@@ -294,8 +309,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
             if (!overwrite && await HeadAsync(destination, cancellationToken).ConfigureAwait(false) is not null) throw new IOException($"Destination '{destination}' already exists.");
             var sourceHead = await remote.HeadAsync(source, cancellationToken).ConfigureAwait(false) ?? throw new FileNotFoundException(source.Value);
             var sourceETag = sourceHead.Validator?.Value;
-            const long copyObjectLimit = 5L * 1024 * 1024 * 1024;
-            if (sourceHead.Length <= copyObjectLimit)
+            if (sourceHead.Length <= SingleRequestCopyLimit)
             {
                 var copy = new CopyObjectRequest
                 {
@@ -319,7 +333,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
             {
                 var partsByNumber = (await ListPartsAsync(upload, cancellationToken).ConfigureAwait(false))
                     .ToDictionary(part => part.Number);
-                var partSize = Math.Max(upload.PartSize, 16L * 1024 * 1024);
+                var partSize = Math.Max(upload.PartSize, MultipartCopyPartSize);
                 var partNumber = 1;
                 for (long first = 0; first < sourceHead.Length; first += partSize)
                 {
@@ -392,7 +406,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
             try { await AbortMultipartUploadAsync(existing, cancellationToken).ConfigureAwait(false); } catch (AmazonS3Exception) { }
         }
 
-        var partSize = 16L * 1024 * 1024;
+        var partSize = MultipartCopyPartSize;
         var request = new InitiateMultipartUploadRequest { BucketName = _bucket, Key = FullKey(destination) };
         request.Headers["Cache-Control"] = CacheControlFor(destination);
         request.Headers["Content-Encoding"] = string.Empty;
@@ -411,12 +425,12 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
         gate.Release();
         // The map previously grew one entry per destination key for the lifetime of the
         // process. Removing an uncontended gate keeps it proportional to concurrent copies.
-        if (gate.CurrentCount == 1) _copyLocks.TryRemove(new KeyValuePair<string, SemaphoreSlim>(destinationKey, gate));
+        if (gate.CurrentCount == UncontendedGateCount) _copyLocks.TryRemove(new KeyValuePair<string, SemaphoreSlim>(destinationKey, gate));
     }
 
     public async ValueTask<MultipartUpload> StartMultipartUploadAsync(ObjectKey key, CancellationToken cancellationToken = default)
     {
-        var partSize = 16L * 1024 * 1024;
+        var partSize = MultipartCopyPartSize;
         var request = new InitiateMultipartUploadRequest { BucketName = _bucket, Key = FullKey(key) };
         request.Headers["Cache-Control"] = CacheControlFor(key);
         request.Headers["Content-Encoding"] = string.Empty;
@@ -445,7 +459,7 @@ public class S3ObjectStore : IDelimitedObjectStore, IRangeReadableObjectStore, I
                 var initiated = candidate.Initiated.ToUniversalTime();
                 if (newest is null || initiated > newestAt)
                 {
-                    newest = new MultipartUpload(key, candidate.UploadId, 16L * 1024 * 1024);
+                    newest = new MultipartUpload(key, candidate.UploadId, MultipartCopyPartSize);
                     newestAt = initiated;
                 }
             }
