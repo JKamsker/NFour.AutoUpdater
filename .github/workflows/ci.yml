@@ -113,6 +113,8 @@ jobs:
           fi
       - name: Deprecated package report
         run: dotnet list AutoUpdater.sln package --include-transitive --deprecated
+      - name: Generate and validate release SBOM
+        run: bash scripts/generate-sbom.sh "$RUNNER_TEMP/4sup-sbom"
       - name: Secret scan
         run: bash scripts/secret-scan.sh
       - name: Diff hygiene
