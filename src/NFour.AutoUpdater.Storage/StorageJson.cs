@@ -1,7 +1,9 @@
 namespace NFour.AutoUpdater.Storage;
 
+/// <summary>Converts storage capability flags to and from their wire-format names.</summary>
 public sealed class StorageCapabilitiesJsonConverter : JsonConverter<StorageCapabilities>
 {
+    /// <inheritdoc />
     public override StorageCapabilities Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         if (reader.TokenType == JsonTokenType.Number) return (StorageCapabilities)reader.GetInt32();
@@ -19,6 +21,7 @@ public sealed class StorageCapabilitiesJsonConverter : JsonConverter<StorageCapa
         }
         return result;
     }
+    /// <inheritdoc />
     public override void Write(Utf8JsonWriter writer, StorageCapabilities value, JsonSerializerOptions options)
     {
         writer.WriteStartArray(); foreach (var (flag, name) in new[] { (StorageCapabilities.Read, "read"), (StorageCapabilities.Range, "range"), (StorageCapabilities.List, "list"), (StorageCapabilities.Write, "write"), (StorageCapabilities.ConditionalWrite, "conditional-write"), (StorageCapabilities.ServerSideCopy, "server-side-copy"), (StorageCapabilities.Presigning, "presigning"), (StorageCapabilities.Multipart, "multipart"), (StorageCapabilities.Delete, "delete") }) if (value.HasFlag(flag)) writer.WriteStringValue(name); writer.WriteEndArray();
