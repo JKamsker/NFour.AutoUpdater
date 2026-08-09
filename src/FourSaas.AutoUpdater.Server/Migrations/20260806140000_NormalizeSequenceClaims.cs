@@ -37,7 +37,7 @@ public partial class NormalizeSequenceClaims : Migration
             INSERT INTO "SequenceClaims" ("RepositoryId", "Scope", "Name", "Value", "AllocatedAt")
             SELECT r."RepositoryId", r."Scope", r."Name", v::bigint, NOW()
             FROM "SequenceReservations" r
-            CROSS JOIN LATERAL jsonb_array_elements_text(r."AllocatedSequencesJson") AS v
+            CROSS JOIN LATERAL jsonb_array_elements_text(r."AllocatedSequencesJson"::jsonb) AS v
             WHERE r."AllocatedSequencesJson" IS NOT NULL
             ON CONFLICT DO NOTHING;
             """);

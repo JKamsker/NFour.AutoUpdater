@@ -363,6 +363,28 @@ namespace FourSaas.AutoUpdater.Server.Migrations
                     b.ToTable("Revocations");
                 });
 
+            modelBuilder.Entity("FourSaas.AutoUpdater.Server.SequenceClaimRow", b =>
+                {
+                    b.Property<string>("RepositoryId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Scope")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .HasColumnType("text");
+
+                    b.Property<long>("Value")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTimeOffset>("AllocatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("RepositoryId", "Scope", "Name", "Value");
+
+                    b.ToTable("SequenceClaims");
+                });
+
             modelBuilder.Entity("FourSaas.AutoUpdater.Server.SequenceReservationRow", b =>
                 {
                     b.Property<string>("RepositoryId")
