@@ -23,7 +23,7 @@ its authoritative record, not a discussion.
 | Q9 | Symlinks, exec bits, empty directories | **DECIDED.** Symlinks rejected at publish; `pol:"executable"` + `mode`; empty dirs via `k:"dir"` ([05](05-repository-format.md) §8) |
 | Q10 | Naming (`FourSaas.*` vs `NFour.*`) | **DECIDED — `NFour.AutoUpdater.*`; see Q10** |
 | Q11 | Re-run the third variant design | **CLOSED — no.** Nothing depends on it |
-| Q12 | Migration from an existing patcher | **OPEN** |
+| Q12 | Migration from an existing patcher | **DECIDED — adopt the existing live tree; see Q12** |
 | Q13 | Telemetry consent | **DECIDED.** Off by default and deployment-configurable; see Q13 |
 | Q14 | Who operates special servers | **DECIDED — first-party only.** Channel per realm; federated overlay explicitly out of scope; see Q14 |
 | — | At-rest compression | **DECIDED — removed.** Identity-only CAS ([18](18-normative-contract.md) §5) |
@@ -349,6 +349,32 @@ transition path: either a one-time full validation pass that adopts an existing 
 ledger (`verify --rebuild-state` against a synthetic release), or a clean reinstall.
 
 **Needs:** product owner. Not blocking for Phases 0–4, but it shapes the first real rollout.
+
+### Answer — adopt the existing live installation (2026-08-09)
+
+An existing installed base is confirmed. The inspected installation has a live game tree plus
+two legacy launcher state roots: `.fourstory-launcher`, with current/previous release pointers
+and version snapshots, and `.pr-launcher`. The live root is authoritative for migration; the
+active legacy snapshot contains only the launcher's versioned subset, not the complete game.
+
+The first NFour release uses in-place adoption rather than requiring a reinstall:
+
+1. Publish a synthetic baseline release from the authoritative build that produced the legacy
+   client. Sign it with the NFour trust root; do not import or implicitly trust legacy launcher
+   envelopes.
+2. Stop the game and legacy launcher, then run `4sup verify <install-root> --rebuild-state`
+   against that explicit baseline release and the installation's selected axes.
+3. Hash every path in the composed baseline. Commit the new ledger only if every required
+   replaceable file matches. Preserve-policy differences become adopted/unmanaged entries;
+   unrelated files remain unowned.
+4. Keep `.fourstory-launcher`, `.pr-launcher`, crash dumps, backups, and other unmatched content
+   outside the new ledger. They are neither proof of installed state nor deletion candidates.
+5. Disable the legacy launcher's update path after adoption so two updaters cannot race. Retain
+   its current and previous snapshots until one NFour-managed update and launch succeeds; cleanup
+   is a later, explicit operation.
+
+If validation fails, the migration reports the mismatched paths and offers targeted repair or a
+clean reinstall. It never writes a partial ledger that claims unverified legacy bytes.
 
 ---
 
