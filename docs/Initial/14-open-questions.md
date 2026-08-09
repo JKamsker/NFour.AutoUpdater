@@ -13,7 +13,7 @@ its authoritative record, not a discussion.
 | # | Topic | Status |
 |---|---|---|
 | Q1 | Engine globs `ui/**` at startup? | **ASSUMED — globbing.** Unconfirmed, but the client is ours to change if not; see Q1 |
-| Q2 | Build-tree partitioning / `slice.yaml` ownership | **OPEN — blocking** |
+| Q2 | Build-tree partitioning / `slice.yaml` ownership | **DECIDED — convention defined.** No concept existed; one is now specified and enforced ([20](20-build-tree-layout.md)) |
 | Q3 | UI packages: full subtree or thin overlay | **DECIDED — full subtree.** The two UIs do not share bulk paths today; see Q3 |
 | Q4 | Which axes are post-install switchable | **OPEN** |
 | Q5 | Ed25519 signing in v1 | **DECIDED — yes.** Architecturally mandatory; the envelope is normative in [17](17-signed-documents.md) and is a Phase 0 exit criterion |
@@ -25,7 +25,7 @@ its authoritative record, not a discussion.
 | Q11 | Re-run the third variant design | **CLOSED — no.** Nothing depends on it |
 | Q12 | Migration from an existing patcher | **OPEN** |
 | Q13 | Telemetry consent | **OPEN**, but lower stakes now — telemetry is diagnostic-only and gates nothing ([09](09-control-plane-server.md) §2.1) |
-| Q14 | Who operates special servers | **OPEN — blocking for that feature** |
+| Q14 | Who operates special servers | **DECIDED — first-party only.** Channel per realm; federated overlay explicitly out of scope; see Q14 |
 | — | At-rest compression | **DECIDED — removed.** Identity-only CAS ([18](18-normative-contract.md) §5) |
 | — | Device targeting | **DECIDED — none.** Channels only ([09](09-control-plane-server.md) §2.3) |
 | — | Rollback mechanics | **DECIDED.** New signed pointer at a higher `channelSequence` ([17](17-signed-documents.md) §4) |
@@ -79,6 +79,31 @@ Specifically: **is the localized data already segregated by directory**
 **Needs:** the build owner.
 **Recommendation:** if interleaved, fix it in the build rather than in the slicer. A packaging
 tool that needs per-file rules for 200k files is a packaging tool nobody maintains.
+
+### Answer — define the convention (2026-08-06)
+
+There is no partitioning concept in the build today, so the question of "is it segregated or
+interleaved" has no answer yet to discover. The convention to build toward is therefore
+specified rather than inferred: **[20-build-tree-layout.md](20-build-tree-layout.md)**.
+
+In short — a file's package is decided by its directory and nothing else:
+
+```
+common/                   axis-independent content
+axis/<axis>/<value>/      content selected by one axis value
+```
+
+This keeps the slice at roughly a dozen rules regardless of file count, which is the property
+that matters; the alternative is per-file rules, and 200k of those is the configuration nobody
+maintains.
+
+Four invariants are enforced by `BuildTreeLayout` (`LAY001`–`LAY004`), the most load-bearing
+being **LAY003**: two axes may not claim the same install path. That is the Q4
+path-disjointness constraint made mechanical instead of remembered.
+
+**Ownership:** `slice.yaml` is generated from the tree, so what needs an owner is the
+build-output layout. Whoever adds a file picks its directory; the checks enforce that a choice
+was made.
 
 ---
 
@@ -262,6 +287,20 @@ dedupe across every realm automatically, and switching realms is an ordinary var
 nearly offline after the first time. The cost is re-cutting realm releases when the base updates
 — but a release lock is ~6 KB and `release new --from <base> --bump` is one command, so it
 automates cleanly.
+
+### Answer — first-party realms, channel per realm (2026-08-06)
+
+All realms are operated by us. That settles it on the top row of the table above: **a channel
+per realm**, needing nothing that does not already exist. Base blobs dedupe across every realm
+automatically, and switching realms is an ordinary variant diff that is nearly offline after
+the first time.
+
+The cost is re-cutting realm releases when the base updates, which automates cleanly — a
+release lock is ~6 KB and `release new --from <base> --bump` is one command.
+
+**The federated-overlay model is explicitly out of scope**, and should stay out unless the
+operating model changes. Everything below records why, so that a future "can we just let
+partners run realms?" is answered with the actual cost rather than re-derived.
 
 **If third parties operate realms, this becomes a different project.** A federated overlay lets a
 server operator write files into a player's install — that is handing arbitrary third parties a
