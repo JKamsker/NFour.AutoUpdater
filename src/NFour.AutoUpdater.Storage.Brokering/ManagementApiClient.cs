@@ -16,6 +16,10 @@ public sealed class ManagementApiClient : IAsyncDisposable
     private readonly Uri _apiRoot;
     private readonly string? _bearer;
 
+    /// <summary>Initializes a client for an origin-pinned management API.</summary>
+    /// <param name="apiBase">The absolute management API base URI.</param>
+    /// <param name="bearerToken">The optional bearer credential.</param>
+    /// <param name="client">An optional caller-owned HTTP client.</param>
     /// <param name="allowedStorageOrigins">
     /// Origins that a grant's presigned upload URI may point at, in addition to the
     /// management API's own origin.  Configure this in any deployment where the storage
@@ -44,6 +48,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
 
     private readonly IReadOnlySet<string> _allowedStorageOrigins;
 
+    /// <summary>Opens a bounded publish session.</summary>
     public async ValueTask<PublishSession> OpenSessionAsync(string repository, CancellationToken cancellationToken = default)
     {
         using var response = await SendAsync(HttpMethod.Post, $"repositories/{Segment(repository)}/publish/sessions", null, cancellationToken).ConfigureAwait(false);
@@ -53,6 +58,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         return new PublishSession(new GrantId(root.GetProperty("sessionId").GetString()!), new BackendId(root.GetProperty("backendId").GetString()!), root.GetProperty("maxObjects").GetInt32(), root.GetProperty("maxTotalBytes").GetInt64(), root.GetProperty("expiresAt").GetDateTimeOffset());
     }
 
+    /// <summary>Allocates the next monotonic sequence for a named scope.</summary>
     public async ValueTask<long> AllocateSequenceAsync(string repository, string scope, string name, CancellationToken cancellationToken = default)
     {
         using var response = await SendAsync(HttpMethod.Post, $"repositories/{Segment(repository)}/sequences/{Segment(scope)}/{Segment(name)}", null, cancellationToken).ConfigureAwait(false);
@@ -61,6 +67,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         return document.RootElement.GetProperty("sequence").GetInt64();
     }
 
+    /// <summary>Creates a release draft and returns its identifier.</summary>
     public async ValueTask<string> CreateReleaseDraftAsync(string productId, byte[] draftBytes, CancellationToken cancellationToken = default)
     {
         using var content = new ByteArrayContent(draftBytes) { Headers = { ContentType = new MediaTypeHeaderValue("application/json") } };
@@ -70,6 +77,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         return document.RootElement.GetProperty("draftId").GetString()!;
     }
 
+    /// <summary>Registers coverage metadata for a release draft.</summary>
     public async ValueTask RegisterDraftCoverageAsync(string productId, string draftId, byte[] coverageBytes, CancellationToken cancellationToken = default)
     {
         using var content = new ByteArrayContent(coverageBytes) { Headers = { ContentType = new MediaTypeHeaderValue("application/json") } };
@@ -77,6 +85,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Creates upload grants for content digests and declared lengths.</summary>
     public async ValueTask<IReadOnlyList<ApiUploadGrant>> CreateGrantsAsync(string repository, string sessionId, IEnumerable<(ContentHash Digest, long Length)> items, CancellationToken cancellationToken = default)
     {
         var payload = JsonSerializer.SerializeToUtf8Bytes(new { items = items.Select(x => new { sha256 = x.Digest.ToString(), storedLength = x.Length }).ToArray() });
@@ -117,6 +126,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         return result;
     }
 
+    /// <summary>Uploads content through the grant's selected transport.</summary>
     public async ValueTask UploadAsync(ApiUploadGrant grant, Stream content, long length, CancellationToken cancellationToken = default)
     {
         if (DateTimeOffset.UtcNow >= grant.ExpiresAt) throw new InvalidDataException($"Upload grant '{grant.GrantId}' has expired.");
@@ -153,6 +163,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
     /// Uploads each part directly to its presigned storage URL and sends only the resulting
     /// ETags to the management API for completion.  The payload never enters the API path.
     /// </summary>
+    /// <summary>Uploads content through a multipart grant and completes it.</summary>
     public async ValueTask UploadMultipartAsync(ApiUploadGrant grant, Stream content, long length, CancellationToken cancellationToken = default)
     {
         if (!grant.IsMultipart || grant.MultipartPartSize is not { } partSize || grant.MultipartParts.IsDefaultOrEmpty || grant.CompletePath is null)
@@ -203,12 +214,14 @@ public sealed class ManagementApiClient : IAsyncDisposable
         }
     }
 
+    /// <summary>Seals a publish session after server-side grant verification.</summary>
     public async ValueTask SealAsync(string repository, string sessionId, CancellationToken cancellationToken = default)
     {
         using var response = await SendAsync(HttpMethod.Post, $"repositories/{Segment(repository)}/publish/sessions/{Segment(sessionId)}/seal", null, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Aborts an incomplete multipart upload grant.</summary>
     public async ValueTask AbortMultipartAsync(ApiUploadGrant grant, CancellationToken cancellationToken = default)
     {
         if (!grant.IsMultipart || grant.AbortPath is null) throw new ArgumentException("The grant does not expose a multipart abort operation.", nameof(grant));
@@ -232,6 +245,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         return result;
     }
 
+    /// <summary>Queries which content digests already exist.</summary>
     public async ValueTask<IReadOnlySet<string>> QueryBlobsAsync(string repository, IEnumerable<ContentHash> hashes, CancellationToken cancellationToken = default)
     {
         var payload = JsonSerializer.SerializeToUtf8Bytes(new { sha256 = hashes.Select(x => x.ToString()).ToArray() });
@@ -241,6 +255,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         return document.RootElement.GetProperty("present").EnumerateArray().Select(x => x.GetString()!).ToHashSet(StringComparer.Ordinal);
     }
 
+    /// <summary>Registers exact package-manifest bytes.</summary>
     public async ValueTask RegisterPackageVersionAsync(string repository, string packageId, byte[] manifestBytes, CancellationToken cancellationToken = default)
     {
         var content = new ByteArrayContent(manifestBytes) { Headers = { ContentType = new MediaTypeHeaderValue("application/json") } };
@@ -248,6 +263,7 @@ public sealed class ManagementApiClient : IAsyncDisposable
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Registers the file-table descriptor for a package version.</summary>
     public async ValueTask RegisterFileTableAsync(string repository, string packageId, string version, FileTableRef table, CancellationToken cancellationToken = default)
     {
         var payload = JsonSerializer.SerializeToUtf8Bytes(new
@@ -261,24 +277,30 @@ public sealed class ManagementApiClient : IAsyncDisposable
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Publishes a fully registered package version.</summary>
     public async ValueTask PublishPackageVersionAsync(string repository, string packageId, string version, CancellationToken cancellationToken = default)
     {
         using var response = await SendAsync(HttpMethod.Post, $"repositories/{Segment(repository)}/packages/{Segment(packageId)}/versions/{Segment(version)}/publish", null, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Places an exact signed release envelope.</summary>
     public async ValueTask PlaceSignedReleaseAsync(string productId, string releaseId, ReadOnlyMemory<byte> envelopeBytes, CancellationToken cancellationToken = default)
         => await PlaceSignedAsync($"products/{Segment(productId)}/releases/{Segment(releaseId)}/lock", envelopeBytes, cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Places an exact signed channel-pointer envelope.</summary>
     public async ValueTask PlaceSignedChannelAsync(string productId, string channel, ReadOnlyMemory<byte> envelopeBytes, CancellationToken cancellationToken = default)
         => await PlaceSignedAsync($"products/{Segment(productId)}/channels/{Segment(channel)}", envelopeBytes, cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Places an exact signed revocation envelope.</summary>
     public async ValueTask PlaceSignedRevocationAsync(string productId, string releaseId, ReadOnlyMemory<byte> envelopeBytes, CancellationToken cancellationToken = default)
         => await PlaceSignedAsync(HttpMethod.Post, $"products/{Segment(productId)}/releases/{Segment(releaseId)}/yank", envelopeBytes, cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Places an exact signed key-manifest envelope.</summary>
     public async ValueTask PlaceSignedKeyManifestAsync(string repository, ReadOnlyMemory<byte> envelopeBytes, CancellationToken cancellationToken = default)
         => await PlaceSignedAsync(HttpMethod.Put, $"repositories/{Segment(repository)}/keys", envelopeBytes, cancellationToken).ConfigureAwait(false);
 
+    /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
         if (_ownsClient) _client.Dispose();
@@ -393,9 +415,13 @@ public sealed class ManagementApiClient : IAsyncDisposable
     }
 }
 
+/// <summary>Describes a presigned multipart upload part returned by the management API.</summary><param name="Number">The one-based part number.</param><param name="Uri">The upload URI.</param><param name="RequiredHeaders">Headers required by storage.</param>
 public sealed record ApiPresignedPart(int Number, Uri Uri, ImmutableArray<HttpHeaderRequirement> RequiredHeaders);
+/// <summary>Describes an upload grant returned by the management API.</summary>
+/// <param name="GrantId">The grant identifier.</param><param name="StagingKey">The staging object key.</param><param name="ExpectedDigest">The required digest.</param><param name="ExpectedLength">The required byte length.</param><param name="ExpiresAt">The expiration time.</param><param name="UploadUri">The single-request upload URI.</param><param name="Enforcement">The integrity-enforcement identifier.</param><param name="RequiredHeaders">Required upload headers.</param><param name="LocalPath">The optional local staging path.</param><param name="MultipartUploadId">The optional multipart upload identifier.</param><param name="MultipartPartSize">The optional multipart part size.</param><param name="MultipartParts">The presigned parts.</param><param name="CompletePath">The API completion path.</param><param name="AbortPath">The API abort path.</param><param name="PartsPath">The API part-listing path.</param>
 public sealed record ApiUploadGrant(string GrantId, ObjectKey StagingKey, ContentHash ExpectedDigest, long ExpectedLength, DateTimeOffset ExpiresAt, Uri? UploadUri, string Enforcement, ImmutableArray<HttpHeaderRequirement> RequiredHeaders, string? LocalPath, string? MultipartUploadId = null, long? MultipartPartSize = null, ImmutableArray<ApiPresignedPart> MultipartParts = default, string? CompletePath = null, string? AbortPath = null, string? PartsPath = null)
 {
+    /// <summary>Gets whether this grant uses multipart upload.</summary>
     public bool IsMultipart => !string.IsNullOrWhiteSpace(MultipartUploadId) || !MultipartParts.IsDefaultOrEmpty;
 }
 internal sealed record MultipartPartState(string ETag, long Length);

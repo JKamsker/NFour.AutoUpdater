@@ -1,35 +1,67 @@
 namespace NFour.AutoUpdater.Storage.Brokering;
 
+/// <summary>Identifies one upload grant.</summary><param name="Value">The grant identifier.</param>
 public readonly record struct GrantId(string Value);
+/// <summary>Identifies a configured storage backend.</summary><param name="Value">The backend identifier.</param>
 public readonly record struct BackendId(string Value);
+/// <summary>Identifies one multipart upload.</summary><param name="Value">The storage upload identifier.</param>
 public readonly record struct MultipartUploadId(string Value);
+/// <summary>Defines an HTTP header required by a direct upload grant.</summary><param name="Name">The header name.</param><param name="Value">The required value.</param>
 public sealed record HttpHeaderRequirement(string Name, string Value);
+/// <summary>Describes one presigned multipart upload part.</summary><param name="Number">The one-based part number.</param><param name="Uri">The upload URI.</param><param name="Checksum">The optional required checksum.</param>
 public sealed record PresignedPart(int Number, Uri Uri, ContentHash? Checksum);
-public enum IntegrityEnforcement { StorageEnforced, ServerVerified, Reduced }
+/// <summary>Describes where an upload grant's digest is enforced.</summary>
+public enum IntegrityEnforcement
+{
+    /// <summary>Storage rejects bytes that do not match the expected digest.</summary>
+    StorageEnforced,
+    /// <summary>The management service verifies staged bytes before promotion.</summary>
+    ServerVerified,
+    /// <summary>The backend provides a reduced integrity guarantee.</summary>
+    Reduced
+}
 
+/// <summary>Defines immutable identity, length, expiration, and enforcement constraints for an upload.</summary>
 public abstract record UploadGrant
 {
+    /// <summary>Gets the grant identifier.</summary>
     public required GrantId GrantId { get; init; }
+    /// <summary>Gets the selected storage backend.</summary>
     public required BackendId Backend { get; init; }
+    /// <summary>Gets the grant-specific staging object key.</summary>
     public required ObjectKey StagingKey { get; init; }
+    /// <summary>Gets the required content digest.</summary>
     public required ContentHash ExpectedDigest { get; init; }
+    /// <summary>Gets the required content length.</summary>
     public required long ExpectedLength { get; init; }
+    /// <summary>Gets the grant expiration time.</summary>
     public required DateTimeOffset ExpiresAt { get; init; }
+    /// <summary>Gets where digest integrity is enforced.</summary>
     public required IntegrityEnforcement Enforcement { get; init; }
+    /// <summary>Uploads content with one HTTP PUT request.</summary><param name="Uri">The upload URI.</param><param name="RequiredHeaders">Headers required by storage.</param>
     public sealed record HttpPut(Uri Uri, ImmutableArray<HttpHeaderRequirement> RequiredHeaders) : UploadGrant;
+    /// <summary>Uploads content through presigned multipart requests.</summary><param name="UploadId">The multipart upload identifier.</param><param name="PartSize">The required non-final part size.</param><param name="Parts">The presigned parts.</param><param name="AbortUri">The optional abort endpoint.</param>
     public sealed record HttpMultipart(MultipartUploadId UploadId, long PartSize, ImmutableArray<PresignedPart> Parts, Uri? AbortUri) : UploadGrant;
+    /// <summary>Uploads content with an HTTP multipart form.</summary><param name="Uri">The form endpoint.</param><param name="Fields">Required form fields.</param>
     public sealed record HttpPostForm(Uri Uri, ImmutableArray<KeyValuePair<string, string>> Fields) : UploadGrant;
+    /// <summary>Uploads through publisher-held backend credentials.</summary><param name="Key">The staging object key.</param>
     public sealed record PublisherCredentialed(ObjectKey Key) : UploadGrant;
+    /// <summary>Writes content to a local staging path.</summary><param name="AbsolutePath">The absolute destination path.</param>
     public sealed record LocalPath(string AbsolutePath) : UploadGrant;
 }
 
+/// <summary>Describes the limits and lifetime of a publish session.</summary><param name="SessionId">The session identifier.</param><param name="Backend">The selected backend.</param><param name="MaxObjects">The maximum object count.</param><param name="MaxTotalBytes">The maximum aggregate byte count.</param><param name="ExpiresAt">The expiration time.</param>
 public sealed record PublishSession(GrantId SessionId, BackendId Backend, int MaxObjects, long MaxTotalBytes, DateTimeOffset ExpiresAt);
+/// <summary>Verifies staged content against a grant's digest and length.</summary>
 public interface IStagedObjectVerifier
 {
+    /// <summary>Verifies one staged object.</summary>
     ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expectedDigest, long expectedLength, CancellationToken cancellationToken = default);
 }
+/// <summary>Verifies staged objects by streaming them from readable storage.</summary><param name="store">The staging object store.</param>
 public sealed class StagedObjectVerifier(IReadableObjectStore store) : IStagedObjectVerifier
 {
+    /// <inheritdoc />
     public async ValueTask<bool> VerifyAsync(ObjectKey key, ContentHash expectedDigest, long expectedLength, CancellationToken cancellationToken = default)
     {
         var head = await store.HeadAsync(key, cancellationToken).ConfigureAwait(false);
@@ -46,8 +78,10 @@ public sealed class StagedObjectVerifier(IReadableObjectStore store) : IStagedOb
     }
 }
 
+/// <summary>Promotes verified staged content into immutable served storage.</summary><param name="source">The staging store.</param><param name="destination">The served store.</param><param name="verifier">The staged-object verifier.</param>
 public sealed class PromotionService(IReadableObjectStore source, IWritableObjectStore destination, IStagedObjectVerifier verifier)
 {
+    /// <summary>Verifies and atomically promotes one staged object.</summary>
     public async ValueTask PromoteAsync(ObjectKey staged, ObjectKey destinationKey, ContentHash digest, long length, CancellationToken cancellationToken = default)
     {
         if (!await verifier.VerifyAsync(staged, digest, length, cancellationToken).ConfigureAwait(false)) throw new InvalidDataException($"Staged object '{staged}' failed server-side verification.");
