@@ -106,9 +106,11 @@ public sealed class LocalObjectStore : IDelimitedObjectStore, IRangeReadableObje
         var temporary = await WriteTemporaryAsync(destination, content, cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var verification = File.OpenRead(temporary);
-            if (await ContentHash.ComputeAsync(verification, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false) != expectedDigest)
-                throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
+            await using (var verification = File.OpenRead(temporary))
+            {
+                if (await ContentHash.ComputeAsync(verification, HashAlgorithmId.Sha256, cancellationToken).ConfigureAwait(false) != expectedDigest)
+                    throw new CryptographicException($"Content does not match CAS digest '{expectedDigest}'.");
+            }
             File.Move(temporary, destination, overwrite: false);
             FlushContainingDirectory(destination);
             return true;
