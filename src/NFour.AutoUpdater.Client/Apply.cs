@@ -91,21 +91,23 @@ public sealed class InstallApplier
         {
             if (old is not null && string.Equals(old.Lock.ReleaseDigest.ToString(), marker.ReleaseDigest, StringComparison.Ordinal) && string.Equals(old.Lock.FileSetId.ToString(), marker.FileSetId, StringComparison.Ordinal) && string.Equals(old.Lock.ProductId, marker.ProductId, StringComparison.Ordinal) && string.Equals(old.Lock.ReleaseId, marker.ReleaseId, StringComparison.Ordinal))
             {
-                foreach (var entry in Directory.EnumerateFileSystemEntries(staging))
-                {
-                    if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
-                    else File.Delete(entry);
-                }
-                File.Delete(planPath);
+                ClearRecoveryState(staging, planPath);
+                await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
             }
             else
             {
                 var persisted = ReadRecoveryMarker(planPath);
-                ValidateRecoveryMarker(persisted, marker);
-                plan = persisted.ToInstallPlan();
+                if (RecoveryTargetMatches(persisted, marker))
+                    plan = persisted.ToInstallPlan();
+                else
+                {
+                    ClearRecoveryState(staging, planPath);
+                    await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
         else await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
+        preconditions.Validate(installRoot, plan);
 
         // An apply that was interrupted between moving a file aside and completing its
         // replacement leaves a backup behind. Recovery is the point at which those become
@@ -123,7 +125,17 @@ public sealed class InstallApplier
             token.ThrowIfCancellationRequested();
             var key = layout.Blob(blob.Content); var path = Path.Combine(staging, Convert.ToHexString(blob.Content.Span).ToLowerInvariant());
             long fetchedLength;
-            if (cache is not null && await cache.TryGetAsync(blob.Content, token).ConfigureAwait(false))
+            long recoveredLength = -1;
+            if (File.Exists(path))
+            {
+                try { recoveredLength = await VerifyStagedBlobAsync(path, blob.Content, token).ConfigureAwait(false); }
+                catch (InvalidDataException) { File.Delete(path); }
+            }
+            if (recoveredLength >= 0)
+            {
+                fetchedLength = recoveredLength;
+            }
+            else if (cache is not null && await cache.TryGetAsync(blob.Content, token).ConfigureAwait(false))
             {
                 File.Copy(cache.GetPath(blob.Content), path, overwrite: true);
                 fetchedLength = await VerifyStagedBlobAsync(path, blob.Content, token).ConfigureAwait(false);
@@ -324,10 +336,22 @@ public sealed class InstallApplier
         catch (Exception ex) { throw new ApplyPreconditionException($"The unfinished apply plan is corrupt: {ex.Message}"); }
     }
 
-    private static void ValidateRecoveryMarker(RecoveryPlanMarker actual, RecoveryPlanMarker expected)
+    private static bool RecoveryTargetMatches(RecoveryPlanMarker actual, RecoveryPlanMarker expected) =>
+        actual.SchemaVersion == expected.SchemaVersion &&
+            string.Equals(actual.FileSetId, expected.FileSetId, StringComparison.Ordinal) &&
+            string.Equals(actual.ReleaseDigest, expected.ReleaseDigest, StringComparison.Ordinal) &&
+            string.Equals(actual.ProductId, expected.ProductId, StringComparison.Ordinal) &&
+            string.Equals(actual.ReleaseId, expected.ReleaseId, StringComparison.Ordinal) &&
+            string.Equals(actual.RootIdentity, expected.RootIdentity, StringComparison.Ordinal);
+
+    private static void ClearRecoveryState(string staging, string planPath)
     {
-        if (actual.SchemaVersion != expected.SchemaVersion || !string.Equals(actual.FileSetId, expected.FileSetId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseDigest, expected.ReleaseDigest, StringComparison.Ordinal) || !string.Equals(actual.ProductId, expected.ProductId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseId, expected.ReleaseId, StringComparison.Ordinal) || !actual.Blobs.SequenceEqual(expected.Blobs) || actual.BytesToDownload != expected.BytesToDownload || actual.BytesToWrite != expected.BytesToWrite || actual.NetInstallDelta != expected.NetInstallDelta || !actual.Operations.SequenceEqual(expected.Operations) || !actual.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal).SequenceEqual(expected.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal) ) || !string.Equals(actual.RootIdentity, expected.RootIdentity, StringComparison.Ordinal))
-            throw new ApplyPreconditionException("An unfinished apply belongs to a different release, file set, or operation plan; recover it before starting another operation.");
+        foreach (var entry in Directory.EnumerateFileSystemEntries(staging))
+        {
+            if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
+            else File.Delete(entry);
+        }
+        File.Delete(planPath);
     }
 
     private sealed record RecoveryBlob(string Content, long Size);

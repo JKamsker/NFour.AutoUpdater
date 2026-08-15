@@ -4,8 +4,8 @@ namespace NFour.AutoUpdater.Repository;
 /// <param name="Pointer">The verified channel pointer.</param><param name="Envelope">The parsed signed envelope.</param><param name="EnvelopeBytes">The exact envelope bytes.</param>
 public sealed record VerifiedChannel(ChannelPointer Pointer, SignedEnvelope Envelope, byte[] EnvelopeBytes);
 /// <summary>Contains a verified release and the signed documents that selected it.</summary>
-/// <param name="Lock">The verified release lock.</param><param name="Envelope">The parsed release envelope.</param><param name="EnvelopeBytes">The exact release-envelope bytes.</param><param name="Bundle">The optional verified release bundle.</param><param name="Pointer">The optional channel pointer that selected the release.</param><param name="PointerEnvelope">The optional channel-pointer envelope.</param>
-public sealed record VerifiedRelease(ReleaseLock Lock, SignedEnvelope Envelope, byte[] EnvelopeBytes, ReleaseBundle? Bundle, ChannelPointer? Pointer = null, SignedEnvelope? PointerEnvelope = null);
+/// <param name="Lock">The verified release lock.</param><param name="Envelope">The parsed release envelope.</param><param name="EnvelopeBytes">The exact release-envelope bytes.</param><param name="Bundle">The optional verified release bundle.</param><param name="Pointer">The optional channel pointer that selected the release.</param><param name="PointerEnvelope">The optional channel-pointer envelope.</param><param name="PointerEnvelopeBytes">The exact channel-pointer envelope bytes.</param>
+public sealed record VerifiedRelease(ReleaseLock Lock, SignedEnvelope Envelope, byte[] EnvelopeBytes, ReleaseBundle? Bundle, ChannelPointer? Pointer = null, SignedEnvelope? PointerEnvelope = null, byte[]? PointerEnvelopeBytes = null);
 /// <summary>Contains a verified key manifest and its exact signed envelope.</summary>
 /// <param name="Manifest">The verified key manifest.</param><param name="Envelope">The parsed signed envelope.</param><param name="EnvelopeBytes">The exact envelope bytes.</param>
 public sealed record VerifiedKeyManifest(KeyManifest Manifest, SignedEnvelope Envelope, byte[] EnvelopeBytes);
@@ -177,7 +177,12 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
         var verifiedChannel = await ReadChannelAsync(productId, channel, trustedKeys, cancellationToken).ConfigureAwait(false);
         var release = await ReadReleaseAsync(productId, verifiedChannel.Pointer.ReleaseId, trustedKeys, verifiedChannel.Pointer.ReleaseDigest, cancellationToken).ConfigureAwait(false);
         if (release.Lock.Sequence != verifiedChannel.Pointer.ReleaseSequence) throw new InvalidDataException("Channel pointer releaseSequence does not match the release lock.");
-        return release with { Pointer = verifiedChannel.Pointer, PointerEnvelope = verifiedChannel.Envelope };
+        return release with
+        {
+            Pointer = verifiedChannel.Pointer,
+            PointerEnvelope = verifiedChannel.Envelope,
+            PointerEnvelopeBytes = verifiedChannel.EnvelopeBytes
+        };
     }
 
     private async ValueTask<byte[]> ReadRequiredAsync(ObjectKey key, CancellationToken cancellationToken)

@@ -27,6 +27,8 @@ public sealed record InstallLock
     public required ContentHash FileSetId { get; init; }
     /// <summary>Gets the last accepted channel sequence.</summary>
     public long LastChannelSequence { get; init; }
+    /// <summary>Gets the digest of the last accepted channel-pointer envelope.</summary>
+    public ContentHash? ChannelDigest { get; init; }
     /// <summary>Gets the last accepted key-manifest sequence.</summary>
     public long KeySequence { get; init; }
     /// <summary>Gets the last accepted key-manifest envelope digest.</summary>
@@ -115,7 +117,7 @@ public sealed class InstallLedger
                 if (key.Length != 32) throw new FormatException($"Ledger trust key '{pair.Key}' is not a 32-byte Ed25519 public key.");
                 trustedKeys[pair.Key] = Base64Url.Encode(key);
             }
-        return new LedgerDocument(new InstallLock { RepositoryUri = lockRecord.RepositoryUri, ProductId = lockRecord.ProductId, Channel = lockRecord.Channel, ReleaseId = lockRecord.ReleaseId, ReleaseSequence = lockRecord.ReleaseSequence, ReleaseDigest = ContentHash.Parse(lockRecord.ReleaseDigest), Selection = selection, SelectionId = ContentHash.Parse(lockRecord.SelectionId), FileSetId = ContentHash.Parse(lockRecord.FileSetId), LastChannelSequence = lockRecord.LastChannelSequence, KeySequence = lockRecord.KeySequence, KeyManifestDigest = lockRecord.KeyManifestDigest is null ? null : ContentHash.Parse(lockRecord.KeyManifestDigest), RevocationSequence = lockRecord.RevocationSequence, RevocationDigest = lockRecord.RevocationDigest is null ? null : ContentHash.Parse(lockRecord.RevocationDigest), KnownRevocations = lockRecord.KnownRevocations?.ToImmutableArray() ?? [], TrustedKeyIds = lockRecord.TrustedKeyIds?.ToImmutableArray() ?? [], TrustedKeys = trustedKeys.ToImmutable(), AppliedAt = lockRecord.AppliedAt, UnknownFields = lockRecord.ExtensionData?.ToImmutableDictionary(StringComparer.Ordinal) ?? ImmutableDictionary<string, JsonElement>.Empty }, files.ToImmutable());
+        return new LedgerDocument(new InstallLock { RepositoryUri = lockRecord.RepositoryUri, ProductId = lockRecord.ProductId, Channel = lockRecord.Channel, ReleaseId = lockRecord.ReleaseId, ReleaseSequence = lockRecord.ReleaseSequence, ReleaseDigest = ContentHash.Parse(lockRecord.ReleaseDigest), Selection = selection, SelectionId = ContentHash.Parse(lockRecord.SelectionId), FileSetId = ContentHash.Parse(lockRecord.FileSetId), LastChannelSequence = lockRecord.LastChannelSequence, ChannelDigest = lockRecord.ChannelDigest is null ? null : ContentHash.Parse(lockRecord.ChannelDigest), KeySequence = lockRecord.KeySequence, KeyManifestDigest = lockRecord.KeyManifestDigest is null ? null : ContentHash.Parse(lockRecord.KeyManifestDigest), RevocationSequence = lockRecord.RevocationSequence, RevocationDigest = lockRecord.RevocationDigest is null ? null : ContentHash.Parse(lockRecord.RevocationDigest), KnownRevocations = lockRecord.KnownRevocations?.ToImmutableArray() ?? [], TrustedKeyIds = lockRecord.TrustedKeyIds?.ToImmutableArray() ?? [], TrustedKeys = trustedKeys.ToImmutable(), AppliedAt = lockRecord.AppliedAt, UnknownFields = lockRecord.ExtensionData?.ToImmutableDictionary(StringComparer.Ordinal) ?? ImmutableDictionary<string, JsonElement>.Empty }, files.ToImmutable());
     }
 
     /// <summary>Atomically commits install state and archives the previous ledger.</summary>
@@ -140,7 +142,7 @@ public sealed class InstallLedger
             await using (var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true))
             {
                 var axes = installLock.Selection.Axes.ToDictionary(x => x.Key, x => x.Value.ToArray(), StringComparer.Ordinal);
-                var lockRecord = new InstallLockRecord("lock", 1, installLock.RepositoryUri, installLock.ProductId, installLock.Channel, installLock.ReleaseId, installLock.ReleaseSequence, installLock.ReleaseDigest.ToString(), axes, installLock.SelectionId.ToString(), installLock.FileSetId.ToString(), installLock.LastChannelSequence, installLock.KeySequence, installLock.KeyManifestDigest?.ToString(), installLock.RevocationSequence, installLock.RevocationDigest?.ToString(), installLock.KnownRevocations.ToArray(), installLock.TrustedKeyIds.ToArray(), installLock.TrustedKeys.ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal), installLock.AppliedAt.ToUniversalTime())
+                var lockRecord = new InstallLockRecord("lock", 1, installLock.RepositoryUri, installLock.ProductId, installLock.Channel, installLock.ReleaseId, installLock.ReleaseSequence, installLock.ReleaseDigest.ToString(), axes, installLock.SelectionId.ToString(), installLock.FileSetId.ToString(), installLock.LastChannelSequence, installLock.ChannelDigest?.ToString(), installLock.KeySequence, installLock.KeyManifestDigest?.ToString(), installLock.RevocationSequence, installLock.RevocationDigest?.ToString(), installLock.KnownRevocations.ToArray(), installLock.TrustedKeyIds.ToArray(), installLock.TrustedKeys.ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal), installLock.AppliedAt.ToUniversalTime())
                 {
                     ExtensionData = installLock.UnknownFields.IsEmpty ? null : installLock.UnknownFields.ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal)
                 };
@@ -192,6 +194,7 @@ public sealed class InstallLedger
         [property: JsonPropertyName("selectionId")] string SelectionId,
         [property: JsonPropertyName("fileSetId")] string FileSetId,
         [property: JsonPropertyName("lastChannelSequence")] long LastChannelSequence,
+        [property: JsonPropertyName("channelDigest")] string? ChannelDigest,
         [property: JsonPropertyName("keySequence")] long KeySequence,
         [property: JsonPropertyName("keyManifestDigest")] string? KeyManifestDigest,
         [property: JsonPropertyName("revocationSequence")] long RevocationSequence,
