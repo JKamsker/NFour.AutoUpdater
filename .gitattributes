@@ -5,12 +5,12 @@
 # byte-for-byte against generated output, so any end-of-line translation on checkout changes
 # their identity. On a machine with core.autocrlf=true and no rule here, every golden blob
 # gains a byte per line and fails the digest that names it — which is how this surfaced.
-tests/vectors/** -text
-schemas/fixtures/** -text
-*.schema.json -text
+tests/vectors/** -text !eol
+schemas/fixtures/** -text !eol
+*.schema.json -text !eol
 
 # Fixture and golden JSON documents are digested as-is.
-tests/fixtures/** -text
+tests/fixtures/** -text !eol
 
 # Shell scripts must keep LF regardless of platform.
 *.sh text eol=lf
