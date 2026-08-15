@@ -106,6 +106,12 @@ public sealed class UpdateClient
 
         ResolutionResult resolution = new VariantResolver().Resolve(verified.Lock, request.Selection);
         ThrowForDiagnostics(resolution.Diagnostics, "release selection");
+        VariantSelection appliedSelection = request.PackageScope == UpdatePackageScope.Base
+            ? new VariantSelection
+            {
+                Axes = ImmutableSortedDictionary<string, ImmutableSortedSet<string>>.Empty
+            }
+            : resolution.Selection;
         var repository = new StaticRepository(store, descriptor);
         ComposedFileSet composed = await new FileSetComposer().ComposeAsync(
             repository,
@@ -135,8 +141,8 @@ public sealed class UpdateClient
             ReleaseId = verified.Lock.ReleaseId,
             ReleaseSequence = verified.Lock.Sequence,
             ReleaseDigest = ContentHash.Compute(verified.EnvelopeBytes),
-            Selection = resolution.Selection,
-            SelectionId = resolution.Selection.SelectionId,
+            Selection = appliedSelection,
+            SelectionId = appliedSelection.SelectionId,
             FileSetId = composed.FileSetId,
             LastChannelSequence = verified.Pointer?.ChannelSequence ?? previous?.Lock.LastChannelSequence ?? 0,
             ChannelDigest = verified.PointerEnvelopeBytes is null
@@ -187,7 +193,7 @@ public sealed class UpdateClient
             composed.FileSetId,
             changed,
             plan,
-            resolution.Selection);
+            appliedSelection);
     }
 
     private static void ValidateRequest(UpdateClientRequest request)
