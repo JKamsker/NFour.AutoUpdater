@@ -30,13 +30,23 @@ public sealed class ClientTests
             var observed = await new LocalTreeScanner().ScanAsync(root, [], [path], HashPolicy.Never);
             var plan = new InstallPlanner().Plan(target, null, observed);
             var installLock = new InstallLock { RepositoryUri = "memory://test", ProductId = "product", Channel = "live", ReleaseId = "r1", ReleaseDigest = ContentHash.Compute("release"u8), Selection = new VariantSelection { Axes = ImmutableSortedDictionary<string, ImmutableSortedSet<string>>.Empty }, SelectionId = ContentHash.Compute([]), FileSetId = target.FileSetId, AppliedAt = DateTimeOffset.UtcNow };
-            await new InstallApplier().ApplyAsync(root, plan, target, installLock, store, layout, new InstallLedger(root), preconditions: new ApplyPreconditions());
+            var cache = new LocalContentCache(Path.Combine(root, "cache"));
+            await cache.StoreAsync(hash, new MemoryStream(content));
+            await new InstallApplier().ApplyAsync(root, plan, target, installLock, store, layout, new InstallLedger(root), preconditions: new ApplyPreconditions(), cache: cache);
             Assert.Equal("verified-content", await File.ReadAllTextAsync(Path.Combine(root, "bin", "game.exe")));
             var ledgerText = await File.ReadAllTextAsync(Path.Combine(root, ".4sup", "state.jsonl"));
             Assert.Contains("\"k\":\"lock\"", ledgerText, StringComparison.Ordinal);
             Assert.NotNull(await new InstallLedger(root).ReadAsync());
         }
-        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                    File.SetAttributes(file, FileAttributes.Normal);
+                Directory.Delete(root, true);
+            }
+        }
     }
 
     [Fact]

@@ -129,7 +129,7 @@ public sealed class InstallApplier
             if (File.Exists(path))
             {
                 try { recoveredLength = await VerifyStagedBlobAsync(path, blob.Content, token).ConfigureAwait(false); }
-                catch (InvalidDataException) { File.Delete(path); }
+                catch (InvalidDataException) { DeleteWritableFile(path); }
             }
             if (recoveredLength >= 0)
             {
@@ -138,6 +138,7 @@ public sealed class InstallApplier
             else if (cache is not null && await cache.TryGetAsync(blob.Content, token).ConfigureAwait(false))
             {
                 File.Copy(cache.GetPath(blob.Content), path, overwrite: true);
+                File.SetAttributes(path, FileAttributes.Normal);
                 fetchedLength = await VerifyStagedBlobAsync(path, blob.Content, token).ConfigureAwait(false);
             }
             else
@@ -270,7 +271,7 @@ public sealed class InstallApplier
         foreach (var file in target.Files.Where(x => x.Value.Kind == FileEntryKind.File))
             if (!nextFiles.ContainsKey(file.Key) && !plan.Operations.Any(x => x.Path == file.Key && x is FileOperation.Orphan)) nextFiles[file.Key] = new InstalledFile(file.Key, file.Value.Content, file.Value.Size, file.Value.Owner, file.Value.Policy, file.Value.Size, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         await ledger.CommitAsync(installLock, nextFiles, cancellationToken).ConfigureAwait(false);
-        foreach (var file in Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories)) File.Delete(file);
+        foreach (var file in Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories)) DeleteWritableFile(file);
         File.Delete(planPath);
     }
 
@@ -310,6 +311,12 @@ public sealed class InstallApplier
         var actual = await ContentHash.ComputeAsync(stream, expected.Algorithm, cancellationToken).ConfigureAwait(false);
         if (actual != expected) throw new InvalidDataException($"Staged blob '{expected}' failed its local content verification.");
         return stream.Length;
+    }
+
+    private static void DeleteWritableFile(string path)
+    {
+        File.SetAttributes(path, FileAttributes.Normal);
+        File.Delete(path);
     }
 
     private static async ValueTask WriteRecoveryMarkerAsync(string path, RecoveryPlanMarker marker, CancellationToken cancellationToken)
