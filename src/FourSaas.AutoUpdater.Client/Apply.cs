@@ -594,8 +594,10 @@ public sealed class LocalContentCache
     public async ValueTask<bool> TryGetAsync(ContentHash hash, CancellationToken cancellationToken = default)
     {
         var path = GetPath(hash); if (!File.Exists(path)) return false;
-        await using var stream = File.OpenRead(path);
-        if (await ContentHash.ComputeAsync(stream, hash.Algorithm, cancellationToken).ConfigureAwait(false) != hash)
+        bool isValid;
+        await using (var stream = File.OpenRead(path))
+            isValid = await ContentHash.ComputeAsync(stream, hash.Algorithm, cancellationToken).ConfigureAwait(false) == hash;
+        if (!isValid)
         {
             try { File.SetAttributes(path, FileAttributes.Normal); File.Delete(path); } catch (IOException) { }
             catch (UnauthorizedAccessException) { }

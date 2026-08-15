@@ -22,7 +22,7 @@ internal static class WindowsSecureInstallOperations
     private const uint FileDirectoryFile = 0x00000001;
     private const uint FileNonDirectoryFile = 0x00000040;
     private const uint FileSynchronousIoNonalert = 0x00000020;
-    private const uint FileOpenReparsePoint = 0x00000200;
+    private const uint FileOpenReparsePoint = 0x00200000;
     private const uint FileOpenForBackupIntent = 0x00004000;
     private const uint Win32OpenReparsePoint = 0x00200000;
     private const uint Win32BackupSemantics = 0x02000000;
@@ -67,7 +67,8 @@ internal static class WindowsSecureInstallOperations
         var renamed = false;
         try
         {
-            using (var output = new FileStream(temporary, FileAccess.Write, 128 * 1024, isAsync: false))
+            using var outputHandle = DuplicateHandle(temporary);
+            using (var output = new FileStream(outputHandle, FileAccess.Write, 128 * 1024, isAsync: false))
             using (var input = File.OpenRead(stagedPath))
             {
                 input.CopyTo(output);
@@ -274,7 +275,7 @@ internal static class WindowsSecureInstallOperations
             Marshal.WriteIntPtr(buffer, rootOffset, parent.DangerousGetHandle());
             Marshal.WriteInt32(buffer, lengthOffset, bytes.Length);
             Marshal.Copy(bytes, 0, IntPtr.Add(buffer, headerSize), bytes.Length);
-            var status = NtSetInformationFileRaw(source, out _, FileRenameInformation, buffer, (uint)(headerSize + bytes.Length));
+            var status = NtSetInformationFileRaw(source, out _, buffer, (uint)(headerSize + bytes.Length), FileRenameInformation);
             if (status != StatusSuccess) ThrowNt("rename verified temporary file", status);
         }
         finally { Marshal.FreeHGlobal(buffer); }
@@ -309,5 +310,5 @@ internal static class WindowsSecureInstallOperations
     [DllImport("ntdll.dll")] private static extern int NtCreateFile(out SafeFileHandle fileHandle, uint desiredAccess, ref ObjectAttributes objectAttributes, out IoStatusBlock ioStatusBlock, IntPtr allocationSize, uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions, IntPtr eaBuffer, uint eaLength);
     [DllImport("ntdll.dll")] private static extern int NtQueryInformationFile(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, out FileAttributeTagInformation fileInformation, uint length, int fileInformationClass);
     [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] private static extern int NtSetInformationFile(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, ref FileDispositionInformationValue fileInformation, uint length, int fileInformationClass);
-    [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] private static extern int NtSetInformationFileRaw(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, int fileInformationClass, IntPtr fileInformation, uint length);
+    [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] private static extern int NtSetInformationFileRaw(SafeFileHandle fileHandle, out IoStatusBlock ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass);
 }
