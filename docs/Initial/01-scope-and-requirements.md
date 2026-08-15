@@ -4,7 +4,7 @@
 
 4Story ships a large native game client (order of 10^5 files, tens of GB) that must be kept
 current on player machines over unreliable consumer connections. The same distribution
-machinery is also wanted for 4SaaS server artifacts and as a general-purpose deployment
+machinery is also wanted for NFour server artifacts and as a general-purpose deployment
 tool. Three properties make this harder than a conventional updater:
 
 1. **The content is served from storage we do not control the semantics of.** A patch mirror
@@ -158,7 +158,7 @@ see [14-open-questions.md](14-open-questions.md) Q7 and Q8.
 
 ## 7. Technology decisions
 
-Settled, matching the 4SaaS sibling repo (`D:\File\repos\4Story\4SaaS\4SaaS`):
+Settled, matching the sibling repository's NFour naming convention:
 
 | Decision | Value | Rationale |
 |---|---|---|
@@ -171,7 +171,7 @@ Settled, matching the 4SaaS sibling repo (`D:\File\repos\4Story\4SaaS\4SaaS`):
 | Server persistence | EF Core + Npgsql (PostgreSQL) | Sibling repo has already cut over to Postgres |
 | Architecture enforcement | `NetArchTest.Rules` | Already pinned; used to enforce the layering in [03](03-architecture.md) |
 
-**Naming is provisional.** Documents use `FourSaas.AutoUpdater.*` and a `4sup` CLI. The
+**Naming is provisional.** Documents use `NFour.AutoUpdater.*` and a `4sup` CLI. The
 sibling repo prefixes with `NFour` (`NFourServer`, `FourSer.Gen`). Aligning is a trivial
 rename but should be decided before the first commit — [14](14-open-questions.md) Q10.
 

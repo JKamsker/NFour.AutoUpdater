@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>NFour.AutoUpdater.Core</RootNamespace>
+    <AssemblyName>NFour.AutoUpdater.Core</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" />
+    <PackageReference Include="BouncyCastle.Cryptography" />
+  </ItemGroup>
+  <Import Project="TrustRoot.targets" />
+</Project>

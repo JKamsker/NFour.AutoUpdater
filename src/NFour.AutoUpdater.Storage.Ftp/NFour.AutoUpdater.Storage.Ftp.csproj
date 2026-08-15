@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>NFour.AutoUpdater.Storage.Ftp</RootNamespace><AssemblyName>NFour.AutoUpdater.Storage.Ftp</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../NFour.AutoUpdater.Storage/NFour.AutoUpdater.Storage.csproj" /><PackageReference Include="FluentFTP" /></ItemGroup>
+  <ItemGroup><InternalsVisibleTo Include="NFour.AutoUpdater.Storage.Tests" /></ItemGroup>
+</Project>

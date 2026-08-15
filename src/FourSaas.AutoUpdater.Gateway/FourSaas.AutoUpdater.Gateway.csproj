@@ -1,3 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
-  <PropertyGroup><RootNamespace>FourSaas.AutoUpdater.Gateway</RootNamespace><AssemblyName>FourSaas.AutoUpdater.Gateway</AssemblyName><OutputType>Exe</OutputType></PropertyGroup>
-</Project>

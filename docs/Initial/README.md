@@ -1,8 +1,10 @@
 # AutoUpdater — Initial Plan
 
-Design documents for the 4SaaS AutoUpdater: a content-addressed, multi-backend patch
-distribution and installation system for the 4Story client, 4SaaS server artifacts, and
+Design documents for the NFour AutoUpdater: a content-addressed, multi-backend patch
+distribution and installation system for the 4Story client, NFour server artifacts, and
 general-purpose deployment.
+
+For current build and command usage, start with the maintained [documentation index](../README.md).
 
 **Status:** implementation baseline. The repository is being reconciled against this normative
 document set; deferred features remain explicitly listed in [14-open-questions.md](14-open-questions.md).
@@ -81,7 +83,7 @@ never on the read path and never authors or signs a release lock or a channel po
 
 ## Provenance
 
-The reference implementation studied is `D:\File\repos\work\Apro\_Apro\Apro\Apro.AutoUpdater_1`
+The legacy reference implementation was used for comparison
 (read-only; nothing in it was modified). It was analysed across seven areas — repository
 abstraction, local flat repository, remote backends, client install engine, server domain
 model, CLI surfaces, and tests/CI. Three competing variant models were designed

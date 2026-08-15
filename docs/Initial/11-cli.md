@@ -14,7 +14,6 @@ Examples, all valid:
 remote/fourstory.client@live
 local/fourstory.client@release:2026.02.15-a
 https://patch.4story.com/live/fourstory.client@live
-C:\mirror\fourstory.client@live
 s3://4story-patches/live/fourstory.client@ptr
 ftp://mirror.example.net/4story/fourstory.client@live
 ```
@@ -51,7 +50,7 @@ Writes go into the layer that already defines the key, else the outermost layer 
 
 ```bash
 # Slice a build tree into packages
-4sup pkg slice --rules packaging/slice.yaml --from D:\build\4story --seq 10407
+4sup pkg slice --rules packaging/slice.yaml --from <build-root> --seq 10407
 
 # Publish changed packages (idempotent; skips blobs that already exist)
 4sup pkg publish fourstory.client.lang.de@1.4.7 --to remote
@@ -125,27 +124,27 @@ flags, never comma-separated — a comma cannot separate both axes and values wi
 (review **H12**).
 
 ```bash
-4sup install "remote/fourstory.client@live" "C:\Games\4Story" \
+4sup install "remote/fourstory.client@live" "<install-root>" \
              --select arch=x64 --select ui=classic \
              --select language=de --select language=en
 
-4sup update  "C:\Games\4Story"
-4sup switch  "C:\Games\4Story" --select ui=modern
-4sup rollback "C:\Games\4Story" --to 2026.02.14-a  # local rollback; target is explicit
+4sup update  "<install-root>"
+4sup switch  "<install-root>" --select ui=modern
+4sup rollback "<install-root>" --to 2026.02.14-a  # local rollback; target is explicit
 
 # Dry run: writes, deletes, bytes, peak space per volume. Touches nothing.
-4sup plan    "C:\Games\4Story" --select ui=modern --json
+4sup plan    "<install-root>" --select ui=modern --json
 
 # Support tools
-4sup status  "C:\Games\4Story" --json
-4sup explain "C:\Games\4Story" --path data/ui/main.dat
-4sup verify  "C:\Games\4Story" --repair --rebuild-state
+4sup status  "<install-root>" --json
+4sup explain "<install-root>" --path data/ui/main.dat
+4sup verify  "<install-root>" --repair --rebuild-state
 ```
 
 ### 6.1 `explain` is a first-class verb
 
 ```
-$ 4sup explain "C:\Games\4Story" --path data/ui/main.dat
+$ 4sup explain "<install-root>" --path data/ui/main.dat
 
 data/ui/main.dat
   owner   fourstory.client.ui.classic@1.4.0   layer 20000  disc 0   ◀ WINNER

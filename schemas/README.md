@@ -6,6 +6,6 @@ reader performs duplicate-key, integer, NFC, and null checks before deserialisat
 schemas are intentionally checked in so a non-.NET implementation can validate the wire form.
 
 Minimal valid and deliberately invalid JSON fixtures for every schema live under
-[`fixtures/`](/home/jonas/priv/repos/AutoUpdater/schemas/fixtures/). Runtime tests additionally
+[`fixtures/`](fixtures/). Runtime tests additionally
 exercise duplicate-key, digest-domain, identity, and cross-document invariants that JSON Schema
 cannot express.

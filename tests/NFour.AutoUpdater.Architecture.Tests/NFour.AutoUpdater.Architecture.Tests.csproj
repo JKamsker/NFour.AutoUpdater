@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><IsTestProject>true</IsTestProject><NoWarn>$(NoWarn);xUnit1051</NoWarn><RootNamespace>NFour.AutoUpdater.Architecture.Tests</RootNamespace></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/NFour.AutoUpdater.Core/NFour.AutoUpdater.Core.csproj" /><ProjectReference Include="../../src/NFour.AutoUpdater.Gateway/NFour.AutoUpdater.Gateway.csproj" /><ProjectReference Include="../../src/NFour.AutoUpdater.Server/NFour.AutoUpdater.Server.csproj" /><PackageReference Include="Microsoft.NET.Test.Sdk" /><PackageReference Include="xunit.v3" /><PackageReference Include="xunit.runner.visualstudio" /></ItemGroup>
+</Project>

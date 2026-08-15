@@ -1,0 +1,55 @@
+<Project>
+
+  <!--
+    Build-time injection of the compiled trust anchor.
+
+    The anchor is generated into a source file rather than hardcoded so that a first-party
+    build can supply its offline-controlled root without editing tracked source, and so that
+    the guard below can tell a real root from the development one.
+  -->
+  <PropertyGroup>
+    <NFourDevelopmentTrustRootKeyId>4s-dev-0000</NFourDevelopmentTrustRootKeyId>
+    <NFourDevelopmentTrustRootPublicKey>A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg</NFourDevelopmentTrustRootPublicKey>
+
+    <NFourTrustRootKeyId Condition="'$(NFourTrustRootKeyId)' == ''">$(NFourDevelopmentTrustRootKeyId)</NFourTrustRootKeyId>
+    <NFourTrustRootPublicKey Condition="'$(NFourTrustRootPublicKey)' == ''">$(NFourDevelopmentTrustRootPublicKey)</NFourTrustRootPublicKey>
+
+    <NFourTrustRootIsDevelopment>false</NFourTrustRootIsDevelopment>
+    <NFourTrustRootIsDevelopment Condition="'$(NFourTrustRootKeyId)' == '$(NFourDevelopmentTrustRootKeyId)' or '$(NFourTrustRootPublicKey)' == '$(NFourDevelopmentTrustRootPublicKey)'">true</NFourTrustRootIsDevelopment>
+  </PropertyGroup>
+
+  <!--
+    A Release build carrying the development anchor is a shippable artifact that trusts a
+    publicly known key. That is a release blocker, not a warning, so the build fails unless
+    the operator explicitly acknowledges it.
+  -->
+  <Target Name="NFourVerifyTrustRoot" BeforeTargets="CoreCompile">
+    <Error Condition="'$(Configuration)' == 'Release' and '$(NFourTrustRootIsDevelopment)' == 'true' and '$(NFourAllowDevelopmentTrustRoot)' != 'true'"
+           Code="FS4SUP001"
+           Text="Release build still carries the development trust root '$(NFourTrustRootKeyId)'. Set NFourTrustRootKeyId and NFourTrustRootPublicKey to the first-party offline root, or pass -p:NFourAllowDevelopmentTrustRoot=true to acknowledge a non-shippable build." />
+  </Target>
+
+  <Target Name="NFourGenerateTrustRoot" BeforeTargets="NFourVerifyTrustRoot;CoreCompile">
+    <!-- IntermediateOutputPath is only defined once the SDK targets have been imported, so
+         the path is resolved here at execution time rather than during evaluation. -->
+    <PropertyGroup>
+      <NFourTrustRootGeneratedFile>$(IntermediateOutputPath)TrustRootBuildConfiguration.g.cs</NFourTrustRootGeneratedFile>
+    </PropertyGroup>
+    <ItemGroup>
+      <NFourTrustRootLines Include="// &lt;auto-generated /&gt; Produced by TrustRoot.targets. Do not edit." />
+      <NFourTrustRootLines Include="namespace NFour.AutoUpdater.Core%3B" />
+      <NFourTrustRootLines Include="internal static class TrustRootBuildConfiguration" />
+      <NFourTrustRootLines Include="{" />
+      <NFourTrustRootLines Include="    public const string KeyId = &quot;$(NFourTrustRootKeyId)&quot;%3B" />
+      <NFourTrustRootLines Include="    public const string PublicKey = &quot;$(NFourTrustRootPublicKey)&quot;%3B" />
+      <NFourTrustRootLines Include="}" />
+    </ItemGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(NFourTrustRootGeneratedFile)" Lines="@(NFourTrustRootLines)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <Compile Include="$(NFourTrustRootGeneratedFile)" />
+      <FileWrites Include="$(NFourTrustRootGeneratedFile)" />
+    </ItemGroup>
+  </Target>
+
+</Project>

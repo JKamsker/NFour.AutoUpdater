@@ -1,6 +1,6 @@
 # 02 — Reference Review: `Apro.AutoUpdater_1`
 
-Reference: `D:\File\repos\work\Apro\_Apro\Apro\Apro.AutoUpdater_1` (read-only; unmodified).
+Reference: the legacy updater repository (read-only; unmodified).
 
 The reference is a working, production-deployed .NET updater for Apro cashbox software. It
 solves several hard problems correctly and is worth studying carefully. It also has a set of
