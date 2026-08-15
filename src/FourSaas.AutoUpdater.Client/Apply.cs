@@ -244,7 +244,6 @@ public sealed class InstallApplier
         progress ??= new NullApplyProgressSink();
         ValidateRoot(installRoot);
         if (preconditions is null) throw new ApplyPreconditionException("ApplyPreconditions are required; the caller must provide the verified protocol preconditions.");
-        preconditions.Validate(installRoot, plan);
         lockProvider ??= new FileInstallLockProvider();
         await using var installLease = await lockProvider.AcquireAsync(installRoot, cancellationToken).ConfigureAwait(false);
         var metadata = Path.Combine(installRoot, ".4sup");
@@ -257,21 +256,28 @@ public sealed class InstallApplier
         {
             if (old is not null && string.Equals(old.Lock.ReleaseDigest.ToString(), marker.ReleaseDigest, StringComparison.Ordinal) && string.Equals(old.Lock.FileSetId.ToString(), marker.FileSetId, StringComparison.Ordinal) && string.Equals(old.Lock.ProductId, marker.ProductId, StringComparison.Ordinal) && string.Equals(old.Lock.ReleaseId, marker.ReleaseId, StringComparison.Ordinal))
             {
-                foreach (var entry in Directory.EnumerateFileSystemEntries(staging))
-                {
-                    if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
-                    else File.Delete(entry);
-                }
-                File.Delete(planPath);
+                ClearRecoveryState(staging, planPath);
+                await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
             }
             else
             {
                 var persisted = ReadRecoveryMarker(planPath);
-                ValidateRecoveryMarker(persisted, marker);
-                plan = persisted.ToInstallPlan();
+                if (RecoveryTargetMatches(persisted, marker))
+                    plan = persisted.ToInstallPlan();
+                else
+                {
+                    // The installed ledger is still the transaction boundary. If a
+                    // channel advanced after an interrupted apply, the caller has
+                    // already scanned the partially materialised tree and planned
+                    // against that stable ledger. Replace the obsolete transaction
+                    // marker and let the new plan reconcile those observed files.
+                    ClearRecoveryState(staging, planPath);
+                    await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
         else await WriteRecoveryMarkerAsync(planPath, marker, cancellationToken).ConfigureAwait(false);
+        preconditions.Validate(installRoot, plan);
         var total = plan.BytesToDownload; var downloaded = 0L; var fetchNumber = 0;
         await progress.ReportAsync(new ApplyProgress { Phase = ApplyPhase.Fetching, DownloadedBytes = 0, TotalDownloadBytes = total, WrittenBytes = 0, TotalWriteBytes = plan.BytesToWrite, FilesDone = 0, FilesTotal = plan.Operations.Length }, cancellationToken).ConfigureAwait(false);
         var configuredParallelism = int.TryParse(Environment.GetEnvironmentVariable("FOURSUP_PARALLELISM"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var configured) ? configured : source.RecommendedParallelism;
@@ -284,7 +290,17 @@ public sealed class InstallApplier
             token.ThrowIfCancellationRequested();
             var key = layout.Blob(blob.Content); var path = Path.Combine(staging, Convert.ToHexString(blob.Content.Value.Span).ToLowerInvariant());
             long fetchedLength;
-            if (cache is not null && await cache.TryGetAsync(blob.Content, token).ConfigureAwait(false))
+            long recoveredLength = -1;
+            if (File.Exists(path))
+            {
+                try { recoveredLength = await VerifyStagedBlobAsync(path, blob.Content, token).ConfigureAwait(false); }
+                catch (InvalidDataException) { File.Delete(path); }
+            }
+            if (recoveredLength >= 0)
+            {
+                fetchedLength = recoveredLength;
+            }
+            else if (cache is not null && await cache.TryGetAsync(blob.Content, token).ConfigureAwait(false))
             {
                 File.Copy(cache.GetPath(blob.Content), path, overwrite: true);
                 fetchedLength = await VerifyStagedBlobAsync(path, blob.Content, token).ConfigureAwait(false);
@@ -450,20 +466,34 @@ public sealed class InstallApplier
         catch (Exception ex) { throw new ApplyPreconditionException($"The unfinished apply plan is corrupt: {ex.Message}"); }
     }
 
-    private static void ValidateRecoveryMarker(RecoveryPlanMarker actual, RecoveryPlanMarker expected)
+    private static bool RecoveryTargetMatches(RecoveryPlanMarker actual, RecoveryPlanMarker expected) =>
+        actual.SchemaVersion == expected.SchemaVersion &&
+            string.Equals(actual.FileSetId, expected.FileSetId, StringComparison.Ordinal) &&
+            string.Equals(actual.ReleaseDigest, expected.ReleaseDigest, StringComparison.Ordinal) &&
+            string.Equals(actual.ProductId, expected.ProductId, StringComparison.Ordinal) &&
+            string.Equals(actual.ReleaseId, expected.ReleaseId, StringComparison.Ordinal) &&
+            string.Equals(actual.RootIdentity, expected.RootIdentity, StringComparison.Ordinal);
+
+    private static void ClearRecoveryState(string staging, string planPath)
     {
-        if (actual.SchemaVersion != expected.SchemaVersion || !string.Equals(actual.FileSetId, expected.FileSetId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseDigest, expected.ReleaseDigest, StringComparison.Ordinal) || !string.Equals(actual.ProductId, expected.ProductId, StringComparison.Ordinal) || !string.Equals(actual.ReleaseId, expected.ReleaseId, StringComparison.Ordinal) || !actual.Blobs.SequenceEqual(expected.Blobs, StringComparer.Ordinal) || actual.BytesToDownload != expected.BytesToDownload || actual.BytesToWrite != expected.BytesToWrite || actual.NetInstallDelta != expected.NetInstallDelta || !actual.Operations.SequenceEqual(expected.Operations) || !actual.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal).SequenceEqual(expected.ParentIdentities.OrderBy(x => x.Key, StringComparer.Ordinal) ) || !string.Equals(actual.RootIdentity, expected.RootIdentity, StringComparison.Ordinal))
-            throw new ApplyPreconditionException("An unfinished apply belongs to a different release, file set, or operation plan; recover it before starting another operation.");
+        foreach (var entry in Directory.EnumerateFileSystemEntries(staging))
+        {
+            if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
+            else File.Delete(entry);
+        }
+        File.Delete(planPath);
     }
 
     private sealed record RecoveryPlanMarker(int SchemaVersion, string FileSetId, string ReleaseDigest, string ProductId, string ReleaseId, string[] Blobs, RecoveryOperation[] Operations, long BytesToDownload, long BytesToWrite, long NetInstallDelta, DateTimeOffset CreatedAt)
     {
         public Dictionary<string, string> ParentIdentities { get; init; } = new(StringComparer.Ordinal);
+        public Dictionary<string, long> PeakFreeSpaceRequiredByVolume { get; init; } = new(StringComparer.Ordinal);
         public string? RootIdentity { get; init; }
 
         public static RecoveryPlanMarker Create(ComposedFileSet target, InstallLock installLock, InstallPlan plan) => new(1, target.FileSetId.ToString(), installLock.ReleaseDigest.ToString(), installLock.ProductId, installLock.ReleaseId, plan.BlobsToFetch.Select(x => x.Content.ToString()).OrderBy(x => x, StringComparer.Ordinal).ToArray(), plan.Operations.Select(RecoveryOperation.From).ToArray(), plan.BytesToDownload, plan.BytesToWrite, plan.NetInstallDelta, DateTimeOffset.UtcNow)
         {
             ParentIdentities = plan.ParentIdentities.ToDictionary(x => x.Key.Value, x => x.Value.Value, StringComparer.Ordinal),
+            PeakFreeSpaceRequiredByVolume = plan.PeakFreeSpaceRequiredByVolume.ToDictionary(StringComparer.Ordinal),
             RootIdentity = plan.RootIdentity?.Value
         };
 
@@ -473,7 +503,7 @@ public sealed class InstallApplier
             BlobsToFetch = Blobs.Select(x => new BlobLocator(ContentHash.Parse(x))).ToImmutableArray(),
             BytesToDownload = BytesToDownload,
             BytesToWrite = BytesToWrite,
-            PeakFreeSpaceRequiredByVolume = ImmutableDictionary<string, long>.Empty,
+            PeakFreeSpaceRequiredByVolume = PeakFreeSpaceRequiredByVolume.ToImmutableDictionary(StringComparer.Ordinal),
             NetInstallDelta = NetInstallDelta,
             ParentIdentities = ParentIdentities.Where(x => VirtualPath.TryCreate(x.Key, out _, out _)).ToImmutableDictionary(x => new VirtualPath(x.Key), x => new FileIdentity(x.Value)),
             RootIdentity = RootIdentity is null ? null : new FileIdentity(RootIdentity)

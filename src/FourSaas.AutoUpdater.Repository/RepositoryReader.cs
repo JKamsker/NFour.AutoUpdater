@@ -1,7 +1,7 @@
 namespace FourSaas.AutoUpdater.Repository;
 
 public sealed record VerifiedChannel(ChannelPointer Pointer, SignedEnvelope Envelope, byte[] EnvelopeBytes);
-public sealed record VerifiedRelease(ReleaseLock Lock, SignedEnvelope Envelope, byte[] EnvelopeBytes, ReleaseBundle? Bundle, ChannelPointer? Pointer = null, SignedEnvelope? PointerEnvelope = null);
+public sealed record VerifiedRelease(ReleaseLock Lock, SignedEnvelope Envelope, byte[] EnvelopeBytes, ReleaseBundle? Bundle, ChannelPointer? Pointer = null, SignedEnvelope? PointerEnvelope = null, byte[]? PointerEnvelopeBytes = null);
 public sealed record VerifiedKeyManifest(KeyManifest Manifest, SignedEnvelope Envelope, byte[] EnvelopeBytes);
 public sealed record VerifiedRevocations(RevocationDocument Document, SignedEnvelope Envelope, byte[] EnvelopeBytes);
 
@@ -153,7 +153,12 @@ public sealed class RepositoryReader(IReadableObjectStore store, RepositoryDescr
         var verifiedChannel = await ReadChannelAsync(productId, channel, trustedKeys, cancellationToken).ConfigureAwait(false);
         var release = await ReadReleaseAsync(productId, verifiedChannel.Pointer.ReleaseId, trustedKeys, verifiedChannel.Pointer.ReleaseDigest, cancellationToken).ConfigureAwait(false);
         if (release.Lock.Sequence != verifiedChannel.Pointer.ReleaseSequence) throw new InvalidDataException("Channel pointer releaseSequence does not match the release lock.");
-        return release with { Pointer = verifiedChannel.Pointer, PointerEnvelope = verifiedChannel.Envelope };
+        return release with
+        {
+            Pointer = verifiedChannel.Pointer,
+            PointerEnvelope = verifiedChannel.Envelope,
+            PointerEnvelopeBytes = verifiedChannel.EnvelopeBytes
+        };
     }
 
     private async ValueTask<byte[]> ReadRequiredAsync(ObjectKey key, CancellationToken cancellationToken)
