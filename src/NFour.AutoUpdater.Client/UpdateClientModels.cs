@@ -23,9 +23,13 @@ public sealed record UpdateClientRequest
     public Version? ClientVersion { get; init; }
     /// <summary>Gets an optional time provider for policy evaluation.</summary>
     public TimeProvider? TimeProvider { get; init; }
-    /// <summary>Gets the maximum accepted age of signed channel metadata.</summary>
+    /// <summary>
+    /// Gets the maximum accepted age of signed channel metadata, or <see cref="Timeout.InfiniteTimeSpan"/>
+    /// to accept any publication age. Unbounded channels keep every sequence and replay check but lose
+    /// freeze-attack protection, so reserve them for development channels.
+    /// </summary>
     public TimeSpan ChannelStalenessBound { get; init; } = TimeSpan.FromDays(7);
-    /// <summary>Gets an optional maximum age for the revocation document.</summary>
+    /// <summary>Gets an optional maximum age for the revocation document; defaults to <see cref="ChannelStalenessBound"/>.</summary>
     public TimeSpan? RevocationStalenessBound { get; init; }
     /// <summary>Gets the portion of the resolved package graph to materialize.</summary>
     public UpdatePackageScope PackageScope { get; init; } = UpdatePackageScope.Composed;

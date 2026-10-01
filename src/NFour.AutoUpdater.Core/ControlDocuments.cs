@@ -112,7 +112,7 @@ public static class ControlDocumentPolicy
     /// <param name="channel">The expected channel identifier.</param>
     /// <param name="lastChannelSequence">The last accepted channel sequence.</param>
     /// <param name="now">The trusted evaluation time.</param>
-    /// <param name="stalenessBound">The permitted clock and publication-age window.</param>
+    /// <param name="stalenessBound">The permitted clock and publication-age window, or <see cref="Timeout.InfiniteTimeSpan"/> to accept any publication age (identity, sequence, and version checks still apply).</param>
     /// <param name="lastReleaseSequence">The last accepted release sequence.</param>
     /// <param name="clientVersion">The running client version.</param>
     /// <returns>The acceptance result.</returns>
@@ -123,7 +123,7 @@ public static class ControlDocumentPolicy
         if (pointer.ChannelSequence < 1 || pointer.ReleaseSequence < 1 || pointer.SupersedesChannelSequence < 0) return new(false, "Channel sequence fields are invalid.");
         if (pointer.ChannelSequence <= lastChannelSequence) return new(false, "Channel sequence is not newer than the installed ledger.");
         if (pointer.SupersedesChannelSequence >= pointer.ChannelSequence) return new(false, "Channel pointer supersedes sequence must be lower than its own sequence.");
-        if (pointer.UpdatedAt > now.Add(stalenessBound) || pointer.UpdatedAt < now.Subtract(stalenessBound)) return new(false, "Channel pointer is outside the configured staleness bound.");
+        if (stalenessBound != Timeout.InfiniteTimeSpan && (pointer.UpdatedAt > now.Add(stalenessBound) || pointer.UpdatedAt < now.Subtract(stalenessBound))) return new(false, "Channel pointer is outside the configured staleness bound.");
         if (pointer.MinimumClientVersion is { } minimumText)
         {
             if (!Version.TryParse(minimumText, out var minimum)) return new(false, $"Channel pointer minimumClientVersion '{minimumText}' is invalid.");

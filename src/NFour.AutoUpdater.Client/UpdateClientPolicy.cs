@@ -12,10 +12,10 @@ internal static class UpdateClientPolicy
             throw new ArgumentException("InstallRoot is required.", nameof(request));
         ArgumentNullException.ThrowIfNull(request.Selection);
         ArgumentNullException.ThrowIfNull(request.TrustedKeys);
-        if (request.ChannelStalenessBound <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(request), "ChannelStalenessBound must be positive.");
-        if (request.RevocationStalenessBound is { } revocationBound && revocationBound <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(request), "RevocationStalenessBound must be positive.");
+        if (!IsValidStalenessBound(request.ChannelStalenessBound))
+            throw new ArgumentOutOfRangeException(nameof(request), "ChannelStalenessBound must be positive or Timeout.InfiniteTimeSpan.");
+        if (request.RevocationStalenessBound is { } revocationBound && !IsValidStalenessBound(revocationBound))
+            throw new ArgumentOutOfRangeException(nameof(request), "RevocationStalenessBound must be positive or Timeout.InfiniteTimeSpan.");
         if (!Identifier.IsValid(request.ProductId, "productId", out string? productError))
             throw new FormatException(productError);
         if (!Identifier.IsValid(request.Channel, "channel", out string? channelError))
@@ -30,6 +30,9 @@ internal static class UpdateClientPolicy
                 throw new CryptographicException($"Trusted key '{keyId}' is not a 32-byte Ed25519 public key.");
         }
     }
+
+    private static bool IsValidStalenessBound(TimeSpan bound) =>
+        bound > TimeSpan.Zero || bound == Timeout.InfiniteTimeSpan;
 
     internal static void EnsureRepositoryBinding(LedgerDocument? previous, UpdateClientRequest request)
     {

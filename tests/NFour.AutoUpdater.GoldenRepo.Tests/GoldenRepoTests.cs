@@ -401,7 +401,7 @@ public sealed class GoldenRepoTests
     private static string VectorPath(string name) => Path.Combine(AppContext.BaseDirectory, "vectors", "signed", name);
     private static string GoldenPath(string name) => Path.Combine(AppContext.BaseDirectory, "vectors", "golden", name);
 
-    private static async ValueTask<MemoryObjectStore> LoadGoldenStoreAsync()
+    internal static async ValueTask<MemoryObjectStore> LoadGoldenStoreAsync()
     {
         var store = new MemoryObjectStore();
         var root = Path.Combine(AppContext.BaseDirectory, "vectors", "golden");
@@ -415,7 +415,7 @@ public sealed class GoldenRepoTests
         return store;
     }
 
-    private static async ValueTask<byte[]> ReadObjectAsync(IReadableObjectStore store, ObjectKey key)
+    internal static async ValueTask<byte[]> ReadObjectAsync(IReadableObjectStore store, ObjectKey key)
     {
         var result = await store.OpenAsync(key);
         Assert.NotNull(result);

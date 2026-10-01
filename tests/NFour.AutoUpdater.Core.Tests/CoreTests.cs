@@ -149,6 +149,22 @@ public sealed class CoreTests
         Assert.False(rejected.Accepted);
     }
 
+    [Fact]
+    public void InfiniteStalenessBoundAcceptsAnyPublicationAgeButKeepsReplayChecks()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var old = new ChannelPointer
+        {
+            ProductId = "product", Channel = "dev", ChannelSequence = 5, SupersedesChannelSequence = 4,
+            ReleaseId = "r5", ReleaseSequence = 5, ReleaseDigest = ContentHash.Compute("r5"u8), UpdatedAt = now.AddYears(-3)
+        };
+
+        Assert.False(ControlDocumentPolicy.AcceptChannel(old, "product", "dev", 4, now, TimeSpan.FromDays(30)).Accepted);
+        var accepted = ControlDocumentPolicy.AcceptChannel(old, "product", "dev", 4, now, Timeout.InfiniteTimeSpan);
+        Assert.True(accepted.Accepted, accepted.Error);
+        Assert.False(ControlDocumentPolicy.AcceptChannel(old, "product", "dev", 5, now, Timeout.InfiniteTimeSpan).Accepted);
+    }
+
     [Theory]
     [InlineData("0644", 0x1A4)]
     [InlineData("0755", 0x1ED)]
